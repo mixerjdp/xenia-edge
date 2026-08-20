@@ -70,8 +70,19 @@ X_RESULT xeXamDispatchDialog(T* dialog,
       result = close_callback(dialog);
     });
     xe::threading::Fence fence;
-    xe::ui::WindowedAppContext& app_context =
-        kernel_state()->emulator()->display_window()->app_context();
+    // Every dialog is drawn into Xenia's own window. An embedder without one
+    // (the libretro core) has nowhere to put it, and dereferencing the null
+    // window here would take down the guest thread mid-call. Report the dialog
+    // as dismissed instead; `headless` already handles this for the paths that
+    // check it, and this catches the ones that don't.
+    xe::ui::Window* display_window =
+        kernel_state()->emulator()->display_window();
+    if (!display_window) {
+      delete dialog;
+      kernel_state()->xam_state()->is_xam_dialog_present_.store(false);
+      return X_ERROR_SUCCESS;
+    }
+    xe::ui::WindowedAppContext& app_context = display_window->app_context();
     if (app_context.CallInUIThreadSynchronous(
             [&dialog, &fence]() { dialog->Then(&fence); })) {
       GuestScheduler::WaitOnFence(fence);

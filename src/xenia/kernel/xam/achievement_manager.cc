@@ -152,6 +152,13 @@ void AchievementManager::ShowAchievementEarnedNotification(
                   xe::to_utf8(achievement->achievement_name));
 
   const Emulator* emulator = kernel_state()->emulator();
+  // The notification is drawn into Xenia's own window. Without one - an
+  // embedder such as the libretro core - there is nowhere to draw it, and the
+  // achievement itself has already been recorded by the backend, so there is
+  // nothing to do but skip the popup.
+  if (!emulator->display_window() || !emulator->imgui_drawer()) {
+    return;
+  }
   ui::WindowedAppContext& app_context =
       emulator->display_window()->app_context();
   ui::ImGuiDrawer* imgui_drawer = emulator->imgui_drawer();

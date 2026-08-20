@@ -709,7 +709,8 @@ X_RESULT KernelState::ApplyTitleUpdate(
 
     // First module that is loaded is always main executable. That way we can
     // prevent random message spam in case of loading/unloading.
-    if (!GetExecutableModule()) {
+    if (!GetExecutableModule() && emulator_->display_window() &&
+        emulator_->imgui_drawer()) {
       emulator_->display_window()->app_context().CallInUIThread([&]() {
         new xe::ui::HostNotificationWindow(
             emulator_->imgui_drawer(), "Warning!",
