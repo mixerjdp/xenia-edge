@@ -123,7 +123,6 @@ bool g_had_first_frame = false;
 std::atomic<bool> g_frontend_ready{false};
 bool g_can_dupe = false;
 unsigned g_frames_inspected = 0;
-int16_t g_audio_peak = 0;
 bool g_input_bitmask_supported = false;
 // One frame's worth of stereo output, refilled every retro_run.
 std::vector<int16_t> g_audio_buffer;
@@ -784,24 +783,8 @@ RETRO_API void retro_run(void) {
     // have and the rest stays silent, which the frontend prefers to a short
     // or missing batch.
     std::fill(g_audio_buffer.begin(), g_audio_buffer.end(), int16_t(0));
-    const size_t audio_frames = xe::libretro::DrainAudioDrivers(
-        g_audio_buffer.data(), kAudioFramesPerVideoFrame);
-
-    // Same idea as the video stat: proves samples are really arriving rather
-    // than the driver merely having registered. Reported periodically because
-    // a title is often silent for its first seconds, and a single early
-    // reading of zero says nothing.
-    for (size_t i = 0; i < audio_frames * 2; ++i) {
-      const int16_t v = g_audio_buffer[i];
-      g_audio_peak = std::max<int16_t>(g_audio_peak, v < 0 ? int16_t(-v) : v);
-    }
-    if ((g_frame_count.load() % 300) == 0) {
-      g_log_cb(RETRO_LOG_INFO,
-               "[xenia] audio: %zu frames this tick, peak over last 5s=%d\n",
-               audio_frames, int(g_audio_peak));
-      g_audio_peak = 0;
-    }
-
+    xe::libretro::DrainAudioDrivers(g_audio_buffer.data(),
+                                    kAudioFramesPerVideoFrame);
     g_audio_batch_cb(g_audio_buffer.data(), kAudioFramesPerVideoFrame);
   }
 }
