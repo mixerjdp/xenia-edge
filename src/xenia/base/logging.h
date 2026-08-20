@@ -12,6 +12,7 @@
 
 #include <cstdarg>
 #include <cstdint>
+#include <memory>
 #include <string>
 
 #include "third_party/fmt/include/fmt/format.h"
@@ -73,7 +74,12 @@ class DebugPrintLogSink final : public LogSink {
 
 // Initializes the logging system and any outputs requested.
 // Must be called on startup.
-void InitializeLogging(const std::string_view app_name);
+// An embedder (the libretro core) may pass an extra sink to mirror the log
+// into the host's own logging. It has to come in here rather than through a
+// later call: the writer thread reads the sink list without synchronization,
+// so the list must be complete before the first line is ever logged.
+void InitializeLogging(const std::string_view app_name,
+                       std::unique_ptr<LogSink> extra_sink = nullptr);
 void ShutdownLogging();
 void FlushLog();
 

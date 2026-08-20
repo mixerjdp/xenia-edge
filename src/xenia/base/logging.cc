@@ -431,7 +431,8 @@ class Logger {
   }
 };
 
-void InitializeLogging(const std::string_view app_name) {
+void InitializeLogging(const std::string_view app_name,
+                       std::unique_ptr<LogSink> extra_sink) {
   auto mem = memory::AlignedAlloc<Logger>(0x10);
   logger_ = new (mem) Logger(app_name);
 
@@ -464,6 +465,10 @@ void InitializeLogging(const std::string_view app_name) {
     logger_->AddLogSink(std::make_unique<DebugPrintLogSink>());
   }
 #endif  // XE_PLATFORM_ANDROID
+
+  if (extra_sink) {
+    logger_->AddLogSink(std::move(extra_sink));
+  }
 }
 
 void ShutdownLogging() {

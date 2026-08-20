@@ -96,6 +96,24 @@ class GraphicsSystem {
   virtual void SetInterruptCallback(uint32_t callback, uint32_t user_data);
   void DispatchInterruptCallback(uint32_t source, uint32_t cpu);
 
+  // Frame pacing handoff. Normally the frame limiter thread picks its own
+  // timing; an embedder whose own loop owns frame timing (the libretro core,
+  // driven by the frontend's retro_run) takes that over instead, so the guest
+  // advances in lockstep with the host's frames rather than racing them.
+  //
+  // Only the timing source moves. The vblank itself still fires on the frame
+  // limiter thread, because MarkVblank dispatches the guest's interrupt
+  // callback and that has to run on a thread the kernel knows about.
+  void SetHostDrivenVblank(bool enabled) {
+    host_driven_vblank_.store(enabled, std::memory_order_relaxed);
+  }
+  bool host_driven_vblank() const {
+    return host_driven_vblank_.load(std::memory_order_relaxed);
+  }
+  // Releases one vblank on the frame limiter thread. Safe to call from any
+  // thread; does nothing unless SetHostDrivenVblank(true) was called.
+  void TriggerHostVblank();
+
   virtual void ClearCaches();
 
   void InvalidateGpuMemory();
@@ -149,6 +167,9 @@ class GraphicsSystem {
   uint32_t interrupt_callback_data_ = 0;
 
   std::atomic<bool> frame_limiter_worker_running_;
+  std::atomic<bool> host_driven_vblank_{false};
+  // Signalled by TriggerHostVblank, awaited by the frame limiter thread.
+  std::unique_ptr<threading::Event> host_vblank_event_;
   kernel::object_ref<kernel::XHostThread> frame_limiter_worker_thread_;
 
   // Anchors for synthesizing D1MODE_V_COUNTER. last_vblank_guest_tick_ is

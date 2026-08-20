@@ -1929,8 +1929,9 @@ X_STATUS Emulator::CompleteLaunch(const std::filesystem::path& path,
                                   const std::string_view module_path) {
   // Making changes to the UI (setting the icon) and executing game config
   // load callbacks which expect to be called from the UI thread.
-  // If not on UI thread, dispatch to it synchronously.
-  if (!display_window_->app_context().IsInUIThread()) {
+  // If not on UI thread, dispatch to it synchronously. Without a display
+  // window there is no UI thread to dispatch to, so run inline.
+  if (display_window_ && !display_window_->app_context().IsInUIThread()) {
     X_STATUS result = X_STATUS_UNSUCCESSFUL;
     display_window_->app_context().CallInUIThreadSynchronous(
         [this, &path, &module_path, &result]() {
@@ -1977,7 +1978,9 @@ X_STATUS Emulator::CompleteLaunch(const std::filesystem::path& path,
   title_id_ = std::nullopt;
   title_name_ = "";
   title_version_ = "";
-  display_window_->SetIcon(nullptr, 0);
+  if (display_window_) {
+    display_window_->SetIcon(nullptr, 0);
+  }
 
   // Allow xam to request module loads.
   auto xam = kernel_state()->GetKernelModule<kernel::xam::XamModule>("xam.xex");
@@ -2146,7 +2149,7 @@ X_STATUS Emulator::CompleteLaunch(const std::filesystem::path& path,
       }
 
       auto icon_block = game_info_database_->GetIcon();
-      if (!icon_block.empty()) {
+      if (display_window_ && !icon_block.empty()) {
         display_window_->SetIcon(icon_block.data(), icon_block.size());
       }
     }

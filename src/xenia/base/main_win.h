@@ -10,8 +10,11 @@
 #ifndef XENIA_BASE_MAIN_WIN_H_
 #define XENIA_BASE_MAIN_WIN_H_
 
+#include <memory>
 #include <string>
 #include <vector>
+
+#include "xenia/base/logging.h"
 
 namespace xe {
 
@@ -21,7 +24,10 @@ bool ParseWin32LaunchArguments(
     const std::vector<std::string>& positional_options,
     std::vector<std::string>* args_out);
 // InitializeWin32App uses cvars, call ParseWin32LaunchArguments before.
-int InitializeWin32App(const std::string_view app_name);
+// extra_sink is forwarded to InitializeLogging - see the note there on why
+// it must be supplied at init rather than attached afterwards.
+int InitializeWin32App(const std::string_view app_name,
+                       std::unique_ptr<LogSink> extra_sink = nullptr);
 void ShutdownWin32App();
 
 }  // namespace xe

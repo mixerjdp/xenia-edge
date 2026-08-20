@@ -144,6 +144,7 @@ X_STATUS GraphicsSystem::Setup(cpu::Processor* processor,
       reinterpret_cast<cpu::MMIOWriteCallback>(WriteRegisterThunk));
 
   // Frame limiter thread.
+  host_vblank_event_ = xe::threading::Event::CreateAutoResetEvent(false);
   frame_limiter_worker_running_ = true;
   frame_limiter_worker_thread_ =
       kernel::object_ref<kernel::XHostThread>(new kernel::XHostThread(
@@ -163,6 +164,22 @@ X_STATUS GraphicsSystem::Setup(cpu::Processor* processor,
               // frame limiter thread.
               if (!kernel_state_->is_title_open()) {
                 xe::threading::Sleep(std::chrono::milliseconds(100));
+                continue;
+              }
+
+              // The host's frame loop owns pacing in this mode: block until it
+              // releases a frame, then fire the vblank from here, where the
+              // guest interrupt callback has a kernel thread to run on. The
+              // timeout keeps the loop responsive to shutdown and to the mode
+              // being turned back off.
+              if (host_driven_vblank_.load(std::memory_order_relaxed)) {
+                if (host_vblank_event_) {
+                  xe::threading::Wait(host_vblank_event_.get(), false,
+                                      std::chrono::milliseconds(100));
+                }
+                if (host_driven_vblank_.load(std::memory_order_relaxed)) {
+                  MarkVblank();
+                }
                 continue;
               }
 
@@ -380,6 +397,19 @@ void GraphicsSystem::SetInterruptCallback(uint32_t callback,
 void GraphicsSystem::DispatchInterruptCallback(uint32_t source, uint32_t cpu) {
   kernel_state()->EmulateCPInterruptDPC(interrupt_callback_,
                                         interrupt_callback_data_, source, cpu);
+}
+
+void GraphicsSystem::TriggerHostVblank() {
+  if (!host_driven_vblank_.load(std::memory_order_relaxed)) {
+    return;
+  }
+  // Just release the frame limiter thread. MarkVblank must not run here: it
+  // dispatches the guest's interrupt callback, which executes guest code and
+  // therefore needs a thread the kernel has registered - the caller is the
+  // host's frame loop, which is not one.
+  if (host_vblank_event_) {
+    host_vblank_event_->Set();
+  }
 }
 
 void GraphicsSystem::MarkVblank() {
