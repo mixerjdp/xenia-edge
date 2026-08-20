@@ -110,8 +110,12 @@ enum class CoreState {
   kSpent,       // content was unloaded; this process can't load again
 };
 
-std::unique_ptr<xe::Emulator> g_emulator;
-std::thread g_emulator_thread;
+// Deliberately a raw pointer that is never deleted, and a detached thread with
+// no object left behind. Xenia has no complete teardown path, and letting a
+// static destructor run at DLL_PROCESS_DETACH is worse than leaking: it tears
+// down Vulkan and waits on emulator threads while the loader lock is held and
+// the process is already exiting, which crashed the frontend on close.
+xe::Emulator* g_emulator = nullptr;
 std::atomic<CoreState> g_state{CoreState::kIdle};
 std::string g_failure_reason;
 std::atomic<uint64_t> g_frame_count{0};
@@ -693,8 +697,8 @@ RETRO_API bool retro_load_game(const struct retro_game_info* game) {
   const std::filesystem::path path =
       std::filesystem::absolute(xe::to_path(game->path));
 
-  g_emulator = std::make_unique<xe::Emulator>("", g_storage_root,
-                                              g_content_root, g_cache_root);
+  g_emulator =
+      new xe::Emulator("", g_storage_root, g_content_root, g_cache_root);
 
   // Bare init only — the subsystems come up on the emulator thread, after the
   // per-game config overrides are in place.
@@ -703,12 +707,14 @@ RETRO_API bool retro_load_game(const struct retro_game_info* game) {
                         CreateGraphicsSystem, CreateInputDrivers);
   if (XFAILED(result)) {
     Fail(fmt::format("Failed to setup emulator: {:08X}", result));
-    g_emulator.reset();
+    // Left dangling on purpose - see the note on g_emulator. Nothing reads it
+    // again once the state is kFailed.
+    g_emulator = nullptr;
     return false;
   }
 
   g_state.store(CoreState::kStarting);
-  g_emulator_thread = std::thread(EmulatorThread, path);
+  std::thread(EmulatorThread, path).detach();
   return true;
 }
 
@@ -731,9 +737,6 @@ RETRO_API void retro_unload_game(void) {
   g_log_cb(RETRO_LOG_WARN,
            "[xenia] Content unloaded, but the emulator cannot be torn down "
            "yet; restart the frontend before loading other content\n");
-  if (g_emulator_thread.joinable()) {
-    g_emulator_thread.detach();
-  }
   g_state.store(CoreState::kSpent);
 }
 
