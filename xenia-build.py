@@ -789,6 +789,7 @@ def run_cmake_configure(cc=None, generator=None, build_tests=False,
                         disable_lto=False, enable_profiler=False,
                         enable_itrace=False, enable_dtrace=False,
                         enable_ftrace=False, build_misc=False,
+                        build_libretro=False,
                         target_arch=None, config=None):
     """Runs `cmake` to (re)configure build/ from the source root.
 
@@ -800,7 +801,9 @@ def run_cmake_configure(cc=None, generator=None, build_tests=False,
     enable_profiler toggles -DXENIA_ENABLE_PROFILER=ON (microprofile
     instrumentation; UI overlay only in Debug, profile.html dump on
     shutdown otherwise); build_misc toggles -DXENIA_BUILD_MISC=ON (trace
-    viewers and dumps, shader compiler, vfs-dump, demos).
+    viewers and dumps, shader compiler, vfs-dump, demos);
+    build_libretro toggles -DXENIA_BUILD_LIBRETRO=ON (the
+    xenia_libretro shared library for libretro frontends).
     target_arch enables cross-compilation on
     Windows (arm64↔x64 via the MSVC cross-compiler) and macOS
     (arm64↔x86_64 via clang's -arch and CMAKE_OSX_ARCHITECTURES) into a
@@ -896,6 +899,7 @@ def run_cmake_configure(cc=None, generator=None, build_tests=False,
     args += [f"-DXENIA_ENABLE_DTRACE={'ON' if enable_dtrace else 'OFF'}"]
     args += [f"-DXENIA_ENABLE_FTRACE={'ON' if enable_ftrace else 'OFF'}"]
     args += [f"-DXENIA_BUILD_MISC={'ON' if build_misc else 'OFF'}"]
+    args += [f"-DXENIA_BUILD_LIBRETRO={'ON' if build_libretro else 'OFF'}"]
     if config:
         args += [f"-DCMAKE_BUILD_TYPE={config.title()}"]
     ret = subprocess.call(args)
@@ -1179,6 +1183,12 @@ class BaseBuildCommand(Command):
                  "-DXENIA_BUILD_MISC=ON): trace viewers and trace dumps, "
                  "the shader compiler, vfs-dump and the demos.")
         self.parser.add_argument(
+            "--build-libretro", dest="build_libretro", action="store_true",
+            default=False,
+            help="Enables building the libretro core (sets "
+                 "-DXENIA_BUILD_LIBRETRO=ON): xenia_libretro, a shared "
+                 "library loadable by RetroArch and other frontends.")
+        self.parser.add_argument(
             "--target-arch", type=normalize_target_arch, default=None,
             help="Target architecture (arm64/aarch64/a64, x64/amd64/x86_64/x86). "
                  "On Windows and macOS, non-native values enable cross-compilation "
@@ -1197,6 +1207,7 @@ class BaseBuildCommand(Command):
                 enable_dtrace=args["enable_dtrace"],
                 enable_ftrace=args["enable_ftrace"],
                 build_misc=args["build_misc"],
+                build_libretro=args["build_libretro"],
                 target_arch=target_arch,
                 config=args["config"],
             )
