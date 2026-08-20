@@ -65,6 +65,8 @@ DECLARE_path(log_file);
 DECLARE_int32(log_level);
 DECLARE_bool(d3d12_install_missing_runtime);
 DECLARE_bool(headless);
+DECLARE_string(readback_resolve);
+DECLARE_bool(disable_context_promotion);
 
 // The app defines this one in xenia_main.cc, which the core doesn't link.
 DEFINE_string(hid, "nop", "Input system. Use: [any, nop, sdl, keyboard]", "HID");
@@ -151,6 +153,13 @@ const retro_variable kCoreOptions[] = {
      "Audio system (restart required); nop|any|xaudio2|sdl"},
     {"xenia_gpu",
      "GPU backend (restart required); auto|vulkan|d3d12|null"},
+    // Both default to "auto", meaning the core leaves the cvar alone so a
+    // per-game config keeps whatever it set. Only an explicit choice here
+    // overrides one.
+    {"xenia_readback_resolve",
+     "Readback resolve; auto|fast|all|none"},
+    {"xenia_context_promotion",
+     "CPU context promotion; auto|enabled|disabled"},
     {nullptr, nullptr},
 };
 
@@ -314,6 +323,25 @@ void ApplyBackendCvars() {
   // for an answer nobody can give: Dead or Alive 4 freezes on Start exactly
   // that way. Headless mode makes each of those take its default instead.
   cvars::headless = true;
+
+  // Two knobs some titles need, exposed because editing a per-game TOML by
+  // hand is a poor way to discover them. FIFA 17 wants both: it reads its own
+  // framebuffer back for gamma, and comes out dark without "all", and its
+  // animations misbehave unless context promotion is off.
+  if (const char* mode = GetOptionValue("xenia_readback_resolve")) {
+    const std::string value(mode);
+    if (value == "fast" || value == "all" || value == "none") {
+      cvars::readback_resolve = value;
+    }
+  }
+  if (const char* promotion = GetOptionValue("xenia_context_promotion")) {
+    const std::string value(promotion);
+    if (value == "enabled") {
+      cvars::disable_context_promotion = false;
+    } else if (value == "disabled") {
+      cvars::disable_context_promotion = true;
+    }
+  }
 }
 
 // Gamertag for the profile the core creates on first run. Titles show it, and
