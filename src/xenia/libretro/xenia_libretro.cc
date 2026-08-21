@@ -324,6 +324,34 @@ std::vector<std::unique_ptr<xe::hid::InputDriver>> CreateInputDrivers(
 // Reapplied after the per-game config loads so a title override can't select
 // a backend the core has no plumbing for. Assigned rather than set through
 // OVERRIDE_string, which only expands in the TU that defines the cvar.
+// Knobs a title may need, exposed because editing a per-game TOML by hand is a
+// poor way to discover them. FIFA 17 wants both: it reads its own framebuffer
+// back for gamma and comes out dark without "all", and its player animations
+// misbehave unless context promotion is off.
+//
+// These are applied *before* the per-game config so that config still wins.
+// The frontend persists whatever value its menu last showed, so treating the
+// option as authoritative would let a stale "enabled" silently undo a title's
+// own override - which is exactly what happened to FIFA.
+void ApplyTunableOptions() {
+  if (const char* mode = GetOptionValue("xenia_readback_resolve")) {
+    const std::string value(mode);
+    if (value == "fast" || value == "all" || value == "none") {
+      cvars::readback_resolve = value;
+    }
+  }
+  if (const char* promotion = GetOptionValue("xenia_context_promotion")) {
+    const std::string value(promotion);
+    if (value == "enabled") {
+      cvars::disable_context_promotion = false;
+    } else if (value == "disabled") {
+      cvars::disable_context_promotion = true;
+    }
+  }
+}
+
+// These have to win over a per-game config: the core has no plumbing for a
+// backend it did not build, and a dialog it cannot draw hangs the frontend.
 void ApplyBackendCvars() {
   cvars::gpu = SelectedGpuBackend();
   // The factories hand back the libretro-backed audio and input systems
@@ -342,24 +370,6 @@ void ApplyBackendCvars() {
   // that way. Headless mode makes each of those take its default instead.
   cvars::headless = true;
 
-  // Two knobs some titles need, exposed because editing a per-game TOML by
-  // hand is a poor way to discover them. FIFA 17 wants both: it reads its own
-  // framebuffer back for gamma, and comes out dark without "all", and its
-  // animations misbehave unless context promotion is off.
-  if (const char* mode = GetOptionValue("xenia_readback_resolve")) {
-    const std::string value(mode);
-    if (value == "fast" || value == "all" || value == "none") {
-      cvars::readback_resolve = value;
-    }
-  }
-  if (const char* promotion = GetOptionValue("xenia_context_promotion")) {
-    const std::string value(promotion);
-    if (value == "enabled") {
-      cvars::disable_context_promotion = false;
-    } else if (value == "disabled") {
-      cvars::disable_context_promotion = true;
-    }
-  }
 }
 
 // Gamertag for the profile the core creates on first run. Titles show it, and
@@ -424,6 +434,7 @@ void EmulatorThread(std::filesystem::path path) {
   g_emulator->MountStandardDrives();
   EnsureProfileSignedIn();
 
+  ApplyTunableOptions();
   config::LoadGameConfigForFile(path);
 
   // Wait for the frontend to finish standing up its own video context before
