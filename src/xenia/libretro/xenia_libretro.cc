@@ -196,9 +196,14 @@ void ApplyLogLevelOption() {
 // Host directories
 // ---------------------------------------------------------------------------
 
-// Resolves where xenia keeps its config, content and shader caches. RetroArch
-// gives us a system dir (read-mostly) and a save dir (writable); xenia writes
-// to all of its roots, so everything hangs off the save dir when there is one.
+// Splits Xenia's roots the way libretro means its directories to be used.
+//
+// The save directory is for what a user would back up, and that is only the
+// guest's saves and profiles - Xenia calls that the content root. Everything
+// else is regenerable bulk and belongs in the system directory: the config,
+// the shader cache, and the guest's own CACHE and SCRATCH drives, which titles
+// fill with installed disc data. Dead or Alive 4 alone parked 1.5 GB there, so
+// keeping it out of the save directory matters.
 void ResolveRoots() {
   const char* save_dir = nullptr;
   const char* system_dir = nullptr;
@@ -206,16 +211,29 @@ void ResolveRoots() {
     g_environ_cb(RETRO_ENVIRONMENT_GET_SAVE_DIRECTORY, &save_dir);
     g_environ_cb(RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY, &system_dir);
   }
-  std::filesystem::path base;
-  if (save_dir && save_dir[0]) {
-    base = std::filesystem::path(save_dir) / "xenia";
-  } else if (system_dir && system_dir[0]) {
-    base = std::filesystem::path(system_dir) / "xenia";
+
+  // Either directory can be missing, so each falls back to the other and then
+  // to the working directory rather than ending up empty.
+  std::filesystem::path system_base;
+  if (system_dir && system_dir[0]) {
+    system_base = std::filesystem::path(system_dir) / "xenia";
+  } else if (save_dir && save_dir[0]) {
+    system_base = std::filesystem::path(save_dir) / "xenia";
   } else {
-    base = std::filesystem::current_path() / "xenia";
+    system_base = std::filesystem::current_path() / "xenia";
   }
-  g_storage_root = std::filesystem::absolute(base);
-  g_content_root = g_storage_root / "content";
+
+  std::filesystem::path save_base;
+  if (save_dir && save_dir[0]) {
+    save_base = std::filesystem::path(save_dir) / "xenia";
+  } else {
+    save_base = system_base / "content";
+  }
+
+  g_storage_root = std::filesystem::absolute(system_base);
+  g_content_root = std::filesystem::absolute(save_base);
+  // Xenia's host-side cache. Named apart from the guest's CACHE drive, which
+  // the emulator hardcodes to <storage root>/cache.
   g_cache_root = g_storage_root / "cache_host";
 
   std::error_code ec;
@@ -661,8 +679,10 @@ RETRO_API void retro_init(void) {
                const_cast<retro_input_descriptor*>(kInputDescriptors));
   g_audio_buffer.assign(kAudioFramesPerVideoFrame * 2, 0);
 
-  g_log_cb(RETRO_LOG_INFO, "[xenia] Storage root: %s\n",
+  g_log_cb(RETRO_LOG_INFO, "[xenia] System root: %s\n",
            xe::path_to_utf8(g_storage_root).c_str());
+  g_log_cb(RETRO_LOG_INFO, "[xenia] Save root: %s\n",
+           xe::path_to_utf8(g_content_root).c_str());
 }
 
 RETRO_API void retro_deinit(void) {
