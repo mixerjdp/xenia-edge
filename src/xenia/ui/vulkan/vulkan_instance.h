@@ -31,6 +31,7 @@ class VulkanInstance {
   static std::unique_ptr<VulkanInstance> Create(bool with_surface,
                                                 int validation_level);
 
+
   VulkanInstance(const VulkanInstance&) = delete;
   VulkanInstance& operator=(const VulkanInstance&) = delete;
   VulkanInstance(VulkanInstance&&) = delete;
@@ -121,6 +122,18 @@ class VulkanInstance {
 
   const Extensions& extensions() const { return extensions_; }
 
+  // Adopts an instance created by someone else - a libretro frontend that owns
+  // the Vulkan context and hands it to the core. The instance is not destroyed
+  // with this object, and no loader library is opened: every entry point comes
+  // from the caller's vkGetInstanceProcAddr.
+  //
+  // The caller states which instance extensions it enabled and which API
+  // version it asked for, because neither can be queried back from a
+  // VkInstance. Getting either wrong shows up as a null function pointer.
+  static std::unique_ptr<VulkanInstance> Adopt(
+      VkInstance instance, PFN_vkGetInstanceProcAddr get_instance_proc_addr,
+      uint32_t api_version, const Extensions& enabled_extensions);
+
   VkInstance instance() const { return instance_; }
 
   void EnumeratePhysicalDevices(
@@ -144,6 +157,12 @@ class VulkanInstance {
   Extensions extensions_;
 
   VkInstance instance_ = nullptr;
+  // False when the instance came from Adopt: someone else created it and will
+  // destroy it, and tearing it down here would pull it out from under them.
+  bool owns_instance_ = true;
+
+  // Shared by Create and Adopt - everything after there is a live VkInstance.
+  bool LoadInstanceFunctions();
 
   static VkBool32 DebugUtilsMessengerCallback(
       VkDebugUtilsMessageSeverityFlagBitsEXT message_severity,

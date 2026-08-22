@@ -26,6 +26,13 @@ class VulkanProvider : public GraphicsProvider {
   static std::unique_ptr<VulkanProvider> Create(bool with_gpu_emulation,
                                                 bool with_presentation);
 
+  // Takes an instance and device the caller already brought up - the libretro
+  // core, which has to create them inside the frontend's context negotiation
+  // rather than on its own schedule.
+  static std::unique_ptr<VulkanProvider> Adopt(
+      std::unique_ptr<VulkanInstance> vulkan_instance,
+      std::unique_ptr<VulkanDevice> vulkan_device, bool with_presentation);
+
   VulkanInstance* vulkan_instance() const { return vulkan_instance_.get(); }
 
   VulkanDevice* vulkan_device() const { return vulkan_device_.get(); }

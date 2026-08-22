@@ -240,6 +240,33 @@ Surface::TypeFlags VulkanPresenter::GetSupportedSurfaceTypes() const {
       vulkan_device_->vulkan_instance()->extensions());
 }
 
+bool VulkanPresenter::AcquireGuestOutputForSharing(VkImage& image_out,
+                                                   VkImageView& view_out,
+                                                   VkExtent2D& extent_out) {
+  std::shared_ptr<GuestOutputImage> guest_output_image;
+  {
+    uint32_t guest_output_mailbox_index;
+    std::unique_lock<std::mutex> guest_output_consumer_lock(
+        ConsumeGuestOutput(guest_output_mailbox_index, nullptr, nullptr));
+    if (guest_output_mailbox_index != UINT32_MAX) {
+      guest_output_image =
+          guest_output_images_[guest_output_mailbox_index].image;
+    }
+    // Holding a reference now, so the consumer lock can go.
+  }
+  if (!guest_output_image) {
+    return false;
+  }
+
+  image_out = guest_output_image->image();
+  view_out = guest_output_image->view();
+  extent_out = guest_output_image->extent();
+  // Replacing the previous one here rather than at the start: the caller is
+  // still sampling it until it asks for the next frame.
+  shared_guest_output_image_ = std::move(guest_output_image);
+  return true;
+}
+
 bool VulkanPresenter::CaptureGuestOutput(RawImage& image_out) {
   std::shared_ptr<GuestOutputImage> guest_output_image;
   {

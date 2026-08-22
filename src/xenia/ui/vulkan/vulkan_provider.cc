@@ -35,6 +35,27 @@ namespace xe {
 namespace ui {
 namespace vulkan {
 
+std::unique_ptr<VulkanProvider> VulkanProvider::Adopt(
+    std::unique_ptr<VulkanInstance> vulkan_instance,
+    std::unique_ptr<VulkanDevice> vulkan_device, const bool with_presentation) {
+  if (!vulkan_instance || !vulkan_device) {
+    return nullptr;
+  }
+
+  std::unique_ptr<VulkanProvider> provider(new VulkanProvider());
+  provider->vulkan_instance_ = std::move(vulkan_instance);
+  provider->vulkan_device_ = std::move(vulkan_device);
+
+  if (with_presentation) {
+    provider->ui_samplers_ = UISamplers::Create(provider->vulkan_device_.get());
+    if (!provider->ui_samplers_) {
+      return nullptr;
+    }
+  }
+
+  return provider;
+}
+
 std::unique_ptr<VulkanProvider> VulkanProvider::Create(
     const bool with_gpu_emulation, const bool with_presentation) {
   std::unique_ptr<VulkanProvider> provider(new VulkanProvider());

@@ -144,6 +144,14 @@ class VulkanPresenter final : public Presenter {
 
   bool CaptureGuestOutput(RawImage& image_out) override;
 
+  // Hands the latest guest output image to an external presenter - a libretro
+  // frontend that samples it directly instead of paying for a readback. The
+  // image is in kGuestOutputInternalLayout and stays alive until the next call,
+  // because the caller only samples it after this returns. False means no frame
+  // has been produced yet.
+  bool AcquireGuestOutputForSharing(VkImage& image_out, VkImageView& view_out,
+                                    VkExtent2D& extent_out);
+
   void AwaitUISubmissionCompletionFromUIThread(uint64_t submission_index) {
     ui_completion_timeline_.AwaitSubmissionAndUpdateCompleted(submission_index);
   }
@@ -208,6 +216,9 @@ class VulkanPresenter final : public Presenter {
     VkDeviceMemory memory_ = VK_NULL_HANDLE;
     VkImageView view_ = VK_NULL_HANDLE;
   };
+
+  // Keeps the image handed to an external presenter alive across the call.
+  std::shared_ptr<GuestOutputImage> shared_guest_output_image_;
 
   struct GuestOutputImageInstance {
     // Refresher-side reference (painting has its own references for the purpose

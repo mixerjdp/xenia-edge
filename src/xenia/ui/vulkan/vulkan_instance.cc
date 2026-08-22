@@ -49,6 +49,111 @@ namespace xe {
 namespace ui {
 namespace vulkan {
 
+bool VulkanInstance::LoadInstanceFunctions() {
+  Functions& ifn = functions_;
+  bool functions_loaded = true;
+
+
+#define XE_UI_VULKAN_FUNCTION(name)                                     \
+  functions_loaded &= (ifn.name = PFN_##name(ifn.vkGetInstanceProcAddr( \
+                           this->instance_, #name))) != nullptr;
+
+  // Vulkan 1.0.
+#include "xenia/ui/vulkan/functions/instance_1_0.inc"
+
+  // Extensions promoted to a Vulkan version supported by the instance.
+#define XE_UI_VULKAN_FUNCTION_PROMOTED(extension_name, core_name) \
+  functions_loaded &=                                             \
+      (ifn.core_name = PFN_##core_name(ifn.vkGetInstanceProcAddr( \
+           this->instance_, #core_name))) != nullptr;
+  if (this->api_version_ >= VK_MAKE_API_VERSION(0, 1, 1, 0)) {
+#include "xenia/ui/vulkan/functions/instance_1_1_khr_get_physical_device_properties2.inc"
+  }
+#undef XE_UI_VULKAN_FUNCTION_PROMOTED
+
+  // Non-promoted extensions, and extensions promoted to a Vulkan version not
+  // supported by the instance.
+#define XE_UI_VULKAN_FUNCTION_PROMOTED(extension_name, core_name) \
+  functions_loaded &=                                             \
+      (ifn.core_name = PFN_##core_name(ifn.vkGetInstanceProcAddr( \
+           this->instance_, #extension_name))) != nullptr;
+  if (this->api_version_ < VK_MAKE_API_VERSION(0, 1, 1, 0)) {
+    if (this->extensions_
+            .ext_1_1_KHR_get_physical_device_properties2) {
+#include "xenia/ui/vulkan/functions/instance_1_1_khr_get_physical_device_properties2.inc"
+    }
+  }
+#ifdef VK_USE_PLATFORM_XCB_KHR
+  if (this->extensions_.ext_KHR_xcb_surface) {
+#include "xenia/ui/vulkan/functions/instance_khr_xcb_surface.inc"
+  }
+#endif
+#ifdef VK_USE_PLATFORM_WAYLAND_KHR
+  if (this->extensions_.ext_KHR_wayland_surface) {
+#include "xenia/ui/vulkan/functions/instance_khr_wayland_surface.inc"
+  }
+#endif
+#ifdef VK_USE_PLATFORM_ANDROID_KHR
+  if (this->extensions_.ext_KHR_android_surface) {
+#include "xenia/ui/vulkan/functions/instance_khr_android_surface.inc"
+  }
+#endif
+#ifdef VK_USE_PLATFORM_METAL_EXT
+  if (this->extensions_.ext_EXT_metal_surface) {
+#include "xenia/ui/vulkan/functions/instance_ext_metal_surface.inc"
+  }
+#endif
+#ifdef VK_USE_PLATFORM_WIN32_KHR
+  if (this->extensions_.ext_KHR_win32_surface) {
+#include "xenia/ui/vulkan/functions/instance_khr_win32_surface.inc"
+  }
+#endif
+  if (this->extensions_.ext_KHR_surface) {
+#include "xenia/ui/vulkan/functions/instance_khr_surface.inc"
+  }
+  if (this->extensions_.ext_EXT_debug_utils) {
+#include "xenia/ui/vulkan/functions/instance_ext_debug_utils.inc"
+  }
+#undef XE_UI_VULKAN_FUNCTION_PROMOTED
+
+#undef XE_UI_VULKAN_FUNCTION
+
+  if (!functions_loaded) {
+    XELOGE("Failed to get all Vulkan instance function pointers");
+    return false;
+  }
+  return true;
+}
+
+std::unique_ptr<VulkanInstance> VulkanInstance::Adopt(
+    VkInstance instance, PFN_vkGetInstanceProcAddr get_instance_proc_addr,
+    uint32_t api_version, const Extensions& enabled_extensions) {
+  if (!instance || !get_instance_proc_addr) {
+    XELOGE("VulkanInstance::Adopt needs both an instance and a loader");
+    return nullptr;
+  }
+
+  std::unique_ptr<VulkanInstance> vulkan_instance(new VulkanInstance());
+  vulkan_instance->owns_instance_ = false;
+  vulkan_instance->instance_ = instance;
+  vulkan_instance->api_version_ = api_version;
+  vulkan_instance->extensions_ = enabled_extensions;
+
+  // No loader library and no global entry points: the owner already resolved
+  // them, and everything else hangs off this one pointer.
+  vulkan_instance->functions_.vkGetInstanceProcAddr = get_instance_proc_addr;
+  vulkan_instance->functions_.vkDestroyInstance = PFN_vkDestroyInstance(
+      get_instance_proc_addr(instance, "vkDestroyInstance"));
+
+  if (!vulkan_instance->LoadInstanceFunctions()) {
+    return nullptr;
+  }
+
+  XELOGI("Adopted a Vulkan {}.{} instance from the host",
+         VK_API_VERSION_MAJOR(api_version), VK_API_VERSION_MINOR(api_version));
+  return vulkan_instance;
+}
+
 std::unique_ptr<VulkanInstance> VulkanInstance::Create(
     const bool with_surface, const int validation_level) {
   std::unique_ptr<VulkanInstance> vulkan_instance(new VulkanInstance());
@@ -477,74 +582,7 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(
     return nullptr;
   }
 
-  // Load instance functions.
-
-#define XE_UI_VULKAN_FUNCTION(name)                                     \
-  functions_loaded &= (ifn.name = PFN_##name(ifn.vkGetInstanceProcAddr( \
-                           vulkan_instance->instance_, #name))) != nullptr;
-
-  // Vulkan 1.0.
-#include "xenia/ui/vulkan/functions/instance_1_0.inc"
-
-  // Extensions promoted to a Vulkan version supported by the instance.
-#define XE_UI_VULKAN_FUNCTION_PROMOTED(extension_name, core_name) \
-  functions_loaded &=                                             \
-      (ifn.core_name = PFN_##core_name(ifn.vkGetInstanceProcAddr( \
-           vulkan_instance->instance_, #core_name))) != nullptr;
-  if (vulkan_instance->api_version_ >= VK_MAKE_API_VERSION(0, 1, 1, 0)) {
-#include "xenia/ui/vulkan/functions/instance_1_1_khr_get_physical_device_properties2.inc"
-  }
-#undef XE_UI_VULKAN_FUNCTION_PROMOTED
-
-  // Non-promoted extensions, and extensions promoted to a Vulkan version not
-  // supported by the instance.
-#define XE_UI_VULKAN_FUNCTION_PROMOTED(extension_name, core_name) \
-  functions_loaded &=                                             \
-      (ifn.core_name = PFN_##core_name(ifn.vkGetInstanceProcAddr( \
-           vulkan_instance->instance_, #extension_name))) != nullptr;
-  if (vulkan_instance->api_version_ < VK_MAKE_API_VERSION(0, 1, 1, 0)) {
-    if (vulkan_instance->extensions_
-            .ext_1_1_KHR_get_physical_device_properties2) {
-#include "xenia/ui/vulkan/functions/instance_1_1_khr_get_physical_device_properties2.inc"
-    }
-  }
-#ifdef VK_USE_PLATFORM_XCB_KHR
-  if (vulkan_instance->extensions_.ext_KHR_xcb_surface) {
-#include "xenia/ui/vulkan/functions/instance_khr_xcb_surface.inc"
-  }
-#endif
-#ifdef VK_USE_PLATFORM_WAYLAND_KHR
-  if (vulkan_instance->extensions_.ext_KHR_wayland_surface) {
-#include "xenia/ui/vulkan/functions/instance_khr_wayland_surface.inc"
-  }
-#endif
-#ifdef VK_USE_PLATFORM_ANDROID_KHR
-  if (vulkan_instance->extensions_.ext_KHR_android_surface) {
-#include "xenia/ui/vulkan/functions/instance_khr_android_surface.inc"
-  }
-#endif
-#ifdef VK_USE_PLATFORM_METAL_EXT
-  if (vulkan_instance->extensions_.ext_EXT_metal_surface) {
-#include "xenia/ui/vulkan/functions/instance_ext_metal_surface.inc"
-  }
-#endif
-#ifdef VK_USE_PLATFORM_WIN32_KHR
-  if (vulkan_instance->extensions_.ext_KHR_win32_surface) {
-#include "xenia/ui/vulkan/functions/instance_khr_win32_surface.inc"
-  }
-#endif
-  if (vulkan_instance->extensions_.ext_KHR_surface) {
-#include "xenia/ui/vulkan/functions/instance_khr_surface.inc"
-  }
-  if (vulkan_instance->extensions_.ext_EXT_debug_utils) {
-#include "xenia/ui/vulkan/functions/instance_ext_debug_utils.inc"
-  }
-#undef XE_UI_VULKAN_FUNCTION_PROMOTED
-
-#undef XE_UI_VULKAN_FUNCTION
-
-  if (!functions_loaded) {
-    XELOGE("Failed to get all Vulkan instance function pointers");
+  if (!vulkan_instance->LoadInstanceFunctions()) {
     return nullptr;
   }
 
@@ -623,7 +661,7 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(
 }
 
 VulkanInstance::~VulkanInstance() {
-  if (instance_) {
+  if (instance_ && owns_instance_) {
     if (debug_utils_messenger_ != VK_NULL_HANDLE) {
       functions_.vkDestroyDebugUtilsMessengerEXT(
           instance_, debug_utils_messenger_, nullptr);
