@@ -20,6 +20,15 @@
 #include "xenia/ui/d3d12/d3d12_presenter.h"
 #include "xenia/ui/d3d12/d3d12_util.h"
 #include "xenia/ui/redist_installer_wx.h"
+DEFINE_path(
+    d3d12_runtime_dir, "",
+    "Directory holding the Direct3D 12 runtime files (dxcompiler.dll, "
+    "dxil.dll, D3D12Core.dll). Empty means a D3D12 folder next to the "
+    "executable, which is what the standalone app wants. An embedder whose "
+    "host executable it does not own - the libretro core - points this at its "
+    "own data directory instead.",
+    "D3D12");
+
 DEFINE_bool(d3d12_debug, false, "Enable Direct3D 12 and DXGI debug layer.",
             "D3D12");
 DEFINE_bool(d3d12_gpu_validation, false,
@@ -279,7 +288,11 @@ bool D3D12Provider::Initialize() {
   // Load the required DXIL shader compiler runtime (dxcompiler.dll + dxil.dll)
   // from the D3D12 folder next to the executable. The D3D12 backend can't run
   // without it, so offer to download it if it's missing.
-  auto d3d12_dir = xe::filesystem::GetExecutablePath().parent_path() / "D3D12";
+  auto d3d12_dir =
+      cvars::d3d12_runtime_dir.empty()
+          ? xe::filesystem::GetExecutablePath().parent_path() / "D3D12"
+          : cvars::d3d12_runtime_dir;
+  XELOGI("D3D12 runtime directory: {}", xe::path_to_utf8(d3d12_dir));
   pfn_dxcompiler_dxc_create_instance_ = nullptr;
   {
     EnsureShaderCompilerRuntime(d3d12_dir);

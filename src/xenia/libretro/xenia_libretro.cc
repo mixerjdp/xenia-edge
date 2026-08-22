@@ -67,6 +67,7 @@ DECLARE_bool(d3d12_install_missing_runtime);
 DECLARE_bool(headless);
 DECLARE_string(readback_resolve);
 DECLARE_bool(disable_context_promotion);
+DECLARE_path(d3d12_runtime_dir);
 
 // The app defines this one in xenia_main.cc, which the core doesn't link.
 DEFINE_string(hid, "nop", "Input system. Use: [any, nop, sdl, keyboard]", "HID");
@@ -362,6 +363,12 @@ void ApplyBackendCvars() {
   // D3D12 provider otherwise offers to download the DXIL shader compiler and
   // blocks on the answer, which wedges the whole frontend.
   cvars::d3d12_install_missing_runtime = false;
+  // ...which leaves the D3D12 backend needing its runtime already in place.
+  // Xenia looks next to the host executable by default, and that is the
+  // frontend's directory, not ours to fill. Point it at our own data dir so
+  // dxcompiler.dll, dxil.dll and D3D12Core.dll live where a libretro core is
+  // supposed to keep its files.
+  cvars::d3d12_runtime_dir = g_storage_root / "D3D12";
 
   // The guest raises its own dialogs too - the sign-in blade, the on-screen
   // keyboard, storage device pickers - and xenia draws those with ImGui into
