@@ -53,6 +53,11 @@
 #include "xenia/libretro/libretro_audio_driver.h"
 #include "xenia/libretro/libretro_input_driver.h"
 #include "xenia/libretro/libretro_log_sink.h"
+#include "xenia/libretro/libretro_vulkan.h"
+#include "xenia/ui/vulkan/vulkan_device.h"
+#include "xenia/ui/vulkan/vulkan_instance.h"
+#include "xenia/ui/vulkan/vulkan_presenter.h"
+#include "xenia/ui/vulkan/vulkan_provider.h"
 
 #if XE_PLATFORM_WIN32
 #include "xenia/base/main_win.h"
@@ -68,6 +73,8 @@ DECLARE_bool(headless);
 DECLARE_string(readback_resolve);
 DECLARE_bool(disable_context_promotion);
 DECLARE_path(d3d12_runtime_dir);
+DECLARE_int32(draw_resolution_scale_x);
+DECLARE_int32(draw_resolution_scale_y);
 
 // The app defines this one in xenia_main.cc, which the core doesn't link.
 DEFINE_string(hid, "nop", "Input system. Use: [any, nop, sdl, keyboard]", "HID");
@@ -82,6 +89,10 @@ using xe::libretro::LibretroLogSink;
 // current size is pushed through SET_GEOMETRY whenever it changes.
 constexpr unsigned kMaxWidth = 1920;
 constexpr unsigned kMaxHeight = 1080;
+// Resolution scaling multiplies the guest output past the unscaled ceiling, so
+// the frontend has to be told the scaled maximum or the frame gets cropped.
+unsigned ScaledMaxWidth();
+unsigned ScaledMaxHeight();
 constexpr unsigned kInitialWidth = 1280;
 constexpr unsigned kInitialHeight = 720;
 constexpr double kFramesPerSecond = 60.0;
@@ -134,6 +145,18 @@ bool g_input_bitmask_supported = false;
 // One frame's worth of stereo output, refilled every retro_run.
 std::vector<int16_t> g_audio_buffer;
 
+// Shared Vulkan context. Populated during the frontend's context negotiation,
+// which happens inside retro_load_game, long before the emulator thread wants
+// a graphics system.
+// Fixed for the lifetime of the core: the frontend sizes its framebuffer from
+// the maximum reported in retro_get_system_av_info, and that is asked once.
+unsigned g_resolution_scale = 1;
+
+bool g_hw_render_requested = false;
+retro_hw_render_callback g_hw_render = {};
+const retro_hw_render_interface_vulkan* g_vulkan_interface = nullptr;
+std::unique_ptr<xe::ui::vulkan::VulkanProvider> g_negotiated_provider;
+
 std::filesystem::path g_storage_root;
 std::filesystem::path g_content_root;
 std::filesystem::path g_cache_root;
@@ -161,6 +184,15 @@ const retro_variable kCoreOptions[] = {
      "Readback resolve; auto|fast|all|none"},
     {"xenia_context_promotion",
      "CPU context promotion; auto|enabled|disabled"},
+    // Off by default while it is being brought up: turning it on replaces the
+    // software readback path wholesale, since a Vulkan hardware context has to
+    // present through set_image rather than a CPU buffer.
+    {"xenia_hw_render",
+     "Share the frontend's Vulkan device (experimental); disabled|vulkan"},
+    // Read once at init because it decides how large a framebuffer the
+    // frontend allocates, which cannot change afterwards.
+    {"xenia_resolution_scale",
+     "Internal resolution scale (restart required); 1x|2x|3x"},
     {nullptr, nullptr},
 };
 
@@ -172,6 +204,22 @@ const char* GetOptionValue(const char* key) {
     return var.value;
   }
   return nullptr;
+}
+
+// Xenia clamps to what the device can actually do (scaling needs sparse
+// binding on Vulkan or tiled resources on D3D12), so an ambitious value here
+// degrades rather than fails. Capped at 3x because the software path has to
+// allocate a CPU framebuffer of the full scaled size.
+unsigned ScaledMaxWidth() { return kMaxWidth * g_resolution_scale; }
+unsigned ScaledMaxHeight() { return kMaxHeight * g_resolution_scale; }
+
+unsigned ReadResolutionScaleOption() {
+  const char* value = GetOptionValue("xenia_resolution_scale");
+  if (!value) {
+    return 1;
+  }
+  const int parsed = std::atoi(value);
+  return unsigned(std::clamp(parsed, 1, 3));
 }
 
 void ApplyLogLevelOption() {
@@ -273,6 +321,157 @@ class HeadlessGraphicsSystem final : public xe::gpu::null::NullGraphicsSystem {
   }
 };
 
+// ---------------------------------------------------------------------------
+// Shared Vulkan context
+// ---------------------------------------------------------------------------
+
+// The frontend's context exists from here until context_destroy. Xenia's own
+// objects are built later, on the emulator thread, so this only records that
+// the interface is available.
+void OnHwContextReset() {
+  const retro_hw_render_interface* interface_base = nullptr;
+  if (g_environ_cb(RETRO_ENVIRONMENT_GET_HW_RENDER_INTERFACE, &interface_base) &&
+      interface_base &&
+      interface_base->interface_type == RETRO_HW_RENDER_INTERFACE_VULKAN) {
+    g_vulkan_interface =
+        reinterpret_cast<const retro_hw_render_interface_vulkan*>(
+            interface_base);
+    g_log_cb(RETRO_LOG_INFO,
+             "[xenia] Vulkan render interface acquired (version %u)\n",
+             g_vulkan_interface->interface_version);
+  } else {
+    g_log_cb(RETRO_LOG_ERROR,
+             "[xenia] The frontend did not hand over a Vulkan render interface\n");
+  }
+}
+
+void OnHwContextDestroy() { g_vulkan_interface = nullptr; }
+
+// The frontend creates the instance, so it has to be told up front which API
+// version we need. Xenia treats 1.1 as the floor - below it,
+// KHR_get_physical_device_properties2 is an extension rather than core, and
+// the device feature queries depend on it.
+const VkApplicationInfo* GetVulkanApplicationInfo() {
+  static const VkApplicationInfo info = {
+      VK_STRUCTURE_TYPE_APPLICATION_INFO,
+      nullptr,
+      "Xenia",
+      0,
+      "Xenia",
+      0,
+      VK_MAKE_API_VERSION(0, 1, 1, 0),
+  };
+  return &info;
+}
+
+// Called by the frontend during its video setup. It owns the instance; we
+// create the logical device, because only Xenia knows which extensions and
+// features its renderer needs, and hand the result back for the frontend to
+// share.
+bool CreateVulkanDevice(retro_vulkan_context* context, VkInstance instance,
+                        VkPhysicalDevice gpu, VkSurfaceKHR surface,
+                        PFN_vkGetInstanceProcAddr get_instance_proc_addr,
+                        const char** required_device_extensions,
+                        unsigned num_required_device_extensions,
+                        const char** required_device_layers,
+                        unsigned num_required_device_layers,
+                        const VkPhysicalDeviceFeatures* required_features) {
+  (void)surface;
+  (void)required_device_extensions;
+  (void)num_required_device_extensions;
+  (void)required_device_layers;
+  (void)num_required_device_layers;
+  (void)required_features;
+
+  xe::ui::vulkan::VulkanInstance::Extensions instance_extensions;
+  // At 1.1 this one is core rather than an extension, and the frontend always
+  // enables the surface extensions for its own swapchain.
+  instance_extensions.ext_1_1_KHR_get_physical_device_properties2 = true;
+  instance_extensions.ext_KHR_surface = true;
+#ifdef VK_USE_PLATFORM_WIN32_KHR
+  instance_extensions.ext_KHR_win32_surface = true;
+#endif
+
+  auto adopted_instance = xe::ui::vulkan::VulkanInstance::Adopt(
+      instance, get_instance_proc_addr, VK_MAKE_API_VERSION(0, 1, 1, 0),
+      instance_extensions);
+  if (!adopted_instance) {
+    g_log_cb(RETRO_LOG_ERROR, "[xenia] Could not adopt the frontend's Vulkan instance\n");
+    return false;
+  }
+
+  // Honour the frontend's choice of GPU when it made one; otherwise take the
+  // first device Xenia can actually run on.
+  std::vector<VkPhysicalDevice> physical_devices;
+  if (gpu != VK_NULL_HANDLE) {
+    physical_devices.push_back(gpu);
+  } else {
+    adopted_instance->EnumeratePhysicalDevices(physical_devices);
+  }
+
+  std::unique_ptr<xe::ui::vulkan::VulkanDevice> device;
+  for (const VkPhysicalDevice physical_device : physical_devices) {
+    device = xe::ui::vulkan::VulkanDevice::CreateIfSupported(
+        adopted_instance.get(), physical_device, /*with_gpu_emulation=*/true,
+        /*with_swapchain=*/true);
+    if (device) {
+      break;
+    }
+  }
+  if (!device) {
+    g_log_cb(RETRO_LOG_ERROR,
+             "[xenia] No Vulkan device the emulator can use\n");
+    return false;
+  }
+
+  // Hand over the graphics/compute family, the one Xenia actually renders on -
+  // sharing any other would leave the frontend submitting to a queue that
+  // never sees the guest's work.
+  const uint32_t queue_family = device->queue_family_graphics_compute();
+  const auto& queue_families = device->queue_families();
+  if (queue_family >= queue_families.size() ||
+      queue_families[queue_family].queues.empty()) {
+    g_log_cb(RETRO_LOG_ERROR,
+             "[xenia] The Vulkan device exposes no graphics queue\n");
+    return false;
+  }
+
+  context->gpu = device->physical_device();
+  context->device = device->device();
+  context->queue = queue_families[queue_family].queues[0]->queue;
+  context->queue_family_index = queue_family;
+  context->presentation_queue = context->queue;
+  context->presentation_queue_family_index = context->queue_family_index;
+
+  g_negotiated_provider = xe::ui::vulkan::VulkanProvider::Adopt(
+      std::move(adopted_instance), std::move(device),
+      /*with_presentation=*/true);
+  if (!g_negotiated_provider) {
+    g_log_cb(RETRO_LOG_ERROR, "[xenia] Could not build a provider from the shared device\n");
+    return false;
+  }
+
+  g_log_cb(RETRO_LOG_INFO,
+           "[xenia] Sharing the frontend's Vulkan device (queue family %u)\n",
+           context->queue_family_index);
+  return true;
+}
+
+void DestroyVulkanDevice() {
+  // The frontend destroys the instance; our device object goes with the
+  // provider, whose lifetime the emulator owns.
+  g_negotiated_provider.reset();
+}
+
+const retro_hw_render_context_negotiation_interface_vulkan
+    kVulkanNegotiationInterface = {
+        RETRO_HW_RENDER_CONTEXT_NEGOTIATION_INTERFACE_VULKAN,
+        RETRO_HW_RENDER_CONTEXT_NEGOTIATION_INTERFACE_VULKAN_VERSION,
+        GetVulkanApplicationInfo,
+        CreateVulkanDevice,
+        DestroyVulkanDevice,
+};
+
 // Backend the guest renders with. This is xenia's own host GPU device, not the
 // frontend's: the frame is read back to system memory and handed over through
 // video_cb, so the two never share a device. Phase 4 replaces the readback with
@@ -295,7 +494,37 @@ std::string SelectedGpuBackend() {
   return name;
 }
 
+// Uses the device negotiated with the frontend instead of creating one. The
+// provider is built during negotiation, which happens well before the emulator
+// thread asks for a graphics system, so it just gets handed over here.
+class SharedVulkanGraphicsSystem final
+    : public xe::gpu::vulkan::VulkanGraphicsSystem {
+ public:
+  explicit SharedVulkanGraphicsSystem(
+      std::unique_ptr<xe::ui::vulkan::VulkanProvider> provider)
+      : provider_to_adopt_(std::move(provider)) {}
+
+  xe::X_STATUS Setup(xe::cpu::Processor* processor,
+                     xe::kernel::KernelState* kernel_state,
+                     xe::ui::WindowedAppContext* app_context,
+                     bool with_presentation) override {
+    provider_ = std::move(provider_to_adopt_);
+    return xe::gpu::GraphicsSystem::Setup(processor, kernel_state, app_context,
+                                          with_presentation);
+  }
+
+ private:
+  std::unique_ptr<xe::ui::vulkan::VulkanProvider> provider_to_adopt_;
+};
+
 std::unique_ptr<xe::gpu::GraphicsSystem> CreateGraphicsSystem() {
+  if (g_negotiated_provider) {
+    g_log_cb(RETRO_LOG_INFO,
+             "[xenia] GPU backend: vulkan (shared with the frontend)\n");
+    return std::make_unique<SharedVulkanGraphicsSystem>(
+        std::move(g_negotiated_provider));
+  }
+
   const std::string backend = SelectedGpuBackend();
   g_log_cb(RETRO_LOG_INFO, "[xenia] GPU backend: %s\n", backend.c_str());
 #if XE_PLATFORM_WIN32
@@ -335,6 +564,9 @@ std::vector<std::unique_ptr<xe::hid::InputDriver>> CreateInputDrivers(
 // option as authoritative would let a stale "enabled" silently undo a title's
 // own override - which is exactly what happened to FIFA.
 void ApplyTunableOptions() {
+  cvars::draw_resolution_scale_x = int32_t(g_resolution_scale);
+  cvars::draw_resolution_scale_y = int32_t(g_resolution_scale);
+
   if (const char* mode = GetOptionValue("xenia_readback_resolve")) {
     const std::string value(mode);
     if (value == "fast" || value == "all" || value == "none") {
@@ -534,12 +766,67 @@ void UpdateGeometry(unsigned width, unsigned height) {
   retro_game_geometry geometry = {};
   geometry.base_width = width;
   geometry.base_height = height;
-  geometry.max_width = kMaxWidth;
-  geometry.max_height = kMaxHeight;
+  geometry.max_width = ScaledMaxWidth();
+  geometry.max_height = ScaledMaxHeight();
   geometry.aspect_ratio = 16.0f / 9.0f;
   g_environ_cb(RETRO_ENVIRONMENT_SET_GEOMETRY, &geometry);
   g_log_cb(RETRO_LOG_INFO, "[xenia] Guest output is now %ux%u\n", width,
            height);
+}
+
+// Hands the guest's own image straight to the frontend, which samples it
+// where it already lives on the shared device. No readback, no copy, no
+// channel conversion - the whole point of sharing the device.
+bool PresentSharedGuestFrame() {
+  if (!g_vulkan_interface || g_state.load() != CoreState::kRunning ||
+      !g_emulator) {
+    return false;
+  }
+  xe::gpu::GraphicsSystem* graphics_system = g_emulator->graphics_system();
+  if (!graphics_system) {
+    return false;
+  }
+  auto* presenter = static_cast<xe::ui::vulkan::VulkanPresenter*>(
+      graphics_system->presenter());
+  if (!presenter) {
+    return false;
+  }
+
+  VkImage image = VK_NULL_HANDLE;
+  VkImageView view = VK_NULL_HANDLE;
+  VkExtent2D extent = {};
+  if (!presenter->AcquireGuestOutputForSharing(image, view, extent) ||
+      !extent.width || !extent.height) {
+    return false;
+  }
+
+  // The frontend wants the view described as well as handed over, so it can
+  // build its own descriptors against it.
+  retro_vulkan_image frontend_image = {};
+  frontend_image.image_view = view;
+  frontend_image.image_layout =
+      xe::ui::vulkan::VulkanPresenter::kGuestOutputInternalLayout;
+  VkImageViewCreateInfo& view_info = frontend_image.create_info;
+  view_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+  view_info.image = image;
+  view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+  view_info.format = xe::ui::vulkan::VulkanPresenter::kGuestOutputFormat;
+  view_info.components.r = VK_COMPONENT_SWIZZLE_IDENTITY;
+  view_info.components.g = VK_COMPONENT_SWIZZLE_IDENTITY;
+  view_info.components.b = VK_COMPONENT_SWIZZLE_IDENTITY;
+  view_info.components.a = VK_COMPONENT_SWIZZLE_IDENTITY;
+  view_info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+  view_info.subresourceRange.levelCount = 1;
+  view_info.subresourceRange.layerCount = 1;
+
+  // The guest's work is already submitted on the queue both sides share, so
+  // the frontend's own submission is ordered after it without a semaphore.
+  g_vulkan_interface->set_image(g_vulkan_interface->handle, &frontend_image, 0,
+                               nullptr, VK_QUEUE_FAMILY_IGNORED);
+
+  UpdateGeometry(extent.width, extent.height);
+  g_video_cb(RETRO_HW_FRAME_BUFFER_VALID, extent.width, extent.height, 0);
+  return true;
 }
 
 // Pulls the latest guest frame out of the presenter and hands it to the
@@ -567,8 +854,8 @@ bool PresentGuestFrame() {
     return false;
   }
 
-  const unsigned width = std::min<unsigned>(image.width, kMaxWidth);
-  const unsigned height = std::min<unsigned>(image.height, kMaxHeight);
+  const unsigned width = std::min<unsigned>(image.width, ScaledMaxWidth());
+  const unsigned height = std::min<unsigned>(image.height, ScaledMaxHeight());
   UpdateGeometry(width, height);
 
   // RawImage is R8 G8 B8 X8 in memory; XRGB8888 wants 0x00RRGGBB, which is
@@ -665,14 +952,53 @@ RETRO_API void retro_init(void) {
 
   config::SetupConfig(g_storage_root);
 
+  // Read before anything sizes itself from it - the frontend asks for the
+  // geometry once and cannot be told a bigger maximum later.
+  g_resolution_scale = ReadResolutionScaleOption();
+  if (g_resolution_scale > 1) {
+    g_log_cb(RETRO_LOG_INFO, "[xenia] Internal resolution scale: %ux\n",
+             g_resolution_scale);
+  }
+
   // Sized for the maximum the guest can ask for, so a resolution change never
   // has to reallocate on the frontend's thread.
-  g_framebuffer.assign(size_t(kMaxWidth) * kMaxHeight, 0u);
+  g_framebuffer.assign(size_t(ScaledMaxWidth()) * ScaledMaxHeight(), 0u);
 
   g_can_dupe = false;
   g_environ_cb(RETRO_ENVIRONMENT_GET_CAN_DUPE, &g_can_dupe);
   g_input_bitmask_supported =
       g_environ_cb(RETRO_ENVIRONMENT_GET_INPUT_BITMASKS, nullptr);
+
+  // Ask for a shared Vulkan context if the user opted in. The frontend calls
+  // back into CreateVulkanDevice during this, so the provider exists by the
+  // time the emulator thread needs it.
+  const char* hw_render = GetOptionValue("xenia_hw_render");
+  g_hw_render_requested = hw_render && std::string(hw_render) == "vulkan";
+  if (g_hw_render_requested) {
+    if (!g_environ_cb(
+            RETRO_ENVIRONMENT_SET_HW_RENDER_CONTEXT_NEGOTIATION_INTERFACE,
+            const_cast<retro_hw_render_context_negotiation_interface_vulkan*>(
+                &kVulkanNegotiationInterface))) {
+      g_log_cb(RETRO_LOG_WARN,
+               "[xenia] The frontend refused the Vulkan negotiation interface\n");
+      g_hw_render_requested = false;
+    }
+  }
+  if (g_hw_render_requested) {
+    g_hw_render.context_type = RETRO_HW_CONTEXT_VULKAN;
+    g_hw_render.version_major = 1;
+    g_hw_render.version_minor = 1;
+    g_hw_render.context_reset = OnHwContextReset;
+    g_hw_render.context_destroy = OnHwContextDestroy;
+    g_hw_render.cache_context = true;
+    g_hw_render.bottom_left_origin = false;
+    if (!g_environ_cb(RETRO_ENVIRONMENT_SET_HW_RENDER, &g_hw_render)) {
+      g_log_cb(RETRO_LOG_WARN,
+               "[xenia] The frontend refused a Vulkan hardware context; "
+               "falling back to the software readback\n");
+      g_hw_render_requested = false;
+    }
+  }
 
   // Names the guest's buttons in the frontend's remapping UI. Without this it
   // shows the bare RetroPad labels, which do not match an Xbox pad.
@@ -723,8 +1049,8 @@ RETRO_API void retro_get_system_av_info(struct retro_system_av_info* info) {
   std::memset(info, 0, sizeof(*info));
   info->geometry.base_width = g_output_width;
   info->geometry.base_height = g_output_height;
-  info->geometry.max_width = kMaxWidth;
-  info->geometry.max_height = kMaxHeight;
+  info->geometry.max_width = ScaledMaxWidth();
+  info->geometry.max_height = ScaledMaxHeight();
   info->geometry.aspect_ratio = 16.0f / 9.0f;
   info->timing.fps = kFramesPerSecond;
   info->timing.sample_rate = kSampleRate;
@@ -833,15 +1159,21 @@ RETRO_API void retro_run(void) {
     }
   }
 
-  if (!PresentGuestFrame()) {
+  const bool presented =
+      g_hw_render_requested ? PresentSharedGuestFrame() : PresentGuestFrame();
+  if (!presented) {
     if (g_state.load() == CoreState::kRunning && g_had_first_frame &&
         g_can_dupe) {
       // Running, just no new guest frame this tick - let the frontend hold the
       // previous one instead of flashing the status screen back up.
       g_video_cb(nullptr, g_output_width, g_output_height,
                  g_output_width * sizeof(uint32_t));
-    } else {
+    } else if (!g_hw_render_requested) {
       PaintStatusFrame();
+    } else if (g_can_dupe) {
+      // Nothing to show yet and no CPU framebuffer allowed under a hardware
+      // context, so hold whatever the frontend last had.
+      g_video_cb(nullptr, g_output_width, g_output_height, 0);
     }
   } else {
     g_had_first_frame = true;

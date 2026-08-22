@@ -52,6 +52,14 @@ elseif(XE_TARGET_AARCH64)
   target_link_libraries(xenia-libretro PRIVATE xenia-cpu-backend-a64)
 endif()
 
+# xenia-ui-vulkan keeps its Vulkan-Headers include private, so a target that
+# includes Vulkan types itself needs its own copy of the path.
+if(NOT APPLE)
+  target_include_directories(xenia-libretro PRIVATE
+    ${PROJECT_SOURCE_DIR}/third_party/Vulkan-Headers/include
+  )
+endif()
+
 # Guest rendering backends. The core reads the finished frame back to system
 # memory and hands it to the frontend, so these are xenia's own host devices -
 # it never shares a device with the frontend (yet).
