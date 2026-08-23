@@ -11,6 +11,7 @@
 #define XENIA_LIBRETRO_LIBRETRO_LOG_SINK_H_
 
 #include <cstddef>
+#include <cstdint>
 #include <string>
 
 #include "xenia/base/logging.h"
@@ -31,9 +32,20 @@ class LibretroLogSink final : public LogSink {
 
  private:
   void EmitLine();
+  // Forwards a line, first reporting anything that was suppressed before it.
+  void Forward(const std::string& line);
+  void ReportSuppressed();
 
   retro_log_printf_t log_cb_;
   std::string line_;
+
+  // Repeat suppression. A guest can make Xenia log the same complaint on every
+  // draw - Forza Motorsport does thousands a frame - and forwarding each one
+  // costs the frontend a formatted write, which drags the whole emulator down.
+  // Only the message body is compared: the frame number and thread id in the
+  // prefix differ between otherwise identical lines.
+  std::string last_body_;
+  uint64_t suppressed_ = 0;
 };
 
 }  // namespace libretro
