@@ -75,6 +75,7 @@ DECLARE_bool(disable_context_promotion);
 DECLARE_path(d3d12_runtime_dir);
 DECLARE_int32(draw_resolution_scale_x);
 DECLARE_int32(draw_resolution_scale_y);
+DECLARE_uint32(internal_display_resolution);
 
 // The app defines this one in xenia_main.cc, which the core doesn't link.
 DEFINE_string(hid, "nop", "Input system. Use: [any, nop, sdl, keyboard]", "HID");
@@ -165,36 +166,138 @@ std::filesystem::path g_cache_root;
 // Core options
 // ---------------------------------------------------------------------------
 
-// Legacy SET_VARIABLES rather than the v2 option API: every frontend
-// understands it, and phase 1 only needs a couple of knobs. Phase 5 upgrades
-// this to the full v2 definitions once the option set is worth it.
-// The first value after the ';' is the default, so keep info first — a
-// work-in-progress core that logs nothing by default is useless to debug.
+// Options are declared twice on purpose. The v2 API gives each setting a
+// short name and a separate explanation, which is what the frontend's menu
+// wants; the legacy list is the fallback for frontends that predate it, where
+// the one string has to carry both.
+const retro_core_option_v2_definition kCoreOptionDefinitions[] = {
+    {"xenia_log_level",
+     "Log Detail",
+     nullptr,
+     "How much of the emulator's log is sent to the frontend. Lower levels "
+     "cost less while a game runs.",
+     nullptr,
+     nullptr,
+     {{"info", nullptr},
+      {"debug", nullptr},
+      {"warning", nullptr},
+      {"error", nullptr},
+      {"disabled", nullptr},
+      {nullptr, nullptr}},
+     "info"},
+    {"xenia_gpu",
+     "Graphics API",
+     nullptr,
+     "Which API the guest renders through. Both reach the same GPU; 'null' "
+     "draws nothing and is only useful for debugging startup. Read once at "
+     "startup.",
+     nullptr,
+     nullptr,
+     {{"auto", "Auto (Vulkan)"},
+      {"vulkan", "Vulkan"},
+      {"d3d12", "Direct3D 12"},
+      {"null", "None (debug)"},
+      {nullptr, nullptr}},
+     "auto"},
+    {"xenia_resolution_scale",
+     "Internal Resolution",
+     nullptr,
+     "Renders the guest at a multiple of its native resolution. Sharper, but "
+     "costs a lot of GPU time and memory. Read once at startup.",
+     nullptr,
+     nullptr,
+     {{"1x", "1x (native)"},
+      {"2x", "2x"},
+      {"3x", "3x"},
+      {nullptr, nullptr}},
+     "1x"},
+    {"xenia_display_resolution",
+     "Guest Display Resolution",
+     nullptr,
+     "The resolution the guest believes its display is, for games that honour "
+     "it. Unlike the scale below it is a real resolution rather than a "
+     "multiplier, so it offers steps in between - but it only works on titles "
+     "that support the mode. Read once at startup.",
+     nullptr,
+     nullptr,
+     {{"default", "Default (1280x720)"},
+      {"1280x720", "1280x720"},
+      {"1280x960", "1280x960"},
+      {"1360x768", "1360x768"},
+      {"1440x900", "1440x900"},
+      {"1680x1050", "1680x1050"},
+      {"1920x1080", "1920x1080"},
+      {nullptr, nullptr}},
+     "default"},
+    {"xenia_readback_resolve",
+     "Readback Resolve",
+     nullptr,
+     "Copies rendered surfaces back into guest memory. Games that read their "
+     "own framebuffer need 'all' or they come out dark or missing effects. "
+     "A per-game config overrides this.",
+     nullptr,
+     nullptr,
+     {{"auto", "Auto (leave as configured)"},
+      {"fast", "Fast (only what is read)"},
+      {"all", "All (slower, most compatible)"},
+      {"none", "None (fastest)"},
+      {nullptr, nullptr}},
+     "auto"},
+    {"xenia_context_promotion",
+     "Context Promotion",
+     nullptr,
+     "Speeds up translated guest code. A few titles, mostly sports games, "
+     "animate wrong with it on. A per-game config overrides this.",
+     nullptr,
+     nullptr,
+     {{"auto", "Auto (leave as configured)"},
+      {"enabled", "On (faster)"},
+      {"disabled", "Off (more compatible)"},
+      {nullptr, nullptr}},
+     "auto"},
+    {"xenia_hw_render",
+     "Share GPU Device With Frontend",
+     nullptr,
+     "Renders on the frontend's own Vulkan device and hands the finished "
+     "image over directly, instead of copying every frame through system "
+     "memory. Needs the frontend's video driver to be Vulkan, and overrides "
+     "the Graphics API setting. Experimental. Read once at startup.",
+     nullptr,
+     nullptr,
+     {{"off", nullptr}, {"on", nullptr}, {nullptr, nullptr}},
+     "off"},
+    {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, {{nullptr, nullptr}},
+     nullptr},
+};
+
+const retro_core_options_v2 kCoreOptionsV2 = {nullptr,
+                                              const_cast<
+                                                  retro_core_option_v2_definition*>(
+                                                  kCoreOptionDefinitions)};
+
+// Fallback for frontends without the v2 API: one string carrying both the
+// name and the choices.
 const retro_variable kCoreOptions[] = {
     {"xenia_log_level",
-     "Log level; info|debug|warning|error|disabled"},
-    {"xenia_apu",
-     "Audio system (restart required); nop|any|xaudio2|sdl"},
+     "Log detail sent to the frontend; info|debug|warning|error|disabled"},
     {"xenia_gpu",
-     "GPU backend (restart required); auto|vulkan|d3d12|null"},
-    // Both default to "auto", meaning the core leaves the cvar alone so a
-    // per-game config keeps whatever it set. Only an explicit choice here
-    // overrides one.
-    {"xenia_readback_resolve",
-     "Readback resolve; auto|fast|all|none"},
-    {"xenia_context_promotion",
-     "CPU context promotion; auto|enabled|disabled"},
-    // Off by default while it is being brought up: turning it on replaces the
-    // software readback path wholesale, since a Vulkan hardware context has to
-    // present through set_image rather than a CPU buffer.
-    {"xenia_hw_render",
-     "Share the frontend's Vulkan device (experimental); disabled|vulkan"},
-    // Read once at init because it decides how large a framebuffer the
-    // frontend allocates, which cannot change afterwards.
+     "Graphics API the guest renders with (restart); auto|vulkan|d3d12|null"},
     {"xenia_resolution_scale",
-     "Internal resolution scale (restart required); 1x|2x|3x"},
+     "Internal render resolution - sharper, heavier (restart); 1x|2x|3x"},
+    {"xenia_display_resolution",
+     "Guest display resolution (restart); "
+     "default|1280x720|1280x960|1360x768|1440x900|1680x1050|1920x1080"},
+    {"xenia_readback_resolve",
+     "Readback resolve - fixes dark or missing visuals; auto|fast|all|none"},
+    {"xenia_context_promotion",
+     "Context promotion - off fixes some sports animations; "
+     "auto|enabled|disabled"},
+    {"xenia_hw_render",
+     "Share the frontend's GPU device (Vulkan only, restart); off|on"},
     {nullptr, nullptr},
 };
+
+
 
 const char* GetOptionValue(const char* key) {
   retro_variable var = {};
@@ -567,6 +670,24 @@ void ApplyTunableOptions() {
   cvars::draw_resolution_scale_x = int32_t(g_resolution_scale);
   cvars::draw_resolution_scale_y = int32_t(g_resolution_scale);
 
+  // Indices into internal_display_resolution_entries in graphics_system.h.
+  if (const char* resolution = GetOptionValue("xenia_display_resolution")) {
+    const std::string value(resolution);
+    if (value == "1280x720") {
+      cvars::internal_display_resolution = 8;
+    } else if (value == "1280x960") {
+      cvars::internal_display_resolution = 10;
+    } else if (value == "1360x768") {
+      cvars::internal_display_resolution = 12;
+    } else if (value == "1440x900") {
+      cvars::internal_display_resolution = 13;
+    } else if (value == "1680x1050") {
+      cvars::internal_display_resolution = 14;
+    } else if (value == "1920x1080") {
+      cvars::internal_display_resolution = 16;
+    }
+  }
+
   if (const char* mode = GetOptionValue("xenia_readback_resolve")) {
     const std::string value(mode);
     if (value == "fast" || value == "all" || value == "none") {
@@ -905,7 +1026,17 @@ RETRO_API unsigned retro_api_version(void) { return RETRO_API_VERSION; }
 
 RETRO_API void retro_set_environment(retro_environment_t cb) {
   g_environ_cb = cb;
-  cb(RETRO_ENVIRONMENT_SET_VARIABLES, const_cast<retro_variable*>(kCoreOptions));
+  // Prefer the v2 declarations so the menu shows a short name with the
+  // explanation underneath, and fall back to the flat list otherwise.
+  unsigned options_version = 0;
+  if (cb(RETRO_ENVIRONMENT_GET_CORE_OPTIONS_VERSION, &options_version) &&
+      options_version >= 2) {
+    cb(RETRO_ENVIRONMENT_SET_CORE_OPTIONS_V2,
+       const_cast<retro_core_options_v2*>(&kCoreOptionsV2));
+  } else {
+    cb(RETRO_ENVIRONMENT_SET_VARIABLES,
+       const_cast<retro_variable*>(kCoreOptions));
+  }
 }
 
 RETRO_API void retro_set_video_refresh(retro_video_refresh_t cb) {
@@ -973,7 +1104,18 @@ RETRO_API void retro_init(void) {
   // back into CreateVulkanDevice during this, so the provider exists by the
   // time the emulator thread needs it.
   const char* hw_render = GetOptionValue("xenia_hw_render");
-  g_hw_render_requested = hw_render && std::string(hw_render) == "vulkan";
+  g_hw_render_requested = hw_render && std::string(hw_render) == "on";
+  if (g_hw_render_requested) {
+    // Worth saying out loud: when the device is shared, its API is whatever
+    // the frontend's video driver uses, so the backend choice has no effect.
+    const std::string backend = SelectedGpuBackend();
+    if (backend != "vulkan") {
+      g_log_cb(RETRO_LOG_WARN,
+               "[xenia] Sharing the frontend's device, so the '%s' GPU backend "
+               "option is ignored\n",
+               backend.c_str());
+    }
+  }
   if (g_hw_render_requested) {
     if (!g_environ_cb(
             RETRO_ENVIRONMENT_SET_HW_RENDER_CONTEXT_NEGOTIATION_INTERFACE,
