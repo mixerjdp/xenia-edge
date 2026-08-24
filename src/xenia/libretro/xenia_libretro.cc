@@ -136,6 +136,13 @@ std::atomic<CoreState> g_state{CoreState::kIdle};
 std::string g_failure_reason;
 std::atomic<uint64_t> g_frame_count{0};
 
+// Kept for reset, which relaunches the same content on a fresh kernel.
+std::filesystem::path g_content_path;
+std::atomic<bool> g_resetting{false};
+// Bumped every time a title is torn down, so the thread that was waiting on
+// the old one can tell its exit apart from a real one and stay quiet.
+std::atomic<uint64_t> g_title_generation{0};
+
 std::vector<uint32_t> g_framebuffer;
 unsigned g_output_width = kInitialWidth;
 unsigned g_output_height = kInitialHeight;
@@ -617,32 +624,38 @@ std::string SelectedGpuBackend() {
 // Uses the device negotiated with the frontend instead of creating one. The
 // provider is built during negotiation, which happens well before the emulator
 // thread asks for a graphics system, so it just gets handed over here.
+// The provider is only borrowed, never owned: the frontend's device has to
+// outlive this graphics system, which a reset tears down and rebuilds. It is
+// released again in Shutdown through owns_provider_.
 class SharedVulkanGraphicsSystem final
     : public xe::gpu::vulkan::VulkanGraphicsSystem {
  public:
   explicit SharedVulkanGraphicsSystem(
-      std::unique_ptr<xe::ui::vulkan::VulkanProvider> provider)
-      : provider_to_adopt_(std::move(provider)) {}
+      xe::ui::vulkan::VulkanProvider* provider)
+      : borrowed_provider_(provider) {}
 
   xe::X_STATUS Setup(xe::cpu::Processor* processor,
                      xe::kernel::KernelState* kernel_state,
                      xe::ui::WindowedAppContext* app_context,
                      bool with_presentation) override {
-    provider_ = std::move(provider_to_adopt_);
+    provider_.reset(borrowed_provider_);
+    owns_provider_ = false;
     return xe::gpu::GraphicsSystem::Setup(processor, kernel_state, app_context,
                                           with_presentation);
   }
 
  private:
-  std::unique_ptr<xe::ui::vulkan::VulkanProvider> provider_to_adopt_;
+  xe::ui::vulkan::VulkanProvider* borrowed_provider_;
 };
 
 std::unique_ptr<xe::gpu::GraphicsSystem> CreateGraphicsSystem() {
   if (g_negotiated_provider) {
     g_log_cb(RETRO_LOG_INFO,
              "[xenia] GPU backend: vulkan (shared with the frontend)\n");
+    // Handed over by pointer, not moved: a reset builds a second graphics
+    // system around this same device, and the frontend still references it.
     return std::make_unique<SharedVulkanGraphicsSystem>(
-        std::move(g_negotiated_provider));
+        g_negotiated_provider.get());
   }
 
   const std::string backend = SelectedGpuBackend();
@@ -811,11 +824,60 @@ void Fail(const std::string& reason) {
 // Runs on its own thread, mirroring EmulatorApp::EmulatorThread: everything
 // past Setup can block for a long time, and the frontend's thread must stay
 // free to keep calling retro_run.
+// Everything between a bare kernel and a running title. Shared by the initial
+// boot and by reset so the two sequences cannot drift apart: a reset lands on
+// a kernel as fresh as the one Setup produces, and needs the same steps.
+bool StartTitle(const std::filesystem::path& path) {
+  // The kernel is new, so nothing is signed in - including after a reset,
+  // where the profile only auto-logs-in at creation time.
+  EnsureProfileSignedIn();
+
+  // After the per-game config, so a title override can't drag in a backend
+  // phase 1 has no plumbing for.
+  ApplyBackendCvars();
+
+  xe::X_STATUS result = g_emulator->SetupSubsystems();
+  if (XFAILED(result)) {
+    Fail(fmt::format("Failed to setup subsystems: {:08X}", result));
+    return false;
+  }
+
+  // A fresh graphics system brings its own frame limiter thread, so the
+  // frontend has to be handed the pacing again every time one is built.
+  if (xe::gpu::GraphicsSystem* graphics_system =
+          g_emulator->graphics_system()) {
+    graphics_system->SetHostDrivenVblank(true);
+  }
+
+  g_log_cb(RETRO_LOG_INFO, "[xenia] Launching %s\n",
+           xe::path_to_utf8(path).c_str());
+  // Mounts the content itself, so a reset does not have to re-mount it.
+  result = g_emulator->LaunchPath(path);
+  if (XFAILED(result)) {
+    Fail(fmt::format("Failed to launch title: {:08X}", result));
+    return false;
+  }
+
+  g_state.store(CoreState::kRunning);
+  g_log_cb(RETRO_LOG_INFO, "[xenia] Title running: %s (%08X)\n",
+           g_emulator->title_name().c_str(), g_emulator->title_id());
+  return true;
+}
+
+// Blocks until the title stops. A reset stops it too, so the exit is only
+// worth reporting when this is still the title that was being waited on.
+void WaitForTitleExit() {
+  const uint64_t generation = g_title_generation.load();
+  g_emulator->WaitUntilExit();
+  if (g_title_generation.load() == generation) {
+    g_log_cb(RETRO_LOG_INFO, "[xenia] Title exited\n");
+  }
+}
+
 void EmulatorThread(std::filesystem::path path) {
   xe::threading::set_name("Xenia Emulator");
 
   g_emulator->MountStandardDrives();
-  EnsureProfileSignedIn();
 
   ApplyTunableOptions();
   config::LoadGameConfigForFile(path);
@@ -828,35 +890,33 @@ void EmulatorThread(std::filesystem::path path) {
          g_state.load() == CoreState::kStarting) {
     std::this_thread::sleep_for(std::chrono::milliseconds(4));
   }
-  // After the per-game config, so a title override can't drag in a backend
-  // phase 1 has no plumbing for.
-  ApplyBackendCvars();
 
-  xe::X_STATUS result = g_emulator->SetupSubsystems();
-  if (XFAILED(result)) {
-    Fail(fmt::format("Failed to setup subsystems: {:08X}", result));
+  if (!StartTitle(path)) {
     return;
   }
+  WaitForTitleExit();
+}
 
-  if (xe::gpu::GraphicsSystem* graphics_system =
-          g_emulator->graphics_system()) {
-    graphics_system->SetHostDrivenVblank(true);
+// Reset relaunches the title on a fresh kernel, which is what the frontend's
+// Restart means. It runs on its own thread because tearing the guest down
+// blocks for as long as its threads take to die, and retro_run has to keep
+// being answered meanwhile - the frontend would otherwise look hung.
+//
+// ResetTitle does the delicate part (stopping the dispatch thread and the
+// command processor before terminating guest threads, then Shutdown/Setup);
+// it stops short of bringing subsystems back up, which is exactly the seam
+// StartTitle picks up from.
+void ResetThread(std::filesystem::path path) {
+  xe::threading::set_name("Xenia Reset");
+
+  g_title_generation.fetch_add(1);
+  g_emulator->ResetTitle();
+
+  const bool started = StartTitle(path);
+  g_resetting.store(false);
+  if (started) {
+    WaitForTitleExit();
   }
-
-  g_log_cb(RETRO_LOG_INFO, "[xenia] Launching %s\n",
-           xe::path_to_utf8(path).c_str());
-  result = g_emulator->LaunchPath(path);
-  if (XFAILED(result)) {
-    Fail(fmt::format("Failed to launch title: {:08X}", result));
-    return;
-  }
-
-  g_state.store(CoreState::kRunning);
-  g_log_cb(RETRO_LOG_INFO, "[xenia] Title running: %s (%08X)\n",
-           g_emulator->title_name().c_str(), g_emulator->title_id());
-
-  g_emulator->WaitUntilExit();
-  g_log_cb(RETRO_LOG_INFO, "[xenia] Title exited\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -1228,9 +1288,22 @@ RETRO_API void retro_set_controller_port_device(unsigned port,
 }
 
 RETRO_API void retro_reset(void) {
-  // A guest reset means relaunching the title, which needs the teardown path
-  // phase 1 doesn't have yet.
-  g_log_cb(RETRO_LOG_WARN, "[xenia] Reset is not implemented yet\n");
+  if (g_state.load() != CoreState::kRunning) {
+    g_log_cb(RETRO_LOG_WARN,
+             "[xenia] Reset ignored: no title is running\n");
+    return;
+  }
+  if (g_resetting.exchange(true)) {
+    g_log_cb(RETRO_LOG_WARN, "[xenia] Reset is already in progress\n");
+    return;
+  }
+
+  g_log_cb(RETRO_LOG_INFO, "[xenia] Resetting\n");
+  // Written from the frontend's thread, which is also the only one that reads
+  // it, so the status screen comes back while the guest is being rebuilt.
+  g_had_first_frame = false;
+  g_state.store(CoreState::kStarting);
+  std::thread(ResetThread, g_content_path).detach();
 }
 
 RETRO_API bool retro_load_game(const struct retro_game_info* game) {
@@ -1253,6 +1326,7 @@ RETRO_API bool retro_load_game(const struct retro_game_info* game) {
 
   const std::filesystem::path path =
       std::filesystem::absolute(xe::to_path(game->path));
+  g_content_path = path;
 
   g_emulator =
       new xe::Emulator("", g_storage_root, g_content_root, g_cache_root);
