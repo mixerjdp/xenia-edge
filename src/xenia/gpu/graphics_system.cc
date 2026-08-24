@@ -270,7 +270,12 @@ void GraphicsSystem::Shutdown() {
     presenter_.reset();
   }
 
-  provider_.reset();
+  if (owns_provider_) {
+    provider_.reset();
+  } else {
+    // Borrowed: the device behind it is still in use by whoever lent it.
+    (void)provider_.release();
+  }
 }
 
 void GraphicsSystem::OnHostGpuLossFromAnyThread(

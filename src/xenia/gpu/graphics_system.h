@@ -162,6 +162,10 @@ class GraphicsSystem {
   kernel::KernelState* kernel_state_ = nullptr;
   ui::WindowedAppContext* app_context_ = nullptr;
   std::unique_ptr<ui::GraphicsProvider> provider_;
+  // False when the provider belongs to an embedder that outlives this graphics
+  // system - the libretro core keeps the frontend's shared device across title
+  // relaunches, so Shutdown must let go of it rather than destroy it.
+  bool owns_provider_ = true;
 
   uint32_t interrupt_callback_ = 0;
   uint32_t interrupt_callback_data_ = 0;
