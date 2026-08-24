@@ -72,6 +72,7 @@ DECLARE_bool(d3d12_install_missing_runtime);
 DECLARE_bool(headless);
 DECLARE_string(readback_resolve);
 DECLARE_bool(disable_context_promotion);
+DECLARE_string(render_target_path);
 DECLARE_path(d3d12_runtime_dir);
 DECLARE_int32(draw_resolution_scale_x);
 DECLARE_int32(draw_resolution_scale_y);
@@ -266,6 +267,19 @@ const retro_core_option_v2_definition kCoreOptionDefinitions[] = {
      nullptr,
      {{"off", nullptr}, {"on", nullptr}, {nullptr, nullptr}},
      "off"},
+    {"xenia_render_target_path",
+     "Render Target Path",
+     nullptr,
+     "How render targets are emulated. 'Performance' copies between render "
+     "targets when their layout changes; 'accuracy' uses a per-pixel path "
+     "that fixes some titles' lighting at a real cost to speed. A per-game "
+     "config overrides this.",
+     nullptr,
+     nullptr,
+     {{"performance", "Performance"},
+      {"accuracy", "Accuracy (ROV/FSI)"},
+      {nullptr, nullptr}},
+     "performance"},
     {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, {{nullptr, nullptr}},
      nullptr},
 };
@@ -294,6 +308,9 @@ const retro_variable kCoreOptions[] = {
      "auto|enabled|disabled"},
     {"xenia_hw_render",
      "Share the frontend's GPU device (Vulkan only, restart); off|on"},
+    {"xenia_render_target_path",
+     "Render target path - accuracy fixes some lighting, costs speed; "
+     "performance|accuracy"},
     {nullptr, nullptr},
 };
 
@@ -700,6 +717,12 @@ void ApplyTunableOptions() {
       cvars::disable_context_promotion = false;
     } else if (value == "disabled") {
       cvars::disable_context_promotion = true;
+    }
+  }
+  if (const char* path = GetOptionValue("xenia_render_target_path")) {
+    const std::string value(path);
+    if (value == "performance" || value == "accuracy") {
+      cvars::render_target_path = value;
     }
   }
 }
