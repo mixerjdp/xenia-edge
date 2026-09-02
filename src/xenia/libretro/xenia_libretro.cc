@@ -157,29 +157,6 @@ std::atomic<bool> g_frontend_ready{false};
 bool g_can_dupe = false;
 unsigned g_frames_inspected = 0;
 unsigned g_shared_frames_reported = 0;
-std::chrono::steady_clock::time_point g_fps_last_report;
-uint64_t g_fps_last_frame_count = 0;
-
-// Where a frame's time actually goes. The interesting one is `outside`: the
-// stretch between one retro_run returning and the next starting, which is the
-// frontend's own present and wait, and is invisible from in here otherwise.
-struct FrameTiming {
-  double outside = 0.0;
-  double vblank = 0.0;
-  double present = 0.0;
-  double audio = 0.0;
-  double total = 0.0;
-  // Inside present, split so the guest's own frame can be told apart from
-  // what the frontend does with it.
-  double acquire = 0.0;   // getting the finished guest image
-  double handover = 0.0;  // set_image
-  double video_cb = 0.0;  // the frontend composing and presenting
-  uint32_t frames = 0;
-};
-FrameTiming g_timing;
-std::chrono::steady_clock::time_point g_last_run_exit;
-uint64_t g_last_produced = 0;
-uint64_t g_last_consumed = 0;
 bool g_input_bitmask_supported = false;
 // One frame's worth of stereo output, refilled every retro_run.
 std::vector<int16_t> g_audio_buffer;
@@ -583,11 +560,12 @@ bool CreateVulkanDevice(retro_vulkan_context* context, VkInstance instance,
                         unsigned num_required_device_layers,
                         const VkPhysicalDeviceFeatures* required_features) {
   (void)surface;
-  (void)required_device_extensions;
-  (void)num_required_device_extensions;
+  // Device layers are ignored on purpose: they were deprecated in Vulkan 1.0
+  // and the loader applies the instance's to the device anyway. The extensions
+  // and features are not - the frontend renders on this device too, and asking
+  // for them is how it says what it needs.
   (void)required_device_layers;
   (void)num_required_device_layers;
-  (void)required_features;
 
   xe::ui::vulkan::VulkanInstance::Extensions instance_extensions;
   // At 1.1 this one is core rather than an extension, and the frontend always
@@ -619,7 +597,8 @@ bool CreateVulkanDevice(retro_vulkan_context* context, VkInstance instance,
   for (const VkPhysicalDevice physical_device : physical_devices) {
     device = xe::ui::vulkan::VulkanDevice::CreateIfSupported(
         adopted_instance.get(), physical_device, /*with_gpu_emulation=*/true,
-        /*with_swapchain=*/true);
+        /*with_swapchain=*/true, required_device_extensions,
+        num_required_device_extensions, required_features);
     if (device) {
       break;
     }
@@ -1116,73 +1095,6 @@ void UpdateGeometry(unsigned width, unsigned height) {
 // Hands the guest's own image straight to the frontend, which samples it
 // where it already lives on the shared device. No readback, no copy, no
 // channel conversion - the whole point of sharing the device.
-// Reports the rate the frontend is actually driving us at. Whether a title is
-// slow, and by how much, is otherwise only visible on screen - which is no
-// help when comparing backends from a log. Follows the Log Detail option, so
-// it stays quiet unless the log was asked for.
-void ReportFrameRate() {
-  if (g_state.load() != CoreState::kRunning || cvars::log_level < 2) {
-    return;
-  }
-  const auto now = std::chrono::steady_clock::now();
-  if (g_fps_last_report == std::chrono::steady_clock::time_point{}) {
-    g_fps_last_report = now;
-    g_fps_last_frame_count = g_frame_count.load();
-    return;
-  }
-  const auto elapsed = now - g_fps_last_report;
-  if (elapsed < std::chrono::seconds(10)) {
-    return;
-  }
-  const uint64_t frames = g_frame_count.load();
-  const double seconds = std::chrono::duration<double>(elapsed).count();
-  g_log_cb(RETRO_LOG_INFO, "[xenia] %.2f fps (%llu frames in %.1fs)\n",
-           double(frames - g_fps_last_frame_count) / seconds,
-           static_cast<unsigned long long>(frames - g_fps_last_frame_count),
-           seconds);
-
-  // Average milliseconds per frame, split by where they went. These have to
-  // add up to the frame period, so whichever one dominates is the answer.
-  if (g_timing.frames) {
-    const double n = double(g_timing.frames);
-    g_log_cb(RETRO_LOG_INFO,
-             "[xenia]   ms/frame: outside=%.2f retro_run=%.2f "
-             "(vblank=%.2f present=%.2f audio=%.2f) over %u frames\n",
-             g_timing.outside / n, g_timing.total / n, g_timing.vblank / n,
-             g_timing.present / n, g_timing.audio / n, g_timing.frames);
-    g_log_cb(RETRO_LOG_INFO,
-             "[xenia]   present split: acquire=%.2f handover=%.2f "
-             "video_cb=%.2f\n",
-             g_timing.acquire / n, g_timing.handover / n,
-             g_timing.video_cb / n);
-
-    // Frames the guest rendered in full that the mailbox threw away because
-    // nothing consumed them in time - GPU work that never reached the screen.
-    if (g_emulator) {
-      if (xe::gpu::GraphicsSystem* gs = g_emulator->graphics_system()) {
-        if (xe::ui::Presenter* p = gs->presenter()) {
-          const uint64_t produced = p->guest_output_frames_produced();
-          const uint64_t consumed = p->guest_output_frames_consumed();
-          const uint64_t dp = produced - g_last_produced;
-          const uint64_t dc = consumed - g_last_consumed;
-          g_log_cb(RETRO_LOG_INFO,
-                   "[xenia]   guest frames: rendered=%llu shown=%llu "
-                   "dropped=%llu\n",
-                   static_cast<unsigned long long>(dp),
-                   static_cast<unsigned long long>(dc),
-                   static_cast<unsigned long long>(dp > dc ? dp - dc : 0));
-          g_last_produced = produced;
-          g_last_consumed = consumed;
-        }
-      }
-    }
-  }
-  g_timing = FrameTiming();
-
-  g_fps_last_report = now;
-  g_fps_last_frame_count = frames;
-}
-
 // Says out loud that the shared path is delivering frames, the way the
 // readback path reports its first captures. Without it a shared frame that
 // never arrives looks exactly like a title drawing nothing. Only the first
@@ -1220,27 +1132,17 @@ bool PresentSharedGuestFrameD3D12() {
   ID3D12Resource* resource = nullptr;
   uint32_t width = 0;
   uint32_t height = 0;
-  const auto t0 = std::chrono::steady_clock::now();
   if (!presenter->AcquireGuestOutputForSharing(resource, width, height) ||
       !width || !height) {
     return false;
   }
-  const auto t1 = std::chrono::steady_clock::now();
 
   g_d3d12_interface->set_texture(
       g_d3d12_interface->handle, resource,
       xe::ui::d3d12::D3D12Presenter::kGuestOutputFormat);
 
   UpdateGeometry(width, height);
-  const auto t2 = std::chrono::steady_clock::now();
   g_video_cb(RETRO_HW_FRAME_BUFFER_VALID, width, height, 0);
-  const auto t3 = std::chrono::steady_clock::now();
-
-  using msd = std::chrono::duration<double, std::milli>;
-  g_timing.acquire += msd(t1 - t0).count();
-  g_timing.handover += msd(t2 - t1).count();
-  g_timing.video_cb += msd(t3 - t2).count();
-
   ReportSharedPresent("d3d12", width, height);
   return true;
 }
@@ -1697,17 +1599,7 @@ RETRO_API void retro_unload_game(void) {
 }
 
 RETRO_API void retro_run(void) {
-  using clock = std::chrono::steady_clock;
-  const auto run_entry = clock::now();
-  const auto ms = [](clock::time_point a, clock::time_point b) {
-    return std::chrono::duration<double, std::milli>(b - a).count();
-  };
-  if (g_last_run_exit != clock::time_point{}) {
-    g_timing.outside += ms(g_last_run_exit, run_entry);
-  }
-
   g_frame_count.fetch_add(1);
-  ReportFrameRate();
   // The frontend's video context exists by the time it starts calling us, so
   // this is the emulator thread's cue to bring the graphics system up.
   g_frontend_ready.store(true, std::memory_order_release);
@@ -1726,16 +1618,12 @@ RETRO_API void retro_run(void) {
   // Frame pacing is inverted compared to standalone xenia: the frontend calls
   // us once per frame, and that call is what advances the guest's vblank. The
   // emulator's own frame limiter thread stands down (SetHostDrivenVblank).
-  const auto t_vblank_start = clock::now();
   if (g_emulator) {
     if (xe::gpu::GraphicsSystem* graphics_system =
             g_emulator->graphics_system()) {
       graphics_system->TriggerHostVblank();
     }
   }
-
-  const auto t_present_start = clock::now();
-  g_timing.vblank += ms(t_vblank_start, t_present_start);
 
   const bool presented =
       g_hw_render_requested ? PresentSharedGuestFrame() : PresentGuestFrame();
@@ -1757,9 +1645,6 @@ RETRO_API void retro_run(void) {
     g_had_first_frame = true;
   }
 
-  const auto t_audio_start = clock::now();
-  g_timing.present += ms(t_present_start, t_audio_start);
-
   if (g_audio_batch_cb) {
     // Hand over what the guest has actually produced since the last call.
     //
@@ -1778,11 +1663,6 @@ RETRO_API void retro_run(void) {
     }
   }
 
-  const auto run_exit = clock::now();
-  g_timing.audio += ms(t_audio_start, run_exit);
-  g_timing.total += ms(run_entry, run_exit);
-  ++g_timing.frames;
-  g_last_run_exit = run_exit;
 }
 
 RETRO_API size_t retro_serialize_size(void) { return 0; }

@@ -396,8 +396,6 @@ bool Presenter::RefreshGuestOutput(
   // after switching from UI thread painting to doing it in the guest output
   // thread, will immediately recover to having the latest frame always sent to
   // the host present call on the CPU and all frames reaching a present call).
-  guest_output_frames_produced_.fetch_add(1, std::memory_order_relaxed);
-
   uint32_t last_acquired_and_ready =
       guest_output_mailbox_acquired_and_ready_.load(std::memory_order_relaxed);
   // Desired acquired = current acquired (changed only by the consumers).
@@ -652,12 +650,6 @@ std::unique_lock<std::mutex> Presenter::ConsumeGuestOutput(
         (old_acquired_and_ready & ~uint32_t(3)) | (old_acquired_and_ready >> 2);
   }
   uint32_t mailbox_index = desired_acquired_and_ready & 3;
-  // Only count a genuinely new image: returning the same one again means the
-  // producer has not refreshed since, which is the consumer running ahead
-  // rather than frames being dropped.
-  if ((old_acquired_and_ready & 3) != mailbox_index) {
-    guest_output_frames_consumed_.fetch_add(1, std::memory_order_relaxed);
-  }
   // Give the current acquired image to the caller, or UINT32_MAX if it's
   // inactive.
   const GuestOutputProperties& properties =
