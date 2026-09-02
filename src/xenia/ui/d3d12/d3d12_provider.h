@@ -33,6 +33,15 @@ class D3D12Provider : public GraphicsProvider {
 
   static std::unique_ptr<D3D12Provider> Create();
 
+  // Takes a device and queue the caller already brought up - the libretro
+  // core, whose frontend owns both. libretro has no context negotiation
+  // interface for Direct3D 12 the way it does for Vulkan, so the device
+  // arrives as-is. That is workable here only because initialization never
+  // requests capabilities at creation time, it queries them off the device
+  // afterwards. Both are retained, so the caller keeps its own references.
+  static std::unique_ptr<D3D12Provider> Adopt(ID3D12Device* device,
+                                              ID3D12CommandQueue* queue);
+
   std::unique_ptr<Presenter> CreatePresenter(
       Presenter::HostGpuLossCallback host_gpu_loss_callback =
           Presenter::FatalErrorHostGpuLossCallback) override;
@@ -180,6 +189,13 @@ class D3D12Provider : public GraphicsProvider {
 
   static bool EnableIncreaseBasePriorityPrivilege();
   bool Initialize();
+
+  // Set by Adopt before Initialize runs. When present, the device and the
+  // queue are taken rather than created, and everything that has to happen
+  // before device creation (the debug layer, DRED, adapter selection) is
+  // skipped because that ship has sailed.
+  ID3D12Device* adopted_device_ = nullptr;
+  ID3D12CommandQueue* adopted_queue_ = nullptr;
 
   typedef HRESULT(WINAPI* PFNCreateDXGIFactory2)(UINT Flags, REFIID riid,
                                                  _COM_Outptr_ void** ppFactory);

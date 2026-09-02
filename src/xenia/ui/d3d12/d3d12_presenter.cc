@@ -70,6 +70,123 @@ Surface::TypeFlags D3D12Presenter::GetSupportedSurfaceTypes() const {
   return types;
 }
 
+bool D3D12Presenter::AcquireGuestOutputForSharing(
+    ID3D12Resource*& resource_out, uint32_t& width_out, uint32_t& height_out) {
+  Microsoft::WRL::ComPtr<ID3D12Resource> guest_output_resource;
+  {
+    uint32_t guest_output_mailbox_index;
+    std::unique_lock<std::mutex> guest_output_consumer_lock(
+        ConsumeGuestOutput(guest_output_mailbox_index, nullptr, nullptr));
+    if (guest_output_mailbox_index != UINT32_MAX) {
+      guest_output_resource =
+          guest_output_resources_[guest_output_mailbox_index].second;
+    }
+    // Holding a reference now, so the consumer lock can go.
+  }
+  if (!guest_output_resource) {
+    return false;
+  }
+
+  ID3D12Device* device = provider_.GetDevice();
+
+  if (!sharing_completion_timeline_) {
+    sharing_completion_timeline_ = D3D12GPUCompletionTimeline::Create(device);
+    if (!sharing_completion_timeline_) {
+      XELOGE("D3D12Presenter: Failed to create the guest output sharing fence");
+      return false;
+    }
+  }
+
+  SharingCommandList& slot = sharing_command_lists_[sharing_command_list_index_];
+  if (!slot.allocator) {
+    if (FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                              IID_PPV_ARGS(&slot.allocator)))) {
+      XELOGE(
+          "D3D12Presenter: Failed to create the guest output sharing command "
+          "allocator");
+      return false;
+    }
+    if (FAILED(device->CreateCommandList(
+            0, D3D12_COMMAND_LIST_TYPE_DIRECT, slot.allocator.Get(), nullptr,
+            IID_PPV_ARGS(&slot.list)))) {
+      slot.allocator.Reset();
+      XELOGE(
+          "D3D12Presenter: Failed to create the guest output sharing command "
+          "list");
+      return false;
+    }
+  } else {
+    // Reusing the slot, so whatever it recorded last time has to be done.
+    sharing_completion_timeline_->AwaitSubmissionAndUpdateCompleted(
+        slot.submission_index);
+    if (FAILED(slot.allocator->Reset()) ||
+        FAILED(slot.list->Reset(slot.allocator.Get(), nullptr))) {
+      XELOGE(
+          "D3D12Presenter: Failed to reset the guest output sharing command "
+          "list");
+      return false;
+    }
+  }
+
+  D3D12_RESOURCE_BARRIER barriers[2];
+  uint32_t barrier_count = 0;
+  auto add_barrier = [&](ID3D12Resource* resource,
+                         D3D12_RESOURCE_STATES before,
+                         D3D12_RESOURCE_STATES after) {
+    D3D12_RESOURCE_BARRIER& barrier = barriers[barrier_count++];
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+    barrier.Transition.pResource = resource;
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    barrier.Transition.StateBefore = before;
+    barrier.Transition.StateAfter = after;
+  };
+  if constexpr (kGuestOutputInternalState !=
+                D3D12_RESOURCE_STATE_COPY_SOURCE) {
+    // Put the previously lent resource back before it can be refreshed again.
+    // Skipped when the same one comes round, which needs no transition at all.
+    if (shared_guest_output_resource_ &&
+        shared_guest_output_resource_ != guest_output_resource) {
+      add_barrier(shared_guest_output_resource_.Get(),
+                  D3D12_RESOURCE_STATE_COPY_SOURCE, kGuestOutputInternalState);
+    }
+    if (shared_guest_output_resource_ != guest_output_resource) {
+      add_barrier(guest_output_resource.Get(), kGuestOutputInternalState,
+                  D3D12_RESOURCE_STATE_COPY_SOURCE);
+    }
+  }
+  if (barrier_count) {
+    slot.list->ResourceBarrier(barrier_count, barriers);
+  }
+  if (FAILED(slot.list->Close())) {
+    XELOGE(
+        "D3D12Presenter: Failed to close the guest output sharing command "
+        "list");
+    return false;
+  }
+
+  ID3D12CommandQueue* const direct_queue = provider_.GetDirectQueue();
+  ID3D12CommandList* execute_command_list = slot.list.Get();
+  direct_queue->ExecuteCommandLists(1, &execute_command_list);
+  slot.submission_index = sharing_completion_timeline_->GetUpcomingSubmission();
+  if (FAILED(sharing_completion_timeline_->SignalAndAdvance(direct_queue))) {
+    XELOGE(
+        "D3D12Presenter: Failed to signal the guest output sharing fence");
+    return false;
+  }
+  sharing_command_list_index_ =
+      (sharing_command_list_index_ + 1) % kSharingCommandListCount;
+
+  const D3D12_RESOURCE_DESC desc = guest_output_resource->GetDesc();
+  resource_out = guest_output_resource.Get();
+  width_out = uint32_t(desc.Width);
+  height_out = uint32_t(desc.Height);
+  // Replaced here rather than at the start: the caller is still reading the
+  // previous one until it asks for this frame.
+  shared_guest_output_resource_ = std::move(guest_output_resource);
+  return true;
+}
+
 bool D3D12Presenter::CaptureGuestOutput(RawImage& image_out) {
   Microsoft::WRL::ComPtr<ID3D12Resource> guest_output_resource;
   {

@@ -102,6 +102,17 @@ class D3D12Presenter final : public Presenter {
 
   bool CaptureGuestOutput(RawImage& image_out) override;
 
+  // Hands the latest guest output resource over to be read on the same device,
+  // instead of copying it back to system memory like CaptureGuestOutput.
+  //
+  // The resource is left in D3D12_RESOURCE_STATE_COPY_SOURCE, which is what a
+  // libretro frontend asks for, and is transitioned back to the internal state
+  // on the following call - the mailbox is three deep, so it cannot come round
+  // for reuse before that. A reference is held until then, so the caller may
+  // keep reading it until it asks for the next frame.
+  bool AcquireGuestOutputForSharing(ID3D12Resource*& resource_out,
+                                    uint32_t& width_out, uint32_t& height_out);
+
   void AwaitUISubmissionCompletionFromUIThread(uint64_t submission_index) {
     ui_completion_timeline_->AwaitSubmissionAndUpdateCompleted(
         submission_index);
@@ -329,6 +340,25 @@ class D3D12Presenter final : public Presenter {
   // UI completion timeline with the submission index that can be given to UI
   // drawers (accessible from the UI thread only, at any time).
   std::unique_ptr<D3D12GPUCompletionTimeline> ui_completion_timeline_;
+
+  // Guest output sharing (AcquireGuestOutputForSharing). All of this is only
+  // brought up if something actually shares, so the usual paths pay nothing.
+  //
+  // The resource currently lent out, kept alive and in COPY_SOURCE until the
+  // next acquire puts it back.
+  Microsoft::WRL::ComPtr<ID3D12Resource> shared_guest_output_resource_;
+  // Enough command list slots that a transition submitted for one frame has
+  // long finished by the time its slot comes round again.
+  static constexpr uint32_t kSharingCommandListCount = 3;
+  struct SharingCommandList {
+    Microsoft::WRL::ComPtr<ID3D12CommandAllocator> allocator;
+    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> list;
+    uint64_t submission_index = 0;
+  };
+  std::array<SharingCommandList, kSharingCommandListCount>
+      sharing_command_lists_;
+  uint32_t sharing_command_list_index_ = 0;
+  std::unique_ptr<D3D12GPUCompletionTimeline> sharing_completion_timeline_;
 
   // Accessible only by painting and by surface connection lifetime management
   // (ConnectOrReconnectPaintingToSurfaceFromUIThread,

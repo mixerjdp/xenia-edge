@@ -159,6 +159,23 @@ std::unique_ptr<D3D12Provider> D3D12Provider::Create() {
   return provider;
 }
 
+std::unique_ptr<D3D12Provider> D3D12Provider::Adopt(
+    ID3D12Device* device, ID3D12CommandQueue* queue) {
+  if (!device || !queue) {
+    return nullptr;
+  }
+  std::unique_ptr<D3D12Provider> provider(new D3D12Provider);
+  provider->adopted_device_ = device;
+  provider->adopted_queue_ = queue;
+  if (!provider->Initialize()) {
+    // No FatalError here, unlike Create: an embedder can fall back to its own
+    // path, and a message box would wedge the frontend that hosts us.
+    XELOGE("Failed to initialize Direct3D 12 on the adopted device");
+    return nullptr;
+  }
+  return provider;
+}
+
 D3D12Provider::~D3D12Provider() {
   if (graphics_analysis_ != nullptr) {
     graphics_analysis_->Release();
@@ -336,8 +353,11 @@ bool D3D12Provider::Initialize() {
 
   // The D3D12SDKVersion exports make d3d12.dll load D3D12Core.dll at the first
   // device creation, which fails outright if it's missing, so fetch it first.
+  // An adopted device is already created, so whatever runtime it needed is
+  // demonstrably in place and there is nothing to fetch.
   std::error_code ec;
-  if (!std::filesystem::exists(d3d12_dir / "D3D12Core.dll", ec)) {
+  if (!adopted_device_ &&
+      !std::filesystem::exists(d3d12_dir / "D3D12Core.dll", ec)) {
     // Returns only on decline or failure. On success it restarts.
     EnsureAgilityRuntime(d3d12_dir);
     if (!std::filesystem::exists(d3d12_dir / "D3D12Core.dll", ec)) {
@@ -367,8 +387,9 @@ bool D3D12Provider::Initialize() {
     }
   }
 
-  // Enable the debug layer.
-  bool debug = cvars::d3d12_debug;
+  // Enable the debug layer. This and DRED below only take effect if set
+  // before the device is created, so with an adopted device they are moot.
+  bool debug = cvars::d3d12_debug && !adopted_device_;
   if (debug) {
     ID3D12Debug* debug_interface;
     if (SUCCEEDED(
@@ -400,7 +421,7 @@ bool D3D12Provider::Initialize() {
 
   // Enable Device Removed Extended Data. Must be set before device creation,
   // and unlike the debug layer it does not need the Graphics Tools feature.
-  if (cvars::d3d12_dred) {
+  if (cvars::d3d12_dred && !adopted_device_) {
     ID3D12DeviceRemovedExtendedDataSettings* dred_settings;
     if (SUCCEEDED(
             pfn_d3d12_get_debug_interface_(IID_PPV_ARGS(&dred_settings)))) {
@@ -425,29 +446,48 @@ bool D3D12Provider::Initialize() {
   // Choose the adapter.
   uint32_t adapter_index = 0;
   IDXGIAdapter1* adapter = nullptr;
-  while (dxgi_factory->EnumAdapters1(adapter_index, &adapter) == S_OK) {
-    DXGI_ADAPTER_DESC1 adapter_desc;
-    if (SUCCEEDED(adapter->GetDesc1(&adapter_desc))) {
-      if (SUCCEEDED(pfn_d3d12_create_device_(adapter, D3D_FEATURE_LEVEL_11_0,
-                                             _uuidof(ID3D12Device), nullptr))) {
-        if (cvars::d3d12_adapter >= 0) {
-          if (adapter_index == cvars::d3d12_adapter) {
-            break;
-          }
-        } else if (cvars::d3d12_adapter == -2) {
-          if (adapter_desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) {
-            break;
-          }
-        } else {
-          if (!(adapter_desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)) {
-            break;
+  if (adopted_device_) {
+    // The choice was already made by whoever created the device. Find that
+    // same adapter again by LUID, because the GPU code keys its per-vendor
+    // workarounds off the IDs read from it below.
+    const LUID device_luid = adopted_device_->GetAdapterLuid();
+    while (dxgi_factory->EnumAdapters1(adapter_index, &adapter) == S_OK) {
+      DXGI_ADAPTER_DESC1 adapter_desc;
+      if (SUCCEEDED(adapter->GetDesc1(&adapter_desc)) &&
+          adapter_desc.AdapterLuid.LowPart == device_luid.LowPart &&
+          adapter_desc.AdapterLuid.HighPart == device_luid.HighPart) {
+        break;
+      }
+      adapter->Release();
+      adapter = nullptr;
+      ++adapter_index;
+    }
+  } else {
+    while (dxgi_factory->EnumAdapters1(adapter_index, &adapter) == S_OK) {
+      DXGI_ADAPTER_DESC1 adapter_desc;
+      if (SUCCEEDED(adapter->GetDesc1(&adapter_desc))) {
+        if (SUCCEEDED(pfn_d3d12_create_device_(
+                adapter, D3D_FEATURE_LEVEL_11_0, _uuidof(ID3D12Device),
+                nullptr))) {
+          if (cvars::d3d12_adapter >= 0) {
+            if (adapter_index == cvars::d3d12_adapter) {
+              break;
+            }
+          } else if (cvars::d3d12_adapter == -2) {
+            if (adapter_desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) {
+              break;
+            }
+          } else {
+            if (!(adapter_desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)) {
+              break;
+            }
           }
         }
       }
+      adapter->Release();
+      adapter = nullptr;
+      ++adapter_index;
     }
-    adapter->Release();
-    adapter = nullptr;
-    ++adapter_index;
   }
   if (adapter == nullptr) {
     XELOGE(
@@ -480,10 +520,15 @@ bool D3D12Provider::Initialize() {
     }
   }
 
-  // Create the Direct3D 12 device.
+  // Create the Direct3D 12 device, or take the one that was handed to us.
   ID3D12Device* device;
-  if (FAILED(pfn_d3d12_create_device_(adapter, D3D_FEATURE_LEVEL_11_0,
-                                      IID_PPV_ARGS(&device)))) {
+  if (adopted_device_) {
+    device = adopted_device_;
+    // Retained so the shared destructor path stays balanced; the lender keeps
+    // its own reference.
+    device->AddRef();
+  } else if (FAILED(pfn_d3d12_create_device_(adapter, D3D_FEATURE_LEVEL_11_0,
+                                             IID_PPV_ARGS(&device)))) {
     XELOGE("Failed to create a Direct3D 12 feature level 11_0 device");
     adapter->Release();
     dxgi_factory->Release();
@@ -556,7 +601,17 @@ bool D3D12Provider::Initialize() {
     d3d12_info_queue->Release();
   }
 
-  // Create the command queue for graphics.
+  // Create the command queue for graphics, or take the lender's.
+  //
+  // Sharing the queue rather than creating a second one is what keeps the
+  // guest's rendering ordered ahead of whatever the lender does with the
+  // finished frame, with no fence between them - the same reasoning as
+  // sharing a queue family on Vulkan.
+  ID3D12CommandQueue* direct_queue = nullptr;
+  if (adopted_queue_) {
+    direct_queue = adopted_queue_;
+    direct_queue->AddRef();
+  } else {
   D3D12_COMMAND_QUEUE_DESC queue_desc;
   queue_desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
   if (cvars::d3d12_queue_priority >= 2) {
@@ -575,7 +630,6 @@ bool D3D12Provider::Initialize() {
   }
   queue_desc.Flags = D3D12_COMMAND_QUEUE_FLAG_NONE;
   queue_desc.NodeMask = 0;
-  ID3D12CommandQueue* direct_queue;
   if (FAILED(device->CreateCommandQueue(&queue_desc,
                                         IID_PPV_ARGS(&direct_queue)))) {
     bool queue_created = false;
@@ -594,6 +648,7 @@ bool D3D12Provider::Initialize() {
       dxgi_factory->Release();
       return false;
     }
+  }
   }
 
   dxgi_factory_ = dxgi_factory;
