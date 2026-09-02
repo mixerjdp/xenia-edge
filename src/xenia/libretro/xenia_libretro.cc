@@ -62,6 +62,9 @@
 #if XE_PLATFORM_WIN32
 #include "xenia/base/main_win.h"
 #include "xenia/gpu/d3d12/d3d12_graphics_system.h"
+#include "xenia/libretro/libretro_d3d12.h"
+#include "xenia/ui/d3d12/d3d12_presenter.h"
+#include "xenia/ui/d3d12/d3d12_provider.h"
 #endif
 
 DECLARE_string(apu);
@@ -150,6 +153,9 @@ bool g_had_first_frame = false;
 std::atomic<bool> g_frontend_ready{false};
 bool g_can_dupe = false;
 unsigned g_frames_inspected = 0;
+unsigned g_shared_frames_reported = 0;
+std::chrono::steady_clock::time_point g_fps_last_report;
+uint64_t g_fps_last_frame_count = 0;
 bool g_input_bitmask_supported = false;
 // One frame's worth of stereo output, refilled every retro_run.
 std::vector<int16_t> g_audio_buffer;
@@ -162,9 +168,23 @@ std::vector<int16_t> g_audio_buffer;
 unsigned g_resolution_scale = 1;
 
 bool g_hw_render_requested = false;
+// Which API the shared context uses, decided from the backend option. Only
+// meaningful while g_hw_render_requested.
+std::string g_hw_render_api;
 retro_hw_render_callback g_hw_render = {};
 const retro_hw_render_interface_vulkan* g_vulkan_interface = nullptr;
 std::unique_ptr<xe::ui::vulkan::VulkanProvider> g_negotiated_provider;
+// Keeps the image last handed to the frontend alive for as long as it may
+// still sample it, which outlasts the presenter that made it when a reset
+// tears the title down in between.
+std::shared_ptr<void> g_shared_vulkan_image_keepalive;
+#if XE_PLATFORM_WIN32
+// Direct3D 12 has no negotiation interface in libretro, so unlike Vulkan the
+// device is simply handed to us at context reset and the provider is built
+// from it later, when the graphics system asks.
+const retro_hw_render_interface_d3d12* g_d3d12_interface = nullptr;
+std::unique_ptr<xe::ui::d3d12::D3D12Provider> g_shared_d3d12_provider;
+#endif
 
 std::filesystem::path g_storage_root;
 std::filesystem::path g_content_root;
@@ -266,10 +286,10 @@ const retro_core_option_v2_definition kCoreOptionDefinitions[] = {
     {"xenia_hw_render",
      "Share GPU Device With Frontend",
      nullptr,
-     "Renders on the frontend's own Vulkan device and hands the finished "
-     "image over directly, instead of copying every frame through system "
-     "memory. Needs the frontend's video driver to be Vulkan, and overrides "
-     "the Graphics API setting. Experimental. Read once at startup.",
+     "Renders on the frontend's own device and hands the finished image over "
+     "directly, instead of copying every frame through system memory. Uses "
+     "the API picked above, which must match the frontend's video driver "
+     "(Vulkan or Direct3D 12). Experimental. Read once at startup.",
      nullptr,
      nullptr,
      {{"off", nullptr}, {"on", nullptr}, {nullptr, nullptr}},
@@ -314,7 +334,7 @@ const retro_variable kCoreOptions[] = {
      "Context promotion - off fixes some sports animations; "
      "auto|enabled|disabled"},
     {"xenia_hw_render",
-     "Share the frontend's GPU device (Vulkan only, restart); off|on"},
+     "Share the frontend's GPU device, using the API above (restart); off|on"},
     {"xenia_render_target_path",
      "Render target path - accuracy fixes some lighting, costs speed; "
      "performance|accuracy"},
@@ -457,22 +477,71 @@ class HeadlessGraphicsSystem final : public xe::gpu::null::NullGraphicsSystem {
 // the interface is available.
 void OnHwContextReset() {
   const retro_hw_render_interface* interface_base = nullptr;
-  if (g_environ_cb(RETRO_ENVIRONMENT_GET_HW_RENDER_INTERFACE, &interface_base) &&
-      interface_base &&
-      interface_base->interface_type == RETRO_HW_RENDER_INTERFACE_VULKAN) {
+  if (!g_environ_cb(RETRO_ENVIRONMENT_GET_HW_RENDER_INTERFACE,
+                    &interface_base) ||
+      !interface_base) {
+    g_log_cb(RETRO_LOG_ERROR,
+             "[xenia] The frontend did not hand over a render interface\n");
+    return;
+  }
+  if (interface_base->interface_type == RETRO_HW_RENDER_INTERFACE_VULKAN) {
     g_vulkan_interface =
         reinterpret_cast<const retro_hw_render_interface_vulkan*>(
             interface_base);
     g_log_cb(RETRO_LOG_INFO,
              "[xenia] Vulkan render interface acquired (version %u)\n",
              g_vulkan_interface->interface_version);
-  } else {
-    g_log_cb(RETRO_LOG_ERROR,
-             "[xenia] The frontend did not hand over a Vulkan render interface\n");
+    // Both sides submit to the one queue we handed over, from their own
+    // threads, and Vulkan requires host access to a queue to be externally
+    // synchronized. Xenia's own mutex does not cover the frontend, so take its
+    // lock as well - otherwise the two race and the driver reports it as a
+    // device loss with no hint of the cause.
+    if (g_negotiated_provider && g_vulkan_interface->lock_queue &&
+        g_vulkan_interface->unlock_queue) {
+      xe::ui::vulkan::VulkanDevice* device =
+          g_negotiated_provider->vulkan_device();
+      // Not named "interface": that is a macro in the Windows headers.
+      const retro_hw_render_interface_vulkan* vk_iface = g_vulkan_interface;
+      device->SetQueueExternalSynchronization(
+          device->queue_family_graphics_compute(), 0,
+          [vk_iface]() { vk_iface->lock_queue(vk_iface->handle); },
+          [vk_iface]() { vk_iface->unlock_queue(vk_iface->handle); });
+      g_log_cb(RETRO_LOG_INFO,
+               "[xenia] Serializing queue access with the frontend\n");
+    }
+    return;
   }
+#if XE_PLATFORM_WIN32
+  if (interface_base->interface_type == RETRO_HW_RENDER_INTERFACE_D3D12) {
+    g_d3d12_interface =
+        reinterpret_cast<const retro_hw_render_interface_d3d12*>(
+            interface_base);
+    g_log_cb(RETRO_LOG_INFO,
+             "[xenia] Direct3D 12 render interface acquired (version %u)\n",
+             g_d3d12_interface->interface_version);
+    return;
+  }
+#endif
+  g_log_cb(RETRO_LOG_ERROR,
+           "[xenia] The frontend handed over an unexpected render interface "
+           "(type %u)\n",
+           unsigned(interface_base->interface_type));
 }
 
-void OnHwContextDestroy() { g_vulkan_interface = nullptr; }
+void OnHwContextDestroy() {
+  // The callbacks installed above close over the interface, which is about to
+  // go away, so drop them before it does.
+  if (g_vulkan_interface && g_negotiated_provider) {
+    xe::ui::vulkan::VulkanDevice* device =
+        g_negotiated_provider->vulkan_device();
+    device->SetQueueExternalSynchronization(
+        device->queue_family_graphics_compute(), 0, nullptr, nullptr);
+  }
+  g_vulkan_interface = nullptr;
+#if XE_PLATFORM_WIN32
+  g_d3d12_interface = nullptr;
+#endif
+}
 
 // The frontend creates the instance, so it has to be told up front which API
 // version we need. Xenia treats 1.1 as the floor - below it,
@@ -648,6 +717,31 @@ class SharedVulkanGraphicsSystem final
   xe::ui::vulkan::VulkanProvider* borrowed_provider_;
 };
 
+#if XE_PLATFORM_WIN32
+// The Direct3D 12 counterpart. Same borrowing rules, but the provider is built
+// here rather than during negotiation, because libretro has no negotiation
+// interface for D3D12 - the device only shows up at context reset.
+class SharedD3D12GraphicsSystem final
+    : public xe::gpu::d3d12::D3D12GraphicsSystem {
+ public:
+  explicit SharedD3D12GraphicsSystem(xe::ui::d3d12::D3D12Provider* provider)
+      : borrowed_provider_(provider) {}
+
+  xe::X_STATUS Setup(xe::cpu::Processor* processor,
+                     xe::kernel::KernelState* kernel_state,
+                     xe::ui::WindowedAppContext* app_context,
+                     bool with_presentation) override {
+    provider_.reset(borrowed_provider_);
+    owns_provider_ = false;
+    return xe::gpu::GraphicsSystem::Setup(processor, kernel_state, app_context,
+                                          with_presentation);
+  }
+
+ private:
+  xe::ui::d3d12::D3D12Provider* borrowed_provider_;
+};
+#endif
+
 std::unique_ptr<xe::gpu::GraphicsSystem> CreateGraphicsSystem() {
   if (g_negotiated_provider) {
     g_log_cb(RETRO_LOG_INFO,
@@ -657,6 +751,26 @@ std::unique_ptr<xe::gpu::GraphicsSystem> CreateGraphicsSystem() {
     return std::make_unique<SharedVulkanGraphicsSystem>(
         g_negotiated_provider.get());
   }
+#if XE_PLATFORM_WIN32
+  if (g_d3d12_interface) {
+    // Built on first use rather than at context reset, so a title reset reuses
+    // the provider instead of adopting the same device twice.
+    if (!g_shared_d3d12_provider) {
+      g_shared_d3d12_provider = xe::ui::d3d12::D3D12Provider::Adopt(
+          g_d3d12_interface->device, g_d3d12_interface->queue);
+    }
+    if (g_shared_d3d12_provider) {
+      g_log_cb(RETRO_LOG_INFO,
+               "[xenia] GPU backend: d3d12 (shared with the frontend)\n");
+      return std::make_unique<SharedD3D12GraphicsSystem>(
+          g_shared_d3d12_provider.get());
+    }
+    // Nothing to fall back to: the frontend already built a hardware context,
+    // which rules out handing it a CPU framebuffer.
+    g_log_cb(RETRO_LOG_ERROR,
+             "[xenia] Could not adopt the frontend's Direct3D 12 device\n");
+  }
+#endif
 
   const std::string backend = SelectedGpuBackend();
   g_log_cb(RETRO_LOG_INFO, "[xenia] GPU backend: %s\n", backend.c_str());
@@ -981,7 +1095,93 @@ void UpdateGeometry(unsigned width, unsigned height) {
 // Hands the guest's own image straight to the frontend, which samples it
 // where it already lives on the shared device. No readback, no copy, no
 // channel conversion - the whole point of sharing the device.
+// Reports the rate the frontend is actually driving us at. Whether a title is
+// slow, and by how much, is otherwise only visible on screen - which is no
+// help when comparing backends from a log. Follows the Log Detail option, so
+// it stays quiet unless the log was asked for.
+void ReportFrameRate() {
+  if (g_state.load() != CoreState::kRunning || cvars::log_level < 2) {
+    return;
+  }
+  const auto now = std::chrono::steady_clock::now();
+  if (g_fps_last_report == std::chrono::steady_clock::time_point{}) {
+    g_fps_last_report = now;
+    g_fps_last_frame_count = g_frame_count.load();
+    return;
+  }
+  const auto elapsed = now - g_fps_last_report;
+  if (elapsed < std::chrono::seconds(10)) {
+    return;
+  }
+  const uint64_t frames = g_frame_count.load();
+  const double seconds = std::chrono::duration<double>(elapsed).count();
+  g_log_cb(RETRO_LOG_INFO, "[xenia] %.2f fps (%llu frames in %.1fs)\n",
+           double(frames - g_fps_last_frame_count) / seconds,
+           static_cast<unsigned long long>(frames - g_fps_last_frame_count),
+           seconds);
+  g_fps_last_report = now;
+  g_fps_last_frame_count = frames;
+}
+
+// Says out loud that the shared path is delivering frames, the way the
+// readback path reports its first captures. Without it a shared frame that
+// never arrives looks exactly like a title drawing nothing. Only the first
+// few, so it costs nothing once running.
+void ReportSharedPresent(const char* api, unsigned width, unsigned height) {
+  if (g_shared_frames_reported >= 5) {
+    return;
+  }
+  ++g_shared_frames_reported;
+  g_log_cb(RETRO_LOG_INFO, "[xenia] shared %s frame %u: %ux%u\n", api,
+           g_shared_frames_reported, width, height);
+}
+
+#if XE_PLATFORM_WIN32
+// The Direct3D 12 counterpart. The frontend copies the texture on the GPU
+// rather than sampling it where it lies, so this is not quite as free as the
+// Vulkan path - but it is still a device-local copy, not a trip through system
+// memory. It wants the resource in required_state (COPY_SOURCE), which is what
+// AcquireGuestOutputForSharing leaves it in.
+bool PresentSharedGuestFrameD3D12() {
+  if (!g_d3d12_interface || g_state.load() != CoreState::kRunning ||
+      !g_emulator) {
+    return false;
+  }
+  xe::gpu::GraphicsSystem* graphics_system = g_emulator->graphics_system();
+  if (!graphics_system) {
+    return false;
+  }
+  auto* presenter = static_cast<xe::ui::d3d12::D3D12Presenter*>(
+      graphics_system->presenter());
+  if (!presenter) {
+    return false;
+  }
+
+  ID3D12Resource* resource = nullptr;
+  uint32_t width = 0;
+  uint32_t height = 0;
+  if (!presenter->AcquireGuestOutputForSharing(resource, width, height) ||
+      !width || !height) {
+    return false;
+  }
+
+  g_d3d12_interface->set_texture(
+      g_d3d12_interface->handle, resource,
+      xe::ui::d3d12::D3D12Presenter::kGuestOutputFormat);
+
+  UpdateGeometry(width, height);
+  g_video_cb(RETRO_HW_FRAME_BUFFER_VALID, width, height, 0);
+  ReportSharedPresent("d3d12", width, height);
+  return true;
+}
+#endif
+
 bool PresentSharedGuestFrame() {
+#if XE_PLATFORM_WIN32
+  if (g_d3d12_interface) {
+    return PresentSharedGuestFrameD3D12();
+  }
+#endif
   if (!g_vulkan_interface || g_state.load() != CoreState::kRunning ||
       !g_emulator) {
     return false;
@@ -999,10 +1199,15 @@ bool PresentSharedGuestFrame() {
   VkImage image = VK_NULL_HANDLE;
   VkImageView view = VK_NULL_HANDLE;
   VkExtent2D extent = {};
-  if (!presenter->AcquireGuestOutputForSharing(image, view, extent) ||
+  std::shared_ptr<void> keepalive;
+  if (!presenter->AcquireGuestOutputForSharing(image, view, extent,
+                                               keepalive) ||
       !extent.width || !extent.height) {
     return false;
   }
+  // Held only after the acquire succeeded, so a failed one leaves the frontend
+  // still holding a live image rather than dropping it mid-teardown.
+  g_shared_vulkan_image_keepalive = std::move(keepalive);
 
   // The frontend wants the view described as well as handed over, so it can
   // build its own descriptors against it.
@@ -1030,6 +1235,7 @@ bool PresentSharedGuestFrame() {
 
   UpdateGeometry(extent.width, extent.height);
   g_video_cb(RETRO_HW_FRAME_BUFFER_VALID, extent.width, extent.height, 0);
+  ReportSharedPresent("vulkan", extent.width, extent.height);
   return true;
 }
 
@@ -1189,17 +1395,29 @@ RETRO_API void retro_init(void) {
   const char* hw_render = GetOptionValue("xenia_hw_render");
   g_hw_render_requested = hw_render && std::string(hw_render) == "on";
   if (g_hw_render_requested) {
-    // Worth saying out loud: when the device is shared, its API is whatever
-    // the frontend's video driver uses, so the backend choice has no effect.
-    const std::string backend = SelectedGpuBackend();
-    if (backend != "vulkan") {
+    // The API of the shared context follows the backend option: both Vulkan
+    // and Direct3D 12 can be shared, so the choice is honoured rather than
+    // ignored. It still has to match the frontend's own video driver, which
+    // the frontend enforces by refusing the context below.
+    g_hw_render_api = SelectedGpuBackend();
+#if XE_PLATFORM_WIN32
+    const bool api_shareable =
+        g_hw_render_api == "vulkan" || g_hw_render_api == "d3d12";
+#else
+    const bool api_shareable = g_hw_render_api == "vulkan";
+#endif
+    if (!api_shareable) {
       g_log_cb(RETRO_LOG_WARN,
-               "[xenia] Sharing the frontend's device, so the '%s' GPU backend "
-               "option is ignored\n",
-               backend.c_str());
+               "[xenia] The '%s' backend cannot share the frontend's device; "
+               "falling back to the software readback\n",
+               g_hw_render_api.c_str());
+      g_hw_render_requested = false;
     }
   }
-  if (g_hw_render_requested) {
+  // Only Vulkan needs this: xenia creates the device itself there, to get the
+  // features it wants. libretro has no negotiation interface for Direct3D 12,
+  // and none is needed - that provider only queries the device it is handed.
+  if (g_hw_render_requested && g_hw_render_api == "vulkan") {
     if (!g_environ_cb(
             RETRO_ENVIRONMENT_SET_HW_RENDER_CONTEXT_NEGOTIATION_INTERFACE,
             const_cast<retro_hw_render_context_negotiation_interface_vulkan*>(
@@ -1210,17 +1428,26 @@ RETRO_API void retro_init(void) {
     }
   }
   if (g_hw_render_requested) {
-    g_hw_render.context_type = RETRO_HW_CONTEXT_VULKAN;
-    g_hw_render.version_major = 1;
-    g_hw_render.version_minor = 1;
+    if (g_hw_render_api == "d3d12") {
+      g_hw_render.context_type = RETRO_HW_CONTEXT_D3D12;
+      g_hw_render.version_major = 12;
+      g_hw_render.version_minor = 0;
+    } else {
+      g_hw_render.context_type = RETRO_HW_CONTEXT_VULKAN;
+      // 1.1 is xenia's floor: below it the physical device property queries
+      // the feature detection relies on are an extension rather than core.
+      g_hw_render.version_major = 1;
+      g_hw_render.version_minor = 1;
+    }
     g_hw_render.context_reset = OnHwContextReset;
     g_hw_render.context_destroy = OnHwContextDestroy;
     g_hw_render.cache_context = true;
     g_hw_render.bottom_left_origin = false;
     if (!g_environ_cb(RETRO_ENVIRONMENT_SET_HW_RENDER, &g_hw_render)) {
       g_log_cb(RETRO_LOG_WARN,
-               "[xenia] The frontend refused a Vulkan hardware context; "
-               "falling back to the software readback\n");
+               "[xenia] The frontend refused a %s hardware context; falling "
+               "back to the software readback\n",
+               g_hw_render_api.c_str());
       g_hw_render_requested = false;
     }
   }
@@ -1373,6 +1600,7 @@ RETRO_API void retro_unload_game(void) {
 
 RETRO_API void retro_run(void) {
   g_frame_count.fetch_add(1);
+  ReportFrameRate();
   // The frontend's video context exists by the time it starts calling us, so
   // this is the emulator thread's cue to bring the graphics system up.
   g_frontend_ready.store(true, std::memory_order_release);
