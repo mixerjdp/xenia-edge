@@ -11,8 +11,10 @@
 #define XENIA_UI_VULKAN_VULKAN_DEVICE_H_
 
 #include <atomic>
+#include <functional>
 #include <memory>
 #include <mutex>
+#include <utility>
 #include <vector>
 
 #include "xenia/ui/vulkan/vulkan_instance.h"
@@ -296,18 +298,47 @@ class VulkanDevice {
     std::recursive_mutex mutex;
     VkQueue queue = nullptr;
 
+    // Set when the queue is shared with code outside Xenia - the libretro
+    // core, whose frontend submits to the very same queue from its own thread.
+    // The mutex above only covers Xenia's own submissions, so without this the
+    // two race, which the driver reports as a device loss rather than anything
+    // that points at the cause. The frontend hands its lock over as callbacks.
+    std::function<void()> external_lock;
+    std::function<void()> external_unlock;
+    // The mutex is recursive, so an acquisition may nest; the external lock is
+    // not assumed to be, and is only taken by the outermost one. Guarded by
+    // the mutex, which is always held while this is touched.
+    uint32_t external_lock_depth = 0;
+
     explicit Queue(const VkQueue queue) : queue(queue) {}
 
     class Acquisition {
      public:
-      explicit Acquisition(Queue& queue)
-          : lock_(queue.mutex), queue_(queue.queue) {}
+      explicit Acquisition(Queue& queue) : lock_(queue.mutex), queue_(&queue) {
+        if (queue_->external_lock && !queue_->external_lock_depth++) {
+          queue_->external_lock();
+        }
+      }
+      Acquisition(Acquisition&& other) noexcept
+          : lock_(std::move(other.lock_)), queue_(other.queue_) {
+        other.queue_ = nullptr;
+      }
+      Acquisition(const Acquisition&) = delete;
+      Acquisition& operator=(const Acquisition&) = delete;
+      ~Acquisition() {
+        // Before the mutex below is released, so the two are always given up
+        // in the reverse of the order they were taken.
+        if (queue_ && queue_->external_unlock &&
+            !--queue_->external_lock_depth) {
+          queue_->external_unlock();
+        }
+      }
 
-      VkQueue queue() const { return queue_; }
+      VkQueue queue() const { return queue_->queue; }
 
      private:
       std::unique_lock<std::recursive_mutex> lock_;
-      VkQueue queue_;
+      Queue* queue_;
     };
 
     Acquisition Acquire() { return Acquisition(*this); }
@@ -338,6 +369,19 @@ class VulkanDevice {
   Queue::Acquisition AcquireQueue(const uint32_t queue_family_index,
                                   const uint32_t queue_index) const {
     return queue_families()[queue_family_index].queues[queue_index]->Acquire();
+  }
+
+  // Declares that someone outside Xenia submits to this queue too, and hands
+  // over the lock that serializes them. See Queue::external_lock.
+  void SetQueueExternalSynchronization(const uint32_t queue_family_index,
+                                       const uint32_t queue_index,
+                                       std::function<void()> lock,
+                                       std::function<void()> unlock) {
+    Queue& queue =
+        *queue_families_[queue_family_index].queues[queue_index].get();
+    std::unique_lock<std::recursive_mutex> queue_lock(queue.mutex);
+    queue.external_lock = std::move(lock);
+    queue.external_unlock = std::move(unlock);
   }
 
   struct MemoryTypes {
