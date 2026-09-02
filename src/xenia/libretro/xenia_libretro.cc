@@ -493,22 +493,13 @@ void OnHwContextReset() {
              g_vulkan_interface->interface_version);
     // Both sides submit to the one queue we handed over, from their own
     // threads, and Vulkan requires host access to a queue to be externally
-    // synchronized. Xenia's own mutex does not cover the frontend, so take its
-    // lock as well - otherwise the two race and the driver reports it as a
-    // device loss with no hint of the cause.
-    if (g_negotiated_provider && g_vulkan_interface->lock_queue &&
-        g_vulkan_interface->unlock_queue) {
-      xe::ui::vulkan::VulkanDevice* device =
-          g_negotiated_provider->vulkan_device();
-      // Not named "interface": that is a macro in the Windows headers.
-      const retro_hw_render_interface_vulkan* vk_iface = g_vulkan_interface;
-      device->SetQueueExternalSynchronization(
-          device->queue_family_graphics_compute(), 0,
-          [vk_iface]() { vk_iface->lock_queue(vk_iface->handle); },
-          [vk_iface]() { vk_iface->unlock_queue(vk_iface->handle); });
-      g_log_cb(RETRO_LOG_INFO,
-               "[xenia] Serializing queue access with the frontend\n");
-    }
+    // synchronized - so taking the frontend's lock_queue here looks right, and
+    // is what the Cemu core does. It is left out on purpose: doing it crashed
+    // reproducibly inside the frontend's lock, called from the command
+    // processor thread during a swap (0xC0000025 out of RtlEnterCriticalSection
+    // by way of Queue::Acquisition). Whatever the frontend expects of callers
+    // of that lock, this is not it, and the device loss it was meant to fix was
+    // never actually traced to a queue race.
     return;
   }
 #if XE_PLATFORM_WIN32
@@ -529,14 +520,9 @@ void OnHwContextReset() {
 }
 
 void OnHwContextDestroy() {
-  // The callbacks installed above close over the interface, which is about to
-  // go away, so drop them before it does.
-  if (g_vulkan_interface && g_negotiated_provider) {
-    xe::ui::vulkan::VulkanDevice* device =
-        g_negotiated_provider->vulkan_device();
-    device->SetQueueExternalSynchronization(
-        device->queue_family_graphics_compute(), 0, nullptr, nullptr);
-  }
+  // Nothing is sampling the shared image once the context is gone, and it has
+  // to be released before the device it came from is.
+  g_shared_vulkan_image_keepalive.reset();
   g_vulkan_interface = nullptr;
 #if XE_PLATFORM_WIN32
   g_d3d12_interface = nullptr;
@@ -654,9 +640,20 @@ bool CreateVulkanDevice(retro_vulkan_context* context, VkInstance instance,
 }
 
 void DestroyVulkanDevice() {
-  // The frontend destroys the instance; our device object goes with the
-  // provider, whose lifetime the emulator owns.
-  g_negotiated_provider.reset();
+  g_shared_vulkan_image_keepalive.reset();
+  // The device is deliberately leaked rather than destroyed.
+  //
+  // The frontend calls this while the emulator is still alive - xenia has no
+  // complete teardown path, so threads and objects of ours outlive the
+  // content - and vkDestroyDevice then faults inside the driver, which is the
+  // crash on closing content or quitting. Nothing here can prove the device
+  // is unreferenced, so it is not destroyed at all: the same thing that
+  // happened before the provider became borrowed, when this reset() acted on
+  // a pointer the graphics system had already moved out of.
+  //
+  // Costs nothing in practice. This only runs when content is closing, and
+  // the core cannot load another title in the same process anyway.
+  (void)g_negotiated_provider.release();
 }
 
 const retro_hw_render_context_negotiation_interface_vulkan
@@ -1343,6 +1340,22 @@ RETRO_API void retro_set_input_state(retro_input_state_t cb) {
 }
 
 RETRO_API void retro_init(void) {
+#if XE_PLATFORM_WIN32
+  // Keep this library mapped for the rest of the process.
+  //
+  // The emulator is deliberately never torn down - xenia has no complete
+  // teardown path - so threads of ours outlive the content, xenia's own log
+  // writer among them. Closing content makes the frontend unload the core,
+  // and unmapping the code those threads are executing takes the process down
+  // with it. Pinning makes the leak survivable instead of fatal. The cost is
+  // that the library stays resident, which changes nothing in practice: the
+  // core already cannot load a second title in the same process.
+  HMODULE self = nullptr;
+  GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                         GET_MODULE_HANDLE_EX_FLAG_PIN,
+                     reinterpret_cast<LPCWSTR>(&retro_init), &self);
+#endif
+
   retro_log_callback log = {};
   if (g_environ_cb && g_environ_cb(RETRO_ENVIRONMENT_GET_LOG_INTERFACE, &log) &&
       log.log) {
@@ -1589,13 +1602,25 @@ RETRO_API void retro_unload_game(void) {
   if (g_state.load() == CoreState::kIdle) {
     return;
   }
-  // Same reasoning as retro_deinit: the emulator keeps running its own threads
-  // and is deliberately left alive rather than torn down into a crash. The
-  // frontend has to be restarted before another title can be loaded.
-  g_log_cb(RETRO_LOG_WARN,
-           "[xenia] Content unloaded, but the emulator cannot be torn down "
-           "yet; restart the frontend before loading other content\n");
   g_state.store(CoreState::kSpent);
+
+  // Stop the guest before returning. The frontend tears its hardware context
+  // down right after this, taking the device the guest renders on with it, so
+  // leaving the title running would leave it submitting to a destroyed device.
+  // ResetTitle also drops the graphics system, which releases the borrowed
+  // provider, so by the time destroy_device runs nothing is using it.
+  //
+  // The emulator itself is still deliberately left alive - xenia has no
+  // complete teardown path - so another title cannot be loaded afterwards.
+  if (g_emulator && g_emulator->is_title_open()) {
+    // Keeps the thread waiting on the old title from reporting this as an
+    // ordinary exit.
+    g_title_generation.fetch_add(1);
+    g_emulator->ResetTitle();
+  }
+  g_log_cb(RETRO_LOG_WARN,
+           "[xenia] Content unloaded; restart the frontend before loading "
+           "other content\n");
 }
 
 RETRO_API void retro_run(void) {
