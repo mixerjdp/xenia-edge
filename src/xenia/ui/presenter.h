@@ -324,6 +324,19 @@ class Presenter {
   // multiple at the same time, and it should acquire the latest guest output
   // image via ConsumeGuestOutput.
   virtual bool CaptureGuestOutput(RawImage& image_out) = 0;
+
+  // How many guest frames the mailbox has been given, and how many a consumer
+  // has taken. The mailbox drops rather than queues, so a producer running
+  // ahead of the consumer leaves the difference as frames the GPU rendered in
+  // full and nothing ever displayed. An embedder that presents at its own
+  // pace - the libretro core - uses these to tell that apart from the guest
+  // simply being slow.
+  uint64_t guest_output_frames_produced() const {
+    return guest_output_frames_produced_.load(std::memory_order_relaxed);
+  }
+  uint64_t guest_output_frames_consumed() const {
+    return guest_output_frames_consumed_.load(std::memory_order_relaxed);
+  }
   const GuestOutputPaintConfig& GetGuestOutputPaintConfigFromUIThread() const {
     return guest_output_paint_config_;
   }
@@ -943,6 +956,9 @@ class Presenter {
   // These two images can be accessed by painting in parallel, in an unordered
   // way, with guest output refreshing.
   std::atomic<uint32_t> guest_output_mailbox_acquired_and_ready_{0};
+  // Diagnostics only - see the accessors above.
+  std::atomic<uint64_t> guest_output_frames_produced_{0};
+  std::atomic<uint64_t> guest_output_frames_consumed_{0};
   // The "writable" image is different than both "acquired" and "ready" and is
   // accessible only by the guest output refreshing - it's the image that the
   // refresher may write to.
