@@ -240,9 +240,9 @@ Surface::TypeFlags VulkanPresenter::GetSupportedSurfaceTypes() const {
       vulkan_device_->vulkan_instance()->extensions());
 }
 
-bool VulkanPresenter::AcquireGuestOutputForSharing(VkImage& image_out,
-                                                   VkImageView& view_out,
-                                                   VkExtent2D& extent_out) {
+bool VulkanPresenter::AcquireGuestOutputForSharing(
+    VkImage& image_out, VkImageView& view_out, VkExtent2D& extent_out,
+    std::shared_ptr<void>& keepalive_out) {
   std::shared_ptr<GuestOutputImage> guest_output_image;
   {
     uint32_t guest_output_mailbox_index;
@@ -261,6 +261,9 @@ bool VulkanPresenter::AcquireGuestOutputForSharing(VkImage& image_out,
   image_out = guest_output_image->image();
   view_out = guest_output_image->view();
   extent_out = guest_output_image->extent();
+  // The caller's reference is what makes the image outlive this presenter, so
+  // hand one out rather than relying on the member below alone.
+  keepalive_out = guest_output_image;
   // Replacing the previous one here rather than at the start: the caller is
   // still sampling it until it asks for the next frame.
   shared_guest_output_image_ = std::move(guest_output_image);

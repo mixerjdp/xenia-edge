@@ -149,8 +149,15 @@ class VulkanPresenter final : public Presenter {
   // image is in kGuestOutputInternalLayout and stays alive until the next call,
   // because the caller only samples it after this returns. False means no frame
   // has been produced yet.
+  //
+  // keepalive_out carries ownership of the image out with it. A frontend keeps
+  // sampling the last image it was given - to redraw an unchanged frame, for
+  // instance - which outlives this presenter if the title is torn down in
+  // between; holding this until the next frame arrives is what stops that
+  // becoming a sample of a destroyed image, and with it a lost device.
   bool AcquireGuestOutputForSharing(VkImage& image_out, VkImageView& view_out,
-                                    VkExtent2D& extent_out);
+                                    VkExtent2D& extent_out,
+                                    std::shared_ptr<void>& keepalive_out);
 
   void AwaitUISubmissionCompletionFromUIThread(uint64_t submission_index) {
     ui_completion_timeline_.AwaitSubmissionAndUpdateCompleted(submission_index);
