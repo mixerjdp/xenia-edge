@@ -102,8 +102,11 @@ constexpr unsigned kInitialWidth = 1280;
 constexpr unsigned kInitialHeight = 720;
 constexpr double kFramesPerSecond = 60.0;
 constexpr double kSampleRate = 48000.0;
-constexpr size_t kAudioFramesPerVideoFrame =
-    static_cast<size_t>(kSampleRate / kFramesPerSecond);
+// Room for a slow frame's worth of audio. The batch handed over is whatever
+// the guest actually produced, which at 10 fps is six times what a 60 fps
+// frame holds, so sizing this by the video frame rate would clip it.
+constexpr size_t kMaxAudioFramesPerCall = 9600;  // 200 ms at 48 kHz
+constexpr size_t kOutputChannelCount = 2;
 
 retro_environment_t g_environ_cb = nullptr;
 retro_video_refresh_t g_video_cb = nullptr;
@@ -156,6 +159,27 @@ unsigned g_frames_inspected = 0;
 unsigned g_shared_frames_reported = 0;
 std::chrono::steady_clock::time_point g_fps_last_report;
 uint64_t g_fps_last_frame_count = 0;
+
+// Where a frame's time actually goes. The interesting one is `outside`: the
+// stretch between one retro_run returning and the next starting, which is the
+// frontend's own present and wait, and is invisible from in here otherwise.
+struct FrameTiming {
+  double outside = 0.0;
+  double vblank = 0.0;
+  double present = 0.0;
+  double audio = 0.0;
+  double total = 0.0;
+  // Inside present, split so the guest's own frame can be told apart from
+  // what the frontend does with it.
+  double acquire = 0.0;   // getting the finished guest image
+  double handover = 0.0;  // set_image
+  double video_cb = 0.0;  // the frontend composing and presenting
+  uint32_t frames = 0;
+};
+FrameTiming g_timing;
+std::chrono::steady_clock::time_point g_last_run_exit;
+uint64_t g_last_produced = 0;
+uint64_t g_last_consumed = 0;
 bool g_input_bitmask_supported = false;
 // One frame's worth of stereo output, refilled every retro_run.
 std::vector<int16_t> g_audio_buffer;
@@ -1116,6 +1140,45 @@ void ReportFrameRate() {
            double(frames - g_fps_last_frame_count) / seconds,
            static_cast<unsigned long long>(frames - g_fps_last_frame_count),
            seconds);
+
+  // Average milliseconds per frame, split by where they went. These have to
+  // add up to the frame period, so whichever one dominates is the answer.
+  if (g_timing.frames) {
+    const double n = double(g_timing.frames);
+    g_log_cb(RETRO_LOG_INFO,
+             "[xenia]   ms/frame: outside=%.2f retro_run=%.2f "
+             "(vblank=%.2f present=%.2f audio=%.2f) over %u frames\n",
+             g_timing.outside / n, g_timing.total / n, g_timing.vblank / n,
+             g_timing.present / n, g_timing.audio / n, g_timing.frames);
+    g_log_cb(RETRO_LOG_INFO,
+             "[xenia]   present split: acquire=%.2f handover=%.2f "
+             "video_cb=%.2f\n",
+             g_timing.acquire / n, g_timing.handover / n,
+             g_timing.video_cb / n);
+
+    // Frames the guest rendered in full that the mailbox threw away because
+    // nothing consumed them in time - GPU work that never reached the screen.
+    if (g_emulator) {
+      if (xe::gpu::GraphicsSystem* gs = g_emulator->graphics_system()) {
+        if (xe::ui::Presenter* p = gs->presenter()) {
+          const uint64_t produced = p->guest_output_frames_produced();
+          const uint64_t consumed = p->guest_output_frames_consumed();
+          const uint64_t dp = produced - g_last_produced;
+          const uint64_t dc = consumed - g_last_consumed;
+          g_log_cb(RETRO_LOG_INFO,
+                   "[xenia]   guest frames: rendered=%llu shown=%llu "
+                   "dropped=%llu\n",
+                   static_cast<unsigned long long>(dp),
+                   static_cast<unsigned long long>(dc),
+                   static_cast<unsigned long long>(dp > dc ? dp - dc : 0));
+          g_last_produced = produced;
+          g_last_consumed = consumed;
+        }
+      }
+    }
+  }
+  g_timing = FrameTiming();
+
   g_fps_last_report = now;
   g_fps_last_frame_count = frames;
 }
@@ -1157,17 +1220,27 @@ bool PresentSharedGuestFrameD3D12() {
   ID3D12Resource* resource = nullptr;
   uint32_t width = 0;
   uint32_t height = 0;
+  const auto t0 = std::chrono::steady_clock::now();
   if (!presenter->AcquireGuestOutputForSharing(resource, width, height) ||
       !width || !height) {
     return false;
   }
+  const auto t1 = std::chrono::steady_clock::now();
 
   g_d3d12_interface->set_texture(
       g_d3d12_interface->handle, resource,
       xe::ui::d3d12::D3D12Presenter::kGuestOutputFormat);
 
   UpdateGeometry(width, height);
+  const auto t2 = std::chrono::steady_clock::now();
   g_video_cb(RETRO_HW_FRAME_BUFFER_VALID, width, height, 0);
+  const auto t3 = std::chrono::steady_clock::now();
+
+  using msd = std::chrono::duration<double, std::milli>;
+  g_timing.acquire += msd(t1 - t0).count();
+  g_timing.handover += msd(t2 - t1).count();
+  g_timing.video_cb += msd(t3 - t2).count();
+
   ReportSharedPresent("d3d12", width, height);
   return true;
 }
@@ -1486,7 +1559,7 @@ RETRO_API void retro_init(void) {
   };
   g_environ_cb(RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS,
                const_cast<retro_input_descriptor*>(kInputDescriptors));
-  g_audio_buffer.assign(kAudioFramesPerVideoFrame * 2, 0);
+  g_audio_buffer.assign(kMaxAudioFramesPerCall * 2, 0);
 
   g_log_cb(RETRO_LOG_INFO, "[xenia] System root: %s\n",
            xe::path_to_utf8(g_storage_root).c_str());
@@ -1624,6 +1697,15 @@ RETRO_API void retro_unload_game(void) {
 }
 
 RETRO_API void retro_run(void) {
+  using clock = std::chrono::steady_clock;
+  const auto run_entry = clock::now();
+  const auto ms = [](clock::time_point a, clock::time_point b) {
+    return std::chrono::duration<double, std::milli>(b - a).count();
+  };
+  if (g_last_run_exit != clock::time_point{}) {
+    g_timing.outside += ms(g_last_run_exit, run_entry);
+  }
+
   g_frame_count.fetch_add(1);
   ReportFrameRate();
   // The frontend's video context exists by the time it starts calling us, so
@@ -1644,12 +1726,16 @@ RETRO_API void retro_run(void) {
   // Frame pacing is inverted compared to standalone xenia: the frontend calls
   // us once per frame, and that call is what advances the guest's vblank. The
   // emulator's own frame limiter thread stands down (SetHostDrivenVblank).
+  const auto t_vblank_start = clock::now();
   if (g_emulator) {
     if (xe::gpu::GraphicsSystem* graphics_system =
             g_emulator->graphics_system()) {
       graphics_system->TriggerHostVblank();
     }
   }
+
+  const auto t_present_start = clock::now();
+  g_timing.vblank += ms(t_vblank_start, t_present_start);
 
   const bool presented =
       g_hw_render_requested ? PresentSharedGuestFrame() : PresentGuestFrame();
@@ -1671,15 +1757,32 @@ RETRO_API void retro_run(void) {
     g_had_first_frame = true;
   }
 
+  const auto t_audio_start = clock::now();
+  g_timing.present += ms(t_present_start, t_audio_start);
+
   if (g_audio_batch_cb) {
-    // Always hand over a full frame's worth: the drivers fill in what they
-    // have and the rest stays silent, which the frontend prefers to a short
-    // or missing batch.
+    // Hand over what the guest has actually produced since the last call.
+    //
+    // This used to submit exactly one 60 Hz frame's worth every time, which
+    // is right only while the core runs at 60 fps. Below that it delivers
+    // proportionally less audio than real time consumes - a third of it at
+    // 20 fps - so the frontend runs dry and the sound breaks up, no matter
+    // what its own audio sync is set to. Draining instead tracks the guest's
+    // real output rate whatever the frame rate is.
+    const size_t capacity = g_audio_buffer.size() / kOutputChannelCount;
     std::fill(g_audio_buffer.begin(), g_audio_buffer.end(), int16_t(0));
-    xe::libretro::DrainAudioDrivers(g_audio_buffer.data(),
-                                    kAudioFramesPerVideoFrame);
-    g_audio_batch_cb(g_audio_buffer.data(), kAudioFramesPerVideoFrame);
+    const size_t produced =
+        xe::libretro::DrainAudioDrivers(g_audio_buffer.data(), capacity);
+    if (produced) {
+      g_audio_batch_cb(g_audio_buffer.data(), produced);
+    }
   }
+
+  const auto run_exit = clock::now();
+  g_timing.audio += ms(t_audio_start, run_exit);
+  g_timing.total += ms(run_entry, run_exit);
+  ++g_timing.frames;
+  g_last_run_exit = run_exit;
 }
 
 RETRO_API size_t retro_serialize_size(void) { return 0; }
