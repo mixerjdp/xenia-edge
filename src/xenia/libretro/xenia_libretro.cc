@@ -560,12 +560,11 @@ bool CreateVulkanDevice(retro_vulkan_context* context, VkInstance instance,
                         unsigned num_required_device_layers,
                         const VkPhysicalDeviceFeatures* required_features) {
   (void)surface;
-  // Device layers are ignored on purpose: they were deprecated in Vulkan 1.0
-  // and the loader applies the instance's to the device anyway. The extensions
-  // and features are not - the frontend renders on this device too, and asking
-  // for them is how it says what it needs.
+  (void)required_device_extensions;
+  (void)num_required_device_extensions;
   (void)required_device_layers;
   (void)num_required_device_layers;
+  (void)required_features;
 
   xe::ui::vulkan::VulkanInstance::Extensions instance_extensions;
   // At 1.1 this one is core rather than an extension, and the frontend always
@@ -597,8 +596,7 @@ bool CreateVulkanDevice(retro_vulkan_context* context, VkInstance instance,
   for (const VkPhysicalDevice physical_device : physical_devices) {
     device = xe::ui::vulkan::VulkanDevice::CreateIfSupported(
         adopted_instance.get(), physical_device, /*with_gpu_emulation=*/true,
-        /*with_swapchain=*/true, required_device_extensions,
-        num_required_device_extensions, required_features);
+        /*with_swapchain=*/true);
     if (device) {
       break;
     }
