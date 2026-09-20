@@ -102,9 +102,10 @@ constexpr unsigned kInitialWidth = 1280;
 constexpr unsigned kInitialHeight = 720;
 constexpr double kFramesPerSecond = 60.0;
 constexpr double kSampleRate = 48000.0;
-// Room for a slow frame's worth of audio. The batch handed over is whatever
-// the guest actually produced, which at 10 fps is six times what a 60 fps
-// frame holds, so sizing this by the video frame rate would clip it.
+// Room for a slow frame's worth of audio. What is handed over is paced by the
+// real time that passed, which at 10 fps is six times what a 60 fps frame
+// holds, so sizing this by the video frame rate would clip it. It doubles as
+// the ceiling on a catch-up burst after a stall.
 constexpr size_t kMaxAudioFramesPerCall = 9600;  // 200 ms at 48 kHz
 constexpr size_t kOutputChannelCount = 2;
 
@@ -160,6 +161,21 @@ unsigned g_shared_frames_reported = 0;
 bool g_input_bitmask_supported = false;
 // One frame's worth of stereo output, refilled every retro_run.
 std::vector<int16_t> g_audio_buffer;
+// Real time is what paces the audio, so the guest is held to the rate the
+// frontend was promised. Zero until the first retro_run after a load or a
+// reset. The debt carries the fraction of a sample the frame boundary leaves
+// over, and grows while the guest has nothing to give, which is what lets it
+// catch up afterwards.
+std::chrono::steady_clock::time_point g_audio_last_drain{};
+double g_audio_frames_owed = 0.0;
+// How long the frontend held us inside its batch callback. Its buffer is
+// finite, so a batch that does not fit blocks until it drains. That wait is
+// not time the guest got to run, and counting it as such is what turns one
+// late frame into a permanent stall: a big batch blocks, the block inflates
+// the next batch, and the loop settles into a few huge batches per second -
+// correct audio throughput, but retro_run barely called, and with it the
+// guest's vblank.
+std::chrono::steady_clock::duration g_audio_last_block{};
 
 // Shared Vulkan context. Populated during the frontend's context negotiation,
 // which happens inside retro_load_game, long before the emulator thread wants
@@ -1459,7 +1475,10 @@ RETRO_API void retro_init(void) {
   };
   g_environ_cb(RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS,
                const_cast<retro_input_descriptor*>(kInputDescriptors));
-  g_audio_buffer.assign(kMaxAudioFramesPerCall * 2, 0);
+  g_audio_buffer.assign(kMaxAudioFramesPerCall * kOutputChannelCount, 0);
+  g_audio_last_drain = {};
+  g_audio_last_block = {};
+  g_audio_frames_owed = 0.0;
 
   g_log_cb(RETRO_LOG_INFO, "[xenia] System root: %s\n",
            xe::path_to_utf8(g_storage_root).c_str());
@@ -1515,6 +1534,10 @@ RETRO_API void retro_reset(void) {
   // Written from the frontend's thread, which is also the only one that reads
   // it, so the status screen comes back while the guest is being rebuilt.
   g_had_first_frame = false;
+  // The guest is about to be torn down, so the audio owed to it goes with it.
+  g_audio_last_drain = {};
+  g_audio_last_block = {};
+  g_audio_frames_owed = 0.0;
   g_state.store(CoreState::kStarting);
   std::thread(ResetThread, g_content_path).detach();
 }
@@ -1644,20 +1667,52 @@ RETRO_API void retro_run(void) {
   }
 
   if (g_audio_batch_cb) {
-    // Hand over what the guest has actually produced since the last call.
+    // Hand over as much as real time has consumed since the last call, and no
+    // more.
     //
-    // This used to submit exactly one 60 Hz frame's worth every time, which
-    // is right only while the core runs at 60 fps. Below that it delivers
-    // proportionally less audio than real time consumes - a third of it at
-    // 20 fps - so the frontend runs dry and the sound breaks up, no matter
-    // what its own audio sync is set to. Draining instead tracks the guest's
-    // real output rate whatever the frame rate is.
+    // Submitting a fixed 60 Hz frame's worth is right only while the core runs
+    // at 60 fps; below that it starves the frontend. Draining everything the
+    // guest has ready fixes that but breaks the other end, because nothing
+    // else paces the guest's audio thread: it waits on slots that only this
+    // drain hands back, so taking all of them lets it outrun real time. The
+    // frontend then throttles retro_run to absorb the excess, and since the
+    // guest's vblank is driven from retro_run, the game slows with it.
+    //
+    // Pacing by the clock is what the hardware did - XAudio2 frees a slot when
+    // it has actually played one - and it holds at both ends: the debt below
+    // grows when the guest falls behind, so a slow core still catches up.
+    const auto now = std::chrono::steady_clock::now();
+    if (g_audio_last_drain.time_since_epoch().count() == 0) {
+      g_audio_frames_owed = kSampleRate / kFramesPerSecond;
+    } else {
+      // Only the time the guest actually got counts. Whatever the frontend
+      // spent making us wait for room is time it has already played, so
+      // charging for it again would ask for a batch that cannot fit either.
+      const double elapsed =
+          std::chrono::duration<double>(now - g_audio_last_drain).count() -
+          std::chrono::duration<double>(g_audio_last_block).count();
+      g_audio_frames_owed += std::max(0.0, elapsed) * kSampleRate;
+    }
+    g_audio_last_drain = now;
+    g_audio_last_block = {};
+    // Loading screens and the frontend's own menu stop the calls for seconds
+    // at a time; that must not come back as a burst with nowhere to go.
     const size_t capacity = g_audio_buffer.size() / kOutputChannelCount;
-    std::fill(g_audio_buffer.begin(), g_audio_buffer.end(), int16_t(0));
-    const size_t produced =
-        xe::libretro::DrainAudioDrivers(g_audio_buffer.data(), capacity);
-    if (produced) {
-      g_audio_batch_cb(g_audio_buffer.data(), produced);
+    g_audio_frames_owed =
+        std::min(g_audio_frames_owed, static_cast<double>(capacity));
+    const size_t budget = static_cast<size_t>(g_audio_frames_owed);
+    if (budget) {
+      std::fill(g_audio_buffer.begin(),
+                g_audio_buffer.begin() + budget * kOutputChannelCount,
+                int16_t(0));
+      const size_t produced =
+          xe::libretro::DrainAudioDrivers(g_audio_buffer.data(), budget);
+      if (produced) {
+        const auto before_cb = std::chrono::steady_clock::now();
+        g_audio_batch_cb(g_audio_buffer.data(), produced);
+        g_audio_last_block = std::chrono::steady_clock::now() - before_cb;
+        g_audio_frames_owed -= static_cast<double>(produced);
+      }
     }
   }
 
