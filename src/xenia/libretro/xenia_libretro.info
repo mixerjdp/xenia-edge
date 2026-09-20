@@ -1,6 +1,6 @@
 display_name = "Microsoft - Xbox 360 (Xenia-edge)"
 authors = "Xenia Team"
-supported_extensions = "iso|xex|zar|xcp"
+supported_extensions = "iso|xex|zar|xcp|xbla|con"
 corename = "Xenia-edge"
 categories = "Emulator"
 license = "BSD-3-Clause"

@@ -1497,7 +1497,12 @@ RETRO_API void retro_get_system_info(struct retro_system_info* info) {
   std::memset(info, 0, sizeof(*info));
   info->library_name = "Xenia-edge";
   info->library_version = "0.1-phase1";
-  info->valid_extensions = "iso|xex|zar|xcp";
+  // Only the frontend's file browser cares about these: xenia identifies
+  // content by its signature, not its name. xbla and con are here because
+  // downloaded titles arrive as an STFS container named after its content
+  // hash, with no extension at all, and the browser cannot show a file it has
+  // no rule for - so renaming one to .xbla is how it becomes selectable.
+  info->valid_extensions = "iso|xex|zar|xcp|xbla|con";
   info->need_fullpath = true;
   info->block_extract = true;
 }
