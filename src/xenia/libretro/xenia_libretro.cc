@@ -582,6 +582,7 @@ void OnHwContextReset() {
 }
 
 void OnHwContextDestroy() {
+  g_log_cb(RETRO_LOG_INFO, "[xenia] Render context destroyed\n");
   // Nothing is sampling the shared image once the context is gone, and it has
   // to be released before the device it came from is.
   g_shared_vulkan_image_keepalive.reset();
