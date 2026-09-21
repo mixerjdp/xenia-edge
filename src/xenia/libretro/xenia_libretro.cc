@@ -190,6 +190,13 @@ std::string g_hw_render_api;
 retro_hw_render_callback g_hw_render = {};
 const retro_hw_render_interface_vulkan* g_vulkan_interface = nullptr;
 std::unique_ptr<xe::ui::vulkan::VulkanProvider> g_negotiated_provider;
+// The queue handed to the frontend, so the external lock can be installed on
+// that exact one once the render interface shows up.
+uint32_t g_shared_queue_family = 0;
+// Non-null on a thread that currently holds the frontend's queue lock, and it
+// is the interface that handed it out - see where these are installed.
+thread_local const retro_hw_render_interface_vulkan* t_queue_lock_holder =
+    nullptr;
 // Keeps the image last handed to the frontend alive for as long as it may
 // still sample it, which outlasts the presenter that made it when a reset
 // tears the title down in between.
@@ -509,13 +516,52 @@ void OnHwContextReset() {
              g_vulkan_interface->interface_version);
     // Both sides submit to the one queue we handed over, from their own
     // threads, and Vulkan requires host access to a queue to be externally
-    // synchronized - so taking the frontend's lock_queue here looks right, and
-    // is what the Cemu core does. It is left out on purpose: doing it crashed
-    // reproducibly inside the frontend's lock, called from the command
-    // processor thread during a swap (0xC0000025 out of RtlEnterCriticalSection
-    // by way of Queue::Acquisition). Whatever the frontend expects of callers
-    // of that lock, this is not it, and the device loss it was meant to fix was
-    // never actually traced to a queue race.
+    // synchronized. The frontend hands its own lock over for exactly that.
+    //
+    // Without it WRC 4 loses the device within half a minute, on a fence wait
+    // and with no fault address - the shape of a queue race rather than of a
+    // bad access. It never happens with the validation layers loaded, which
+    // take their own locks around queue operations and so serialize what is
+    // left unguarded here.
+    //
+    // The callbacks read the interface pointer at call time instead of
+    // capturing it: it is cleared when the context goes away, and calling
+    // through the stale one is what took down the first attempt at this
+    // (0xC0000025 inside RtlEnterCriticalSection, by way of an acquisition on
+    // the command processor thread during a swap).
+    if (g_negotiated_provider && g_vulkan_interface->lock_queue &&
+        g_vulkan_interface->unlock_queue) {
+      xe::ui::vulkan::VulkanDevice* device =
+          g_negotiated_provider->vulkan_device();
+      if (device) {
+        device->SetQueueExternalSynchronization(
+            g_shared_queue_family, 0,
+            []() {
+              const retro_hw_render_interface_vulkan* vk = g_vulkan_interface;
+              if (vk && vk->lock_queue) {
+                vk->lock_queue(vk->handle);
+              } else {
+                vk = nullptr;
+              }
+              // Remembered so the release below is decided by whether this
+              // thread actually took the lock, not by what the interface
+              // looks like by then. The context can go away in between, and
+              // skipping the unlock would leave the frontend's lock held.
+              t_queue_lock_holder = vk;
+            },
+            []() {
+              const retro_hw_render_interface_vulkan* vk =
+                  t_queue_lock_holder;
+              t_queue_lock_holder = nullptr;
+              if (vk) {
+                vk->unlock_queue(vk->handle);
+              }
+            });
+        g_log_cb(RETRO_LOG_INFO,
+                 "[xenia] Serializing queue %u with the frontend's lock\n",
+                 g_shared_queue_family);
+      }
+    }
     return;
   }
 #if XE_PLATFORM_WIN32
@@ -539,6 +585,19 @@ void OnHwContextDestroy() {
   // Nothing is sampling the shared image once the context is gone, and it has
   // to be released before the device it came from is.
   g_shared_vulkan_image_keepalive.reset();
+  // Take the frontend's lock out of the queue before its interface goes away.
+  // Clearing the pointer alone is not enough: an acquisition on the command
+  // processor thread can already have read it and be about to call through a
+  // lock the frontend is tearing down. Uninstalling takes the queue's own
+  // mutex, so it waits for any acquisition in flight and no later one can pick
+  // the callbacks up.
+  if (g_negotiated_provider) {
+    if (xe::ui::vulkan::VulkanDevice* device =
+            g_negotiated_provider->vulkan_device()) {
+      device->SetQueueExternalSynchronization(g_shared_queue_family, 0, nullptr,
+                                              nullptr);
+    }
+  }
   g_vulkan_interface = nullptr;
 #if XE_PLATFORM_WIN32
   g_d3d12_interface = nullptr;
@@ -546,9 +605,11 @@ void OnHwContextDestroy() {
 }
 
 // The frontend creates the instance, so it has to be told up front which API
-// version we need. Xenia treats 1.1 as the floor - below it,
-// KHR_get_physical_device_properties2 is an extension rather than core, and
-// the device feature queries depend on it.
+// version we need, and it has to be the same one standalone asks for. The
+// loader hands out no entry point from a version above the instance's, so
+// asking for less than xenia uses makes vkGetDeviceProcAddr return null for
+// the core 1.3 functions - dynamic rendering among them - and device creation
+// fails outright rather than degrading.
 const VkApplicationInfo* GetVulkanApplicationInfo() {
   static const VkApplicationInfo info = {
       VK_STRUCTURE_TYPE_APPLICATION_INFO,
@@ -557,7 +618,7 @@ const VkApplicationInfo* GetVulkanApplicationInfo() {
       0,
       "Xenia",
       0,
-      VK_MAKE_API_VERSION(0, 1, 1, 0),
+      xe::ui::vulkan::VulkanDevice::kHighestUsedApiMinorVersion,
   };
   return &info;
 }
@@ -590,8 +651,11 @@ bool CreateVulkanDevice(retro_vulkan_context* context, VkInstance instance,
   instance_extensions.ext_KHR_win32_surface = true;
 #endif
 
+  // The same version reported above - this is the instance the frontend
+  // created from it.
   auto adopted_instance = xe::ui::vulkan::VulkanInstance::Adopt(
-      instance, get_instance_proc_addr, VK_MAKE_API_VERSION(0, 1, 1, 0),
+      instance, get_instance_proc_addr,
+      xe::ui::vulkan::VulkanDevice::kHighestUsedApiMinorVersion,
       instance_extensions);
   if (!adopted_instance) {
     g_log_cb(RETRO_LOG_ERROR, "[xenia] Could not adopt the frontend's Vulkan instance\n");
@@ -648,6 +712,8 @@ bool CreateVulkanDevice(retro_vulkan_context* context, VkInstance instance,
     g_log_cb(RETRO_LOG_ERROR, "[xenia] Could not build a provider from the shared device\n");
     return false;
   }
+
+  g_shared_queue_family = queue_family;
 
   g_log_cb(RETRO_LOG_INFO,
            "[xenia] Sharing the frontend's Vulkan device (queue family %u)\n",
