@@ -40,9 +40,10 @@ DEFINE_bool(
     "Apple GPUs while keeping NoContraction semantics enabled.",
     "Metal");
 
-DEFINE_bool(metal_shader_disk_cache, true,
-            "Cache compiled Metal shader libraries (metallib) to disk when "
-            "store_shaders is enabled.",
+DEFINE_bool(metal_msl_source_disk_cache, true,
+            "Cache the MSL that SPIRV-Cross generates to disk, skipping the "
+            "translation on later runs. SPIRV-Cross path only; guest shaders "
+            "and pipelines are stored separately when store_shaders is on.",
             "Metal");
 
 namespace xe {
@@ -1140,7 +1141,7 @@ bool MslShader::MslTranslation::CompileToMsl(MTL::Device* device, bool is_ios) {
   // Compile to MSL.  SPIRV-Cross throws on translation errors.
   const auto spirv_cross_begin = std::chrono::steady_clock::now();
   bool loaded_source_from_cache = false;
-  if (cvars::metal_shader_disk_cache) {
+  if (cvars::metal_msl_source_disk_cache) {
     loaded_source_from_cache =
         LoadCachedMslSource(msl_source_cache_key, &msl_source_);
     if (loaded_source_from_cache) {
@@ -1155,7 +1156,7 @@ bool MslShader::MslTranslation::CompileToMsl(MTL::Device* device, bool is_ios) {
       XELOGE("MslShader: SPIRV-Cross compilation failed: {}", e.what());
       return false;
     }
-    if (cvars::metal_shader_disk_cache) {
+    if (cvars::metal_msl_source_disk_cache) {
       StoreCachedMslSource(msl_source_cache_key, msl_source_);
     }
   }

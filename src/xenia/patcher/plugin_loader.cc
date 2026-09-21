@@ -47,7 +47,7 @@ void PluginLoader::LoadConfigs() {
 
   for (const auto& entry : dir_files) {
     const uint32_t title_id = string_util::from_string<uint32_t>(
-        entry.name.filename().string(), true);
+        xe::path_to_utf8(entry.name.filename()), true);
 
     LoadTitleConfig(title_id);
   }
@@ -57,7 +57,7 @@ void PluginLoader::LoadConfigs() {
 
 void PluginLoader::LoadTitleConfig(const uint32_t title_id) {
   const std::filesystem::path title_plugins_config =
-      plugins_root_ / fmt::format("{:08X}\\plugins.toml", title_id);
+      plugins_root_ / fmt::format("{:08X}", title_id) / "plugins.toml";
 
   if (!std::filesystem::exists(title_plugins_config)) {
     return;

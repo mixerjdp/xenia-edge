@@ -12,6 +12,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <filesystem>
 #include <functional>
 #include <map>
 #include <unordered_map>
@@ -143,6 +144,11 @@ class RenderTargetCache {
                                     float& clamp_alpha_high,
                                     uint32_t& keep_mask_low,
                                     uint32_t& keep_mask_high);
+  // Whether an aliased color write touches enabled depth or stencil bits.
+  static bool ColorOverlapsDepthStencil(
+      xenos::ColorRenderTargetFormat color_format, uint32_t color_keep_mask_low,
+      uint32_t color_keep_mask_high,
+      reg::RB_DEPTHCONTROL normalized_depth_control);
 
   virtual ~RenderTargetCache();
 
@@ -229,6 +235,8 @@ class RenderTargetCache {
   // afterwards. Submit returns whether there is anything for Complete to read.
   bool InitializeTraceSubmitDownloads();
   void InitializeTraceCompleteDownloads();
+  // Writes the trace EDRAM readback to a raw file.
+  bool WriteEdramSnapshotToFile(const std::filesystem::path& path);
 
  protected:
   RenderTargetCache(const RegisterFile& register_file, const Memory& memory,
@@ -555,8 +563,6 @@ class RenderTargetCache {
     kNotHostRenderTargets,
     // The copy converts formats, which the direct shaders don't reproduce.
     kConvertingCopyShader,
-    // The scaled destination layout isn't in the direct shaders.
-    kResolutionScaled,
     // No render target owns any of the source tiles.
     kNoOwnership,
     // A source render target's tile layout differs from the one the resolve
@@ -643,6 +649,8 @@ class RenderTargetCache {
                                  uint32_t rows, uint32_t pitch) const;
 
   // copy_shader is the one ResolveInfo::GetCopyShader picked for this resolve.
+  // Both destination layouts are covered - the caller decides which by what it
+  // binds and by EdramDumpShaderKey::native_layout.
   DirectResolveEligibility GetDirectResolveEligibility(
       const draw_util::ResolveInfo& resolve_info,
       draw_util::ResolveCopyShaderIndex copy_shader) const;
@@ -694,14 +702,19 @@ class RenderTargetCache {
   // EDRAM memory are committed with a memory barrier.
   void PixelShaderInterlockFullEdramBarrierPlaced();
 
-  // Whether a 7e3 -> 8_8_8_8 in-place reuse should decode (HDR float to LDR
-  // unorm) instead of bit-reinterpreting. Bit-reinterpret is hardware-accurate,
-  // so decode applies only where the reinterpreted bytes are actually seen: a
-  // matched same-base/pitch/MSAA reuse, 7e3 -> plain 8_8_8_8, whose draw blends
-  // over the dest. Everything else (overwrite, reverse, gamma, cvar off) stays
-  // bit-exact.
+  // Whether a 7e3 to 8_8_8_8 in-place reuse should decode (HDR float to LDR
+  // unorm) rather than bit-reinterpret. Reinterpreting is hardware-accurate, so
+  // decoding applies only where those bytes are actually seen, a matched
+  // same-base/pitch/MSAA reuse into a render target of the last update whose
+  // blending reads the destination. Everything else stays bit-exact.
   bool IsTransferValueConverted7e3And8888(RenderTargetKey source,
                                           RenderTargetKey dest) const;
+
+  // Logs one round of EDRAM ownership transfers.
+  void LogTransfers(uint32_t render_target_count,
+                    RenderTarget* const* render_targets,
+                    const std::vector<Transfer>* render_target_transfers,
+                    const Transfer::Rectangle* resolve_clear_rectangle) const;
 
  private:
   const RegisterFile& register_file_;
@@ -721,6 +734,9 @@ class RenderTargetCache {
     // render targets.
     // Render target this range is last used by.
     RenderTargetKey render_target;
+    // Host target containing the current depth bits (8:31).
+    // Stencil-only color writes leave it current.
+    RenderTargetKey depth_bits_target;
     // Last host-side depth render targets that used this range even if it has
     // been used by a different render target since then, only used if the
     // respective format has a different encoding on the host. They are tracked
@@ -743,6 +759,7 @@ class RenderTargetCache {
                    RenderTargetKey host_depth_render_target_float24)
         : end_tiles(end_tiles),
           render_target(render_target),
+          depth_bits_target(render_target),
           host_depth_render_target_unorm24(host_depth_render_target_unorm24),
           host_depth_render_target_float24(host_depth_render_target_float24) {}
     const RenderTargetKey& GetHostDepthRenderTarget(
@@ -778,6 +795,7 @@ class RenderTargetCache {
     }
     bool AreOwnersSame(const OwnershipRange& other_range) const {
       return render_target == other_range.render_target &&
+             depth_bits_target == other_range.depth_bits_target &&
              host_depth_render_target_unorm24 ==
                  other_range.host_depth_render_target_unorm24 &&
              host_depth_render_target_float24 ==
@@ -805,12 +823,17 @@ class RenderTargetCache {
   bool WouldOwnershipChangeRequireTransfers(RenderTargetKey dest,
                                             uint32_t start_tiles_base_relative,
                                             uint32_t length_tiles) const;
+  bool IsHostDepthCurrent(RenderTargetKey depth_target,
+                          uint32_t start_tiles_base_relative,
+                          uint32_t length_tiles) const;
   // Updates ownership_ranges_, adds the transfers needed for the ownership
-  // change to transfers_append_out if it's not null.
+  // change to transfers_append_out if it's not null. If keep_depth_bits is true
+  // the existing depth bits target is preserved.
   void ChangeOwnership(
       RenderTargetKey dest, uint32_t start_tiles_base_relative,
       uint32_t length_tiles, std::vector<Transfer>* transfers_append_out,
-      const Transfer::Rectangle* resolve_clear_cutout = nullptr);
+      const Transfer::Rectangle* resolve_clear_cutout = nullptr,
+      bool keep_depth_bits = false);
 
   // If failed to create, may contain nullptr to prevent attempting to create a
   // render target twice.
@@ -830,6 +853,11 @@ class RenderTargetCache {
   // Only valid for non-pixel-shader-interlock paths.
   RenderTarget*
       last_update_used_render_targets_[1 + xenos::kMaxColorRenderTargets];
+  // Keys of the color render targets of the last successful update whose
+  // blending reads the destination, empty for the other slots. Cleared for
+  // transfers gathered outside a draw, like before a resolve clear.
+  RenderTargetKey
+      last_update_blend_reading_color_rts_[xenos::kMaxColorRenderTargets];
   // Render targets used by the draw call with the last successful update or
   // previous updates, unless a different or a totally new one was bound (or
   // surface info was changed), to avoid unneeded render target switching (which

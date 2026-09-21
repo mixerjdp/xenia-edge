@@ -24,7 +24,6 @@
 #include "xenia/base/xxhash.h"
 #include "xenia/gpu/draw_util.h"
 #include "xenia/gpu/gpu_flags.h"
-#include "xenia/gpu/pipeline_util.h"
 #include "xenia/gpu/register_file.h"
 #include "xenia/gpu/registers.h"
 #include "xenia/gpu/spirv_builder.h"
@@ -98,7 +97,7 @@ std::unique_ptr<SpirvShaderTranslator> VulkanPipelineCache::CreateTranslator()
       SpirvShaderTranslator::Features(vulkan_device),
       render_target_cache_.msaa_2x_attachments_supported(),
       render_target_cache_.msaa_2x_no_attachments_supported(),
-      edram_fragment_shader_interlock,
+      edram_fragment_shader_interlock, precise_interpolation_supported(),
       render_target_cache_.draw_resolution_scale_x(),
       render_target_cache_.draw_resolution_scale_y());
 }
@@ -131,19 +130,23 @@ bool VulkanPipelineCache::Initialize() {
   }
 
   if (edram_fragment_shader_interlock) {
-    std::vector<uint8_t> depth_only_fragment_shader_code =
-        guest_shader_cache_.translator().CreateDepthOnlyFragmentShader();
-    depth_only_fragment_shader_ = ui::vulkan::util::CreateShaderModule(
-        vulkan_device,
-        reinterpret_cast<const uint32_t*>(
-            depth_only_fragment_shader_code.data()),
-        depth_only_fragment_shader_code.size());
-    if (depth_only_fragment_shader_ == VK_NULL_HANDLE) {
-      XELOGE(
-          "VulkanPipelineCache: Failed to create the depth/stencil-only "
-          "fragment shader for the fragment shader interlock render backend "
-          "implementation");
-      return false;
+    for (size_t i = 0; i < xe::countof(depth_only_fragment_shaders_); ++i) {
+      std::vector<uint8_t> depth_only_fragment_shader_code =
+          guest_shader_cache_.translator().CreateDepthOnlyFragmentShader(
+              xenos::MsaaSamples(i));
+      depth_only_fragment_shaders_[i] = ui::vulkan::util::CreateShaderModule(
+          vulkan_device,
+          reinterpret_cast<const uint32_t*>(
+              depth_only_fragment_shader_code.data()),
+          depth_only_fragment_shader_code.size());
+      if (depth_only_fragment_shaders_[i] == VK_NULL_HANDLE) {
+        XELOGE(
+            "VulkanPipelineCache: Failed to create the {}-sample "
+            "depth/stencil-only fragment shader for the fragment shader "
+            "interlock render backend implementation",
+            UINT32_C(1) << i);
+        return false;
+      }
     }
   }
 
@@ -151,7 +154,10 @@ bool VulkanPipelineCache::Initialize() {
   // conversion is active - keep the depth buffer's encoding consistent with
   // PS-converted draws (matches the DXBC backend's
   // float24_{truncate,round}_ps).
-  if (render_target_cache_.depth_float24_convert_in_pixel_shader()) {
+  // Not on the FSI path - it converts the depth in the EDRAM ROP itself, and
+  // the modification keeps the sample count where the mode would be.
+  if (!edram_fragment_shader_interlock &&
+      render_target_cache_.depth_float24_convert_in_pixel_shader()) {
     using DepthStencilMode =
         SpirvShaderTranslator::Modification::DepthStencilMode;
     auto build = [&](DepthStencilMode mode, VkShaderModule& out) -> bool {
@@ -282,9 +288,17 @@ bool VulkanPipelineCache::Initialize() {
     // Pick some reasonable amount if couldn't determine the number of cores.
     logical_processor_count = 6;
   }
-  creation_completion_event_ =
-      xe::threading::Event::CreateManualResetEvent(true);
-  assert_not_null(creation_completion_event_);
+  creation_queue_.Initialize(
+      "Vulkan Pipelines",
+      [this](const PipelineCreationArguments& creation_arguments,
+             SpirvShaderTranslator* worker_translator) {
+        return CreateQueuedPipeline(creation_arguments, worker_translator);
+      },
+      [this](const PipelineCreationArguments& creation_arguments,
+             VkPipeline pipeline) {
+        StoreCreatedPipeline(creation_arguments, pipeline, false);
+      },
+      [this]() { return guest_shader_cache_.CreateWorkerTranslator(); });
   if (cvars::vulkan_pipeline_creation_threads != 0) {
     size_t creation_thread_count;
     if (cvars::vulkan_pipeline_creation_threads < 0) {
@@ -295,14 +309,7 @@ bool VulkanPipelineCache::Initialize() {
           std::min(uint32_t(cvars::vulkan_pipeline_creation_threads),
                    logical_processor_count);
     }
-    creation_threads_shutdown_ = false;
-    for (size_t i = 0; i < creation_thread_count; ++i) {
-      std::unique_ptr<xe::threading::Thread> creation_thread =
-          xe::threading::Thread::Create({}, [this]() { CreationThread(); });
-      assert_not_null(creation_thread);
-      creation_thread->set_name("Vulkan Pipelines");
-      creation_threads_.push_back(std::move(creation_thread));
-    }
+    creation_queue_.SetThreadCount(creation_thread_count);
   }
 
   return true;
@@ -313,26 +320,11 @@ void VulkanPipelineCache::Shutdown() {
   ShutdownShaderStorage();
 
   // Shut down all threads, before destroying the pipelines since they may be
-  // creating them.
-  if (!creation_threads_.empty()) {
-    {
-      std::lock_guard<std::mutex> lock(creation_request_lock_);
-      creation_threads_shutdown_ = true;
-    }
-    creation_request_cond_.notify_all();
-    for (size_t i = 0; i < creation_threads_.size(); ++i) {
-      xe::threading::Wait(creation_threads_[i].get(), false);
-    }
-    creation_threads_.clear();
-  }
-  // Clear any pending completion callback (may capture 'this') and reset
-  // startup state.
-  {
-    std::lock_guard<std::mutex> lock(creation_request_lock_);
-    creation_completion_callback_ = nullptr;
-  }
+  // creating them. Also drops the pending completion callback, which may
+  // capture 'this'.
+  std::vector<std::pair<PipelineCreationArguments, VkPipeline>> parked =
+      creation_queue_.Shutdown();
   startup_loading_ = false;
-  creation_completion_event_.reset();
 
   const ui::vulkan::VulkanDevice* const vulkan_device =
       command_processor_.GetVulkanDevice();
@@ -351,6 +343,13 @@ void VulkanPipelineCache::Shutdown() {
     deferred_destroy_pipelines_.clear();
   }
 
+  // Nothing will publish what the creation threads held back, so destroy it.
+  for (const auto& publication : parked) {
+    if (publication.second != VK_NULL_HANDLE) {
+      dfn.vkDestroyPipeline(device, publication.second, nullptr);
+    }
+  }
+
   // Destroy all pipelines.
   last_pipeline_ = nullptr;
   for (const auto& pipeline_pair : pipelines_) {
@@ -367,8 +366,11 @@ void VulkanPipelineCache::Shutdown() {
   }
 
   // Destroy all internal shaders.
-  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyShaderModule, device,
-                                         depth_only_fragment_shader_);
+  for (VkShaderModule& depth_only_fragment_shader :
+       depth_only_fragment_shaders_) {
+    ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyShaderModule, device,
+                                           depth_only_fragment_shader);
+  }
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyShaderModule, device,
                                          float24_truncate_fragment_shader_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyShaderModule, device,
@@ -512,7 +514,7 @@ bool VulkanPipelineCache::EnsureShadersTranslated(
 }
 
 bool VulkanPipelineCache::CanCreatePipelineAsync(bool has_pixel_shader) const {
-  return cvars::async_shader_compilation && !creation_threads_.empty() &&
+  return cvars::async_shader_compilation && creation_queue_.has_threads() &&
          has_pixel_shader && placeholder_pixel_shader_ != VK_NULL_HANDLE;
 }
 
@@ -728,31 +730,17 @@ bool VulkanPipelineCache::ConfigurePipeline(
     }
 
     // Queue the real pipeline creation in the background.
-    uint8_t priority = 0;
-    if (pixel_shader) {
-      uint32_t bound_rts = pipeline_util::GetBoundRTMaskFromNormalizedColorMask(
-          normalized_color_mask);
-      priority = pipeline_util::CalculatePipelinePriority(
-          bound_rts, pixel_shader->shader().writes_color_targets(),
-          pixel_shader->shader().writes_depth());
-    }
-    {
-      std::lock_guard<std::mutex> lock(creation_request_lock_);
-      PipelineCreationArguments creation_arguments;
-      creation_arguments.pipeline = &pipeline_pair;
-      creation_arguments.vertex_shader = vertex_shader;
-      creation_arguments.pixel_shader = pixel_shader;
-      creation_arguments.geometry_shader = geometry_shader;
-      creation_arguments.tessellation_vertex_shader =
-          tessellation_vertex_shader;
-      creation_arguments.tessellation_control_shader =
-          tessellation_control_shader;
-      creation_arguments.render_pass = render_pass;
-      creation_arguments.render_pass_key = render_pass_key;
-      creation_arguments.priority = priority;
-      creation_queue_.push(creation_arguments);
-    }
-    creation_request_cond_.notify_one();
+    PipelineCreationArguments creation_arguments;
+    creation_arguments.pipeline = &pipeline_pair;
+    creation_arguments.vertex_shader = vertex_shader;
+    creation_arguments.pixel_shader = pixel_shader;
+    creation_arguments.geometry_shader = geometry_shader;
+    creation_arguments.tessellation_vertex_shader = tessellation_vertex_shader;
+    creation_arguments.tessellation_control_shader =
+        tessellation_control_shader;
+    creation_arguments.render_pass = render_pass;
+    creation_arguments.render_pass_key = render_pass_key;
+    creation_queue_.Push(creation_arguments);
   } else {
     // Sync mode (no creation threads / async off / no pixel shader): translate
     // on this thread and create the pipeline immediately.
@@ -797,144 +785,64 @@ void VulkanPipelineCache::EndSubmission() {
     pipeline_storage_file_flush_needed_ = false;
   }
 
-  if (creation_threads_.empty()) {
-    // Process deferred destructions when GPU is idle
-    ProcessDeferredDestructions();
-    return;
-  }
-
-  if (startup_loading_) {
-    // Non-blocking: let background threads work asynchronously.
-    creation_request_cond_.notify_one();
-  } else {
-    // Blocking: wait for all queued pipelines.
-    bool await_creation_completion_event;
-    {
-      std::lock_guard<std::mutex> lock(creation_request_lock_);
-      await_creation_completion_event =
-          !creation_queue_.empty() || creation_threads_busy_ != 0;
-      if (await_creation_completion_event) {
-        creation_completion_event_->Reset();
-        creation_completion_set_event_.store(true, std::memory_order_release);
-      }
-    }
-    if (await_creation_completion_event) {
-      creation_request_cond_.notify_one();
-      xe::threading::Wait(creation_completion_event_.get(), false);
+  if (creation_queue_.has_threads()) {
+    if (startup_loading_) {
+      // Non-blocking: let background threads work asynchronously.
+      creation_queue_.Notify();
+    } else {
+      // Blocking: wait for all queued pipelines.
+      creation_queue_.AwaitCompletion();
     }
   }
 
-  // Process deferred destructions
+  // Process deferred destructions when the GPU is idle.
   ProcessDeferredDestructions();
 }
 
 bool VulkanPipelineCache::IsCreatingPipelines() {
-  if (creation_threads_.empty()) {
-    return false;
-  }
-  std::lock_guard<std::mutex> lock(creation_request_lock_);
-  return !creation_queue_.empty() || creation_threads_busy_ != 0;
+  return creation_queue_.IsBusy();
 }
 
 void VulkanPipelineCache::AwaitPipelineCompletion() {
-  if (creation_threads_.empty()) {
-    return;
-  }
-
-  bool await_creation_completion_event;
-  {
-    std::lock_guard<std::mutex> lock(creation_request_lock_);
-    await_creation_completion_event =
-        !creation_queue_.empty() || creation_threads_busy_ != 0;
-    if (await_creation_completion_event) {
-      creation_completion_event_->Reset();
-      creation_completion_set_event_.store(true, std::memory_order_release);
-    }
-  }
-
-  if (await_creation_completion_event) {
-    creation_request_cond_.notify_one();
-    xe::threading::Wait(creation_completion_event_.get(), false);
-  }
+  creation_queue_.AwaitCompletion();
 }
 
-void VulkanPipelineCache::CreationThread() {
-  // Per-thread worker translator - the shared SpirvShaderTranslator is not
-  // thread-safe, so the deferred ucode->SPIR-V build (VS interpreter
-  // placeholder) runs here, off the main thread, one translator per creation
-  // thread.
-  std::unique_ptr<SpirvShaderTranslator> worker_translator =
-      guest_shader_cache_.CreateWorkerTranslator();
-
-  for (;;) {
-    PipelineCreationArguments creation_arguments;
-    {
-      std::unique_lock<std::mutex> lock(creation_request_lock_);
-      creation_request_cond_.wait(lock, [this]() {
-        return !creation_queue_.empty() || creation_threads_shutdown_;
-      });
-      if (creation_threads_shutdown_) {
-        break;
-      }
-      creation_arguments = creation_queue_.top();
-      creation_queue_.pop();
-      ++creation_threads_busy_;
+VkPipeline VulkanPipelineCache::CreateQueuedPipeline(
+    const PipelineCreationArguments& creation_arguments,
+    SpirvShaderTranslator* worker_translator) {
+  VkPipeline created_pipeline = VK_NULL_HANDLE;
+  const char* failed_stage = nullptr;
+  if (!EnsureShadersTranslated(creation_arguments.vertex_shader,
+                               creation_arguments.pixel_shader,
+                               worker_translator)) {
+    failed_stage = "shader translation";
+  } else {
+    // Async pipelines are created with a minimal (no-texture) layout on the
+    // draw thread since their shaders weren't translated there (interpreter
+    // placeholder, or drop-until-ready with no placeholder). Now that they're
+    // translated, compute the real layout before creating the real pipeline.
+    // Idempotent when the layout was already real (real-VS placeholder path).
+    const PipelineLayoutProvider* real_layout = GetGuestGraphicsPipelineLayout(
+        creation_arguments.vertex_shader, creation_arguments.pixel_shader);
+    if (real_layout) {
+      creation_arguments.pipeline->second.pipeline_layout.store(
+          real_layout, std::memory_order_release);
     }
-
-    if (!EnsureShadersTranslated(creation_arguments.vertex_shader,
-                                 creation_arguments.pixel_shader,
-                                 worker_translator.get())) {
-      XELOGE("Failed to translate shaders for pipeline creation");
-    } else {
-      // Async pipelines are created with a minimal (no-texture) layout on the
-      // draw thread since their shaders weren't translated there (interpreter
-      // placeholder, or drop-until-ready with no placeholder). Now that they're
-      // translated, compute the real layout before creating the real pipeline.
-      // Idempotent when the layout was already real (real-VS placeholder path).
-      const PipelineLayoutProvider* real_layout =
-          GetGuestGraphicsPipelineLayout(creation_arguments.vertex_shader,
-                                         creation_arguments.pixel_shader);
-      if (real_layout) {
-        creation_arguments.pipeline->second.pipeline_layout.store(
-            real_layout, std::memory_order_release);
-      }
-      if (!EnsurePipelineCreated(creation_arguments)) {
-        XELOGE("Failed to create Vulkan pipeline");
-      }
-    }
-    // On failure: if a placeholder exists it will remain in use permanently.
-    // Clear the flag so we're not in a misleading "waiting for real" state.
-    if (creation_arguments.pipeline->second.is_placeholder.load(
-            std::memory_order_acquire)) {
-      XELOGW(
-          "Real pipeline creation failed - placeholder will remain in use "
-          "(may cause visual artifacts)");
-      creation_arguments.pipeline->second.is_placeholder.store(
-          false, std::memory_order_release);
-    }
-
-    {
-      std::unique_lock<std::mutex> lock(creation_request_lock_);
-      --creation_threads_busy_;
-      if (creation_threads_busy_ == 0 && creation_queue_.empty()) {
-        // All pipelines created.
-        if (creation_completion_set_event_.load(std::memory_order_acquire)) {
-          // Signal the event (blocking mode).
-          creation_completion_set_event_.store(false,
-                                               std::memory_order_release);
-          creation_completion_event_->Set();
-        }
-        if (creation_completion_callback_) {
-          // Invoke completion callback (non-blocking mode).
-          auto callback = std::move(creation_completion_callback_);
-          creation_completion_callback_ = nullptr;
-          lock.unlock();
-          callback();
-          lock.lock();
-        }
-      }
+    if (!EnsurePipelineCreated(creation_arguments, VK_NULL_HANDLE,
+                               VK_NULL_HANDLE, &created_pipeline)) {
+      failed_stage = "pipeline creation";
     }
   }
+  if (failed_stage) {
+    // Many of EnsurePipelineCreated's failure paths log nothing, so this is
+    // the only trace of what went wrong for most of them.
+    XELOGE("Async {} failed (VS {:016X}, PS {:016X})", failed_stage,
+           creation_arguments.vertex_shader->shader().ucode_data_hash(),
+           creation_arguments.pixel_shader
+               ? creation_arguments.pixel_shader->shader().ucode_data_hash()
+               : 0);
+  }
+  return created_pipeline;
 }
 
 bool VulkanPipelineCache::TranslateAnalyzedShader(
@@ -1091,33 +999,35 @@ void VulkanPipelineCache::TranslateShadersForStorage(
       render_target_cache_.msaa_2x_no_attachments_supported();
   uint32_t draw_res_x = render_target_cache_.draw_resolution_scale_x();
   uint32_t draw_res_y = render_target_cache_.draw_resolution_scale_y();
+  bool precise_interpolation = precise_interpolation_supported();
 
-  auto translate_function = [this, &translations_to_do, &translation_index,
-                             &translations_completed, vulkan_device,
-                             msaa_2x_attachments, msaa_2x_no_attachments,
-                             edram_fsi_used, draw_res_x, draw_res_y]() {
-    // Each thread needs its own translator.
-    SpirvShaderTranslator translator(
-        SpirvShaderTranslator::Features(vulkan_device), msaa_2x_attachments,
-        msaa_2x_no_attachments, edram_fsi_used, draw_res_x, draw_res_y);
+  auto translate_function =
+      [this, &translations_to_do, &translation_index, &translations_completed,
+       vulkan_device, msaa_2x_attachments, msaa_2x_no_attachments,
+       edram_fsi_used, precise_interpolation, draw_res_x, draw_res_y]() {
+        // Each thread needs its own translator.
+        SpirvShaderTranslator translator(
+            SpirvShaderTranslator::Features(vulkan_device), msaa_2x_attachments,
+            msaa_2x_no_attachments, edram_fsi_used, precise_interpolation,
+            draw_res_x, draw_res_y);
 
-    while (true) {
-      size_t index = translation_index.fetch_add(1);
-      if (index >= translations_to_do.size()) {
-        break;
-      }
-      VulkanShader* shader = translations_to_do[index].first;
-      uint64_t modification = translations_to_do[index].second;
-      VulkanShader::VulkanTranslation* translation =
-          static_cast<VulkanShader::VulkanTranslation*>(
-              shader->GetTranslation(modification));
-      if (translation && !translation->is_translated()) {
-        if (TranslateAnalyzedShader(translator, *translation)) {
-          translations_completed.fetch_add(1);
+        while (true) {
+          size_t index = translation_index.fetch_add(1);
+          if (index >= translations_to_do.size()) {
+            break;
+          }
+          VulkanShader* shader = translations_to_do[index].first;
+          uint64_t modification = translations_to_do[index].second;
+          VulkanShader::VulkanTranslation* translation =
+              static_cast<VulkanShader::VulkanTranslation*>(
+                  shader->GetTranslation(modification));
+          if (translation && !translation->is_translated()) {
+            if (TranslateAnalyzedShader(translator, *translation)) {
+              translations_completed.fetch_add(1);
+            }
+          }
         }
-      }
-    }
-  };
+      };
 
   size_t thread_count = 0;
   if (cvars::vulkan_pipeline_creation_threads != 0) {
@@ -1648,21 +1558,47 @@ VkShaderModule VulkanPipelineCache::GetTessellationVertexShader(
              : tessellation_indexed_vs_;
 }
 
+VkShaderModule VulkanPipelineCache::GetPlaceholderFragmentShader(
+    const PipelineCreationArguments& creation_arguments,
+    bool allow_debug_color) const {
+  if (render_target_cache_.GetPath() ==
+      RenderTargetCache::Path::kPixelShaderInterlock) {
+    // Depth goes through the pixel shader here, so write it like a depth-only
+    // draw rather than drawing nothing.
+    VkShaderModule depth_only_fragment_shader =
+        depth_only_fragment_shaders_[size_t(
+            creation_arguments.pipeline->first.render_pass_key.msaa_samples)];
+    if (depth_only_fragment_shader != VK_NULL_HANDLE) {
+      return depth_only_fragment_shader;
+    }
+    // Not null - creating_placeholder is derived from this being non-null.
+    return placeholder_pixel_shader_;
+  }
+  if (allow_debug_color && cvars::async_shader_vs_interpreter_debug_color &&
+      placeholder_color_pixel_shader_ != VK_NULL_HANDLE) {
+    return placeholder_color_pixel_shader_;
+  }
+  return placeholder_pixel_shader_;
+}
+
 bool VulkanPipelineCache::EnsurePipelineCreatedWithInterpreterPlaceholder(
     const PipelineCreationArguments& creation_arguments) {
-  VkShaderModule placeholder_ps =
-      (cvars::async_shader_vs_interpreter_debug_color &&
-       placeholder_color_pixel_shader_ != VK_NULL_HANDLE)
-          ? placeholder_color_pixel_shader_
-          : placeholder_pixel_shader_;
-  return EnsurePipelineCreated(creation_arguments, placeholder_ps,
-                               ucode_interpreter_vs_);
+  return EnsurePipelineCreated(
+      creation_arguments,
+      GetPlaceholderFragmentShader(creation_arguments,
+                                   /*allow_debug_color=*/true),
+      ucode_interpreter_vs_);
 }
 
 bool VulkanPipelineCache::EnsurePipelineCreated(
     const PipelineCreationArguments& creation_arguments,
     VkShaderModule fragment_shader_override,
-    VkShaderModule vertex_shader_override) {
+    VkShaderModule vertex_shader_override,
+    VkPipeline* out_unpublished_pipeline) {
+  if (out_unpublished_pipeline) {
+    // Defined on every path below, including the early returns.
+    *out_unpublished_pipeline = VK_NULL_HANDLE;
+  }
   // Check if we already have a pipeline.
   // If it's a placeholder and we're not creating another placeholder,
   // we need to replace it with the real pipeline.
@@ -1836,7 +1772,8 @@ bool VulkanPipelineCache::EnsurePipelineCreated(
     }
   } else {
     if (edram_fragment_shader_interlock) {
-      shader_stage_fragment.module = depth_only_fragment_shader_;
+      shader_stage_fragment.module = depth_only_fragment_shaders_[size_t(
+          description.render_pass_key.msaa_samples)];
     } else if (render_target_cache_.depth_float24_convert_in_pixel_shader() &&
                (description.depth_write_enable ||
                 description.depth_compare_op !=
@@ -2280,6 +2217,39 @@ bool VulkanPipelineCache::EnsurePipelineCreated(
     return false;
   }
 
+  if (out_unpublished_pipeline) {
+    // The caller publishes it, in its turn.
+    *out_unpublished_pipeline = pipeline;
+    return true;
+  }
+  StoreCreatedPipeline(creation_arguments, pipeline, creating_placeholder);
+  return true;
+}
+
+void VulkanPipelineCache::StoreCreatedPipeline(
+    const PipelineCreationArguments& creation_arguments, VkPipeline pipeline,
+    bool creating_placeholder) {
+  if (pipeline == VK_NULL_HANDLE) {
+    // Nothing else will be created for this entry, so say what it is left as.
+    // Clearing the flag also stops it reporting as "waiting for real" forever,
+    // which would hang an occlusion-query await.
+    const bool had_placeholder =
+        creation_arguments.pipeline->second.is_placeholder.load(
+            std::memory_order_acquire);
+    XELOGE(
+        "Pipeline stuck for the rest of the run, {} (VS {:016X}, PS {:016X})",
+        had_placeholder ? "drawing through its placeholder"
+                        : "its draws skipped",
+        creation_arguments.vertex_shader->shader().ucode_data_hash(),
+        creation_arguments.pixel_shader
+            ? creation_arguments.pixel_shader->shader().ucode_data_hash()
+            : 0);
+    if (had_placeholder) {
+      creation_arguments.pipeline->second.is_placeholder.store(
+          false, std::memory_order_release);
+    }
+    return;
+  }
   // Record the placeholder handle before publishing it, so a draw that observes
   // this pipeline handle also observes it as the placeholder (see Pipeline::
   // placeholder_pipeline). Stored before the exchange so the release on the
@@ -2316,8 +2286,6 @@ bool VulkanPipelineCache::EnsurePipelineCreated(
                ? creation_arguments.pixel_shader->shader().ucode_data_hash()
                : 0);
   }
-
-  return true;
 }
 
 void VulkanPipelineCache::ProcessDeferredDestructions() {
@@ -2389,9 +2357,9 @@ void VulkanPipelineCache::InitializeShaderStorage(
   pipeline_config.file_suffix =
       fmt::format(".{}.vk.xpso", edram_fsi_used ? "fsi" : "fbo");
   pipeline_config.api_magic = kPipelineStorageAPIMagicVulkan;
-  pipeline_config.version =
-      std::max(PipelineDescription::kVersion,
-               SpirvShaderTranslator::Modification::kVersion);
+  // Sum so a bump of either version invalidates - both only ever move up.
+  pipeline_config.version = PipelineDescription::kVersion +
+                            SpirvShaderTranslator::Modification::kVersion;
 
   uint32_t storage_index = storage_writer_.storage_index() + 1;
 
@@ -2620,87 +2588,37 @@ void VulkanPipelineCache::InitializeShaderStorage(
           *pipelines_.emplace(pipeline_description, Pipeline(pipeline_layout))
                .first;
 
-      // Queue for creation.
-      if (!creation_threads_.empty()) {
-        // Calculate priority based on whether shader writes to visible RTs.
-        uint8_t priority = 0;
-        if (pixel_shader) {
-          uint32_t bound_rts =
-              (pipeline_description.render_targets[0].color_write_mask ? 1
-                                                                       : 0) |
-              (pipeline_description.render_targets[1].color_write_mask ? 2
-                                                                       : 0) |
-              (pipeline_description.render_targets[2].color_write_mask ? 4
-                                                                       : 0) |
-              (pipeline_description.render_targets[3].color_write_mask ? 8 : 0);
-          priority = pipeline_util::CalculatePipelinePriority(
-              bound_rts, pixel_shader->writes_color_targets(),
-              pixel_shader->writes_depth());
-        }
-
-        std::lock_guard<std::mutex> lock(creation_request_lock_);
-        PipelineCreationArguments creation_arguments;
-        creation_arguments.pipeline = &pipeline_pair;
-        creation_arguments.vertex_shader = vertex_translation;
-        creation_arguments.pixel_shader = pixel_translation;
-        creation_arguments.geometry_shader = geometry_shader;
-        creation_arguments.tessellation_vertex_shader =
-            tessellation_vertex_shader;
-        creation_arguments.tessellation_control_shader =
-            tessellation_control_shader;
-        creation_arguments.render_pass = render_pass;
-        creation_arguments.render_pass_key =
-            pipeline_description.render_pass_key;
-        creation_arguments.priority = priority;
-        creation_queue_.push(creation_arguments);
-        creation_request_cond_.notify_one();
+      PipelineCreationArguments creation_arguments;
+      creation_arguments.pipeline = &pipeline_pair;
+      creation_arguments.vertex_shader = vertex_translation;
+      creation_arguments.pixel_shader = pixel_translation;
+      creation_arguments.geometry_shader = geometry_shader;
+      creation_arguments.tessellation_vertex_shader =
+          tessellation_vertex_shader;
+      creation_arguments.tessellation_control_shader =
+          tessellation_control_shader;
+      creation_arguments.render_pass = render_pass;
+      creation_arguments.render_pass_key = pipeline_description.render_pass_key;
+      if (creation_queue_.has_threads()) {
+        // Nothing is drawing these yet, so they publish as they are built.
+        creation_queue_.PushUnordered(creation_arguments);
       } else {
         // No creation threads - create synchronously.
-        PipelineCreationArguments creation_arguments;
-        creation_arguments.pipeline = &pipeline_pair;
-        creation_arguments.vertex_shader = vertex_translation;
-        creation_arguments.pixel_shader = pixel_translation;
-        creation_arguments.geometry_shader = geometry_shader;
-        creation_arguments.tessellation_vertex_shader =
-            tessellation_vertex_shader;
-        creation_arguments.tessellation_control_shader =
-            tessellation_control_shader;
-        creation_arguments.render_pass = render_pass;
-        creation_arguments.render_pass_key =
-            pipeline_description.render_pass_key;
         EnsurePipelineCreated(creation_arguments);
       }
 
       ++pipelines_created;
     }
 
-    if (!creation_threads_.empty()) {
+    if (creation_queue_.has_threads()) {
       if (blocking) {
         // Blocking mode: wait for all pipelines to be created.
-        bool await_creation_completion_event;
-        {
-          std::lock_guard<std::mutex> lock(creation_request_lock_);
-          await_creation_completion_event =
-              !creation_queue_.empty() || creation_threads_busy_ != 0;
-          if (await_creation_completion_event) {
-            creation_completion_event_->Reset();
-            creation_completion_set_event_.store(true,
-                                                 std::memory_order_release);
-          }
-        }
-        if (await_creation_completion_event) {
-          creation_request_cond_.notify_one();
-          xe::threading::Wait(creation_completion_event_.get(), false);
-        }
+        creation_queue_.AwaitCompletion();
       } else {
-        // Non-blocking mode: store callback for later invocation.
-        std::lock_guard<std::mutex> lock(creation_request_lock_);
-        if (creation_queue_.empty() && creation_threads_busy_ == 0) {
-          // No work pending - callback will be invoked at end of function.
-        } else {
-          creation_completion_callback_ = std::move(completion_callback);
-          completion_callback = nullptr;  // Prevent invocation at end
-        }
+        // Non-blocking mode: the creation threads invoke the callback when they
+        // are done - or leave it to the tail of this function if they already
+        // are.
+        creation_queue_.TakeCompletionCallback(completion_callback);
       }
     }
 

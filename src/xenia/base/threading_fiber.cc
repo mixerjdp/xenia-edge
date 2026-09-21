@@ -240,8 +240,7 @@ class FcontextFiber : public Fiber {
   FcontextFiber(size_t stack_size, std::function<void()> start_routine)
       : entry_(std::move(start_routine)) {
     stack_ = AllocFiberStack(stack_size);
-    fctx_ = make_fcontext(stack_.high, stack_.usable,
-                          &FcontextFiber::EntryTrampoline);
+    ResetContext();
     owns_stack_ = true;
   }
 
@@ -300,7 +299,20 @@ class FcontextFiber : public Fiber {
 
   void SetTerminated() override { terminated_ = true; }
 
+  void Restart() override {
+    assert_true(owns_stack_);
+    assert_true(current_fiber_ != this);
+    ResetContext();
+    terminated_ = false;
+  }
+
  private:
+  // The stack's floor page is not part of what the context may use.
+  void ResetContext() {
+    fctx_ = make_fcontext(stack_.high, stack_.usable,
+                          &FcontextFiber::EntryTrampoline);
+  }
+
   static void EntryTrampoline(fcontext_transfer_t t) {
     // First entry into a created fiber. |t.data| is the switcher (prev),
     // |t.fctx| its continuation - record it so prev can be resumed.

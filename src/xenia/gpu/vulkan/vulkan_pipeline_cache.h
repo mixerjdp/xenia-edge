@@ -11,7 +11,6 @@
 #define XENIA_GPU_VULKAN_VULKAN_PIPELINE_STATE_CACHE_H_
 
 #include <atomic>
-#include <condition_variable>
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
@@ -20,7 +19,6 @@
 #include <functional>
 #include <memory>
 #include <mutex>
-#include <queue>
 #include <set>
 #include <unordered_map>
 #include <utility>
@@ -31,6 +29,7 @@
 #include "xenia/base/threading.h"
 #include "xenia/base/xxhash.h"
 #include "xenia/gpu/guest_spirv_shader_cache.h"
+#include "xenia/gpu/pipeline_creation_queue.h"
 #include "xenia/gpu/primitive_processor.h"
 #include "xenia/gpu/register_file.h"
 #include "xenia/gpu/registers.h"
@@ -341,17 +340,6 @@ class VulkanPipelineCache : public GuestSpirvShaderCache::Host {
     VkRenderPass render_pass;
     // For dynamic rendering (VK_KHR_dynamic_rendering / Vulkan 1.3).
     VulkanRenderTargetCache::RenderPassKey render_pass_key;
-    // Priority for async compilation (higher = compiled sooner).
-    // Pipelines that write to visible render targets get higher priority.
-    uint8_t priority = 0;
-  };
-
-  // Comparator for priority queue - higher priority first.
-  struct PipelineCreationPriorityCompare {
-    bool operator()(const PipelineCreationArguments& a,
-                    const PipelineCreationArguments& b) const {
-      return a.priority < b.priority;  // max-heap: lower priority at bottom
-    }
   };
 
   // Can be called from multiple threads. use_try_claim atomically claims the
@@ -390,9 +378,10 @@ class VulkanPipelineCache : public GuestSpirvShaderCache::Host {
 
   VkShaderModule GetGeometryShader(GeometryShaderKey key);
 
+  bool precise_interpolation_supported() const;
+
   // GuestSpirvShaderCache::Host.
   std::unique_ptr<SpirvShaderTranslator> CreateTranslator() const override;
-  bool precise_interpolation_supported() const override;
   bool depth_float24_round() const override {
     return render_target_cache_.depth_float24_round();
   }
@@ -417,16 +406,33 @@ class VulkanPipelineCache : public GuestSpirvShaderCache::Host {
   // vertex_shader_override, if not VK_NULL_HANDLE, is used instead of the
   // translated vertex shader module (for the ucode interpreter placeholder,
   // whose guest VS is intentionally not translated yet).
+  // If out_unpublished_pipeline is given, the pipeline is returned through it
+  // instead of swapped into the entry, for a caller that publishes it later.
+  // Set on every path, VK_NULL_HANDLE when there is nothing new to publish.
   bool EnsurePipelineCreated(
       const PipelineCreationArguments& creation_arguments,
       VkShaderModule fragment_shader_override = VK_NULL_HANDLE,
-      VkShaderModule vertex_shader_override = VK_NULL_HANDLE);
+      VkShaderModule vertex_shader_override = VK_NULL_HANDLE,
+      VkPipeline* out_unpublished_pipeline = nullptr);
+
+  // Swaps a created pipeline (or a failure, a null handle) into its entry.
+  void StoreCreatedPipeline(const PipelineCreationArguments& creation_arguments,
+                            VkPipeline pipeline, bool creating_placeholder);
+
+  // The pixel shader a placeholder pipeline rasterizes with. The no-op one
+  // draws nothing on the FSI path, where depth goes through the pixel shader.
+  VkShaderModule GetPlaceholderFragmentShader(
+      const PipelineCreationArguments& creation_arguments,
+      bool allow_debug_color) const;
 
   // Creates a placeholder pipeline using the placeholder pixel shader.
   // Used for pipeline hot-swap to reduce stutter.
   bool EnsurePipelineCreatedWithPlaceholder(
       const PipelineCreationArguments& creation_arguments) {
-    return EnsurePipelineCreated(creation_arguments, placeholder_pixel_shader_);
+    return EnsurePipelineCreated(
+        creation_arguments,
+        GetPlaceholderFragmentShader(creation_arguments,
+                                     /*allow_debug_color=*/false));
   }
 
   // Creates a placeholder pipeline that rasterizes the guest geometry via the
@@ -479,7 +485,9 @@ class VulkanPipelineCache : public GuestSpirvShaderCache::Host {
 
   // Empty depth-only pixel shader for writing to depth buffer using fragment
   // shader interlock when no Xenos pixel shader provided.
-  VkShaderModule depth_only_fragment_shader_ = VK_NULL_HANDLE;
+  // One per guest sample count - FSI shaders are specialized for it.
+  VkShaderModule
+      depth_only_fragment_shaders_[size_t(xenos::MsaaSamples::k4X) + 1] = {};
 
   // Substitute depth-only pixel shaders that perform float24 conversion of the
   // rasterizer's depth, bound for guest depth-only draws when in-PS float24
@@ -528,25 +536,16 @@ class VulkanPipelineCache : public GuestSpirvShaderCache::Host {
   // Previously used pipeline, to avoid lookups if the state wasn't changed.
   std::pair<const PipelineDescription, Pipeline>* last_pipeline_ = nullptr;
 
-  void CreationThread();
+  // Builds one queued pipeline on a creation thread. VK_NULL_HANDLE if it
+  // failed.
+  VkPipeline CreateQueuedPipeline(
+      const PipelineCreationArguments& creation_arguments,
+      SpirvShaderTranslator* worker_translator);
 
   // For asynchronous creation.
-  std::vector<std::unique_ptr<xe::threading::Thread>> creation_threads_;
-  std::atomic<bool> creation_threads_shutdown_{false};
-  std::atomic<size_t> creation_threads_busy_{0};
-  // Priority queue contains pointers to map entries. Pipelines are never
-  // evicted as games have a finite set that should all remain cached for
-  // performance. Higher priority pipelines (those writing to visible RTs)
-  // are compiled first.
-  std::priority_queue<PipelineCreationArguments,
-                      std::vector<PipelineCreationArguments>,
-                      PipelineCreationPriorityCompare>
+  PipelineCreationQueue<PipelineCreationArguments, VkPipeline,
+                        SpirvShaderTranslator>
       creation_queue_;
-  std::mutex creation_request_lock_;
-  std::condition_variable creation_request_cond_;
-  std::unique_ptr<xe::threading::Event> creation_completion_event_ = nullptr;
-  std::atomic<bool> creation_completion_set_event_{false};
-  std::function<void()> creation_completion_callback_;
   // During startup loading, don't block on pipeline creation to allow game
   // boot.
   bool startup_loading_ = false;

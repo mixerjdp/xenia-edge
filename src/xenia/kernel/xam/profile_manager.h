@@ -100,7 +100,9 @@ class ProfileManager {
 
   UserProfile* GetProfile(const uint64_t xuid) const;
   UserProfile* GetProfile(const uint8_t user_index) const;
+  UserProfile* GetProfileLive(const uint64_t xuid) const;
   uint8_t GetUserIndexAssignedToProfile(const uint64_t xuid) const;
+  uint8_t GetUserIndexAssignedToLiveProfile(const uint64_t xuid_online) const;
 
   const std::map<uint64_t, X_XAMACCOUNTINFO>* GetAccounts() {
     return &accounts_;
@@ -119,9 +121,6 @@ class ProfileManager {
   bool UpdateAccount(const uint64_t xuid, const X_XAMACCOUNTINFO* account);
 
   std::vector<ScannedTitleInfo> ScanAllProfilesForTitles() const;
-
-  // Reads a title's icon PNG from a per-title GPD on disk (migration only).
-  std::vector<uint8_t> ReadTitleIcon(uint32_t title_id) const;
 
   static bool IsGamertagValid(const std::string gamertag);
 

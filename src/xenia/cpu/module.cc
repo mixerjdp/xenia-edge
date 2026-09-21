@@ -145,6 +145,11 @@ Symbol::Status Module::DefineVariable(Symbol* symbol) {
   return DefineSymbol(symbol);
 }
 
+void Module::ForgetSymbol(uint32_t address) {
+  auto global_lock = global_critical_region_.Acquire();
+  map_.erase(address);
+}
+
 const std::vector<uint32_t> Module::GetAddressedFunctions() {
   std::vector<uint32_t> addresses;
 

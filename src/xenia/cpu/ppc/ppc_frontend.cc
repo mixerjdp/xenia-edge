@@ -52,8 +52,6 @@ PPCFrontend::~PPCFrontend() {
   translator_pool_.Reset();
 }
 
-Memory* PPCFrontend::memory() const { return processor_->memory(); }
-
 // Checks the state of the global lock and sets scratch to the current MSR
 // value.
 void CheckGlobalLock(PPCContext* ppc_context, void* arg0, void* arg1) {
@@ -81,6 +79,10 @@ void LeaveGlobalLock(PPCContext* ppc_context, void* arg0, void* arg1) {
 }
 
 void SyscallHandler(PPCContext* ppc_context, void* arg0, void* arg1) {
+  if (auto hook = ppc_context->processor->syscall_hook();
+      hook && hook(ppc_context)) {
+    return;
+  }
   uint64_t syscall_number = ppc_context->r[0];
   switch (syscall_number) {
     default:

@@ -338,13 +338,13 @@ class Presenter {
   // Requests (re)painting with the UI if there's UI to draw.
   void RequestUIPaintFromUIThread();
 
-  // Whether a new guest output frame arrived since the previous UI-thread
-  // paint, so the guest output is currently driving the paint cadence. UI
-  // drawers can check this to avoid requesting extra repaints that present
-  // faster than the guest produces frames. Valid only while UI drawers execute.
-  bool GuestOutputDroveCurrentUIPaint() const {
-    return guest_output_drove_current_ui_paint_;
-  }
+  // A guest output not refreshed for this long is stalled, not merely slow.
+  static constexpr uint32_t kGuestOutputStallTimeoutMillis = 250;
+  // Whether the guest output is refreshing often enough to be relied on to
+  // drive the next UI paint too. UI drawers needing continuous repaints must
+  // request their own paints when it isn't, or a dialog opened over a stalled
+  // guest would never be painted again.
+  bool IsGuestOutputDrivingPaints() const;
 
  protected:
   enum class PaintResult {
@@ -979,6 +979,9 @@ class Presenter {
   // presentation, so the UI thread can tell whether the guest output is driving
   // the paint cadence.
   std::atomic<uint64_t> guest_output_refresh_count_{0};
+  // steady_clock ticks of the last refresh, written by the guest output thread.
+  std::atomic<std::chrono::steady_clock::rep> guest_output_last_refresh_ticks_{
+      0};
   // UI-thread-only snapshot of guest_output_refresh_count_ at the previous
   // paint, and whether it advanced since (the guest drove the current paint).
   uint64_t guest_output_refresh_count_prev_ui_paint_ = 0;

@@ -21,12 +21,10 @@
 #define MICROPROFILEUI_ENABLED 1
 #define MICROPROFILEUI_IMPL 1
 #endif
-// Paid per live guest thread, not per host thread: the cooperative scheduler
-// gives every fiber-backed thread its own log. Sized for the command processor
-// thread, which logs ~25k entries per frame where no other thread exceeds 300;
-// once the ring wraps ahead of a flip, dropped entries mispair enter/leave and
-// poison the aggregate.
+// Allocated per logging thread, a flip overrunning it loses its tail.
 #define MICROPROFILE_PER_THREAD_BUFFER_SIZE (4 * 1024 * 1024)
+// No GPU timers to wait on, so each flip replays as soon as it ends.
+#define MICROPROFILE_GPU_FRAME_DELAY 0
 #define MICROPROFILE_USE_THREAD_NAME_CALLBACK 1
 #define MICROPROFILE_WEBSERVER_MAXFRAMES 3
 #define MICROPROFILE_PRINTF(...)                               \
@@ -81,6 +79,13 @@ namespace xe {
 
 #if XE_OPTION_PROFILING
 
+// Slots held back from the guest so engine scopes can still claim one. Every
+// SCOPE_profile_* registers lazily on first execution, and the GPU backends
+// first run theirs on the first draw, long after boot has walked enough guest
+// functions to fill the table. Sized above the ~150 scope sites in src/.
+static constexpr size_t kGuestFunctionTokenBudget =
+    MICROPROFILE_MAX_TIMERS - 256;
+
 MicroProfileToken GetGuestFunctionToken(uint32_t guest_address) {
   // Thread-local cache keeps the hot path lock-free. This is called per guest
   // function under FTrace, so the global lock is hit only on the first lookup
@@ -93,17 +98,25 @@ MicroProfileToken GetGuestFunctionToken(uint32_t guest_address) {
 
   static std::mutex mutex;
   static std::unordered_map<uint32_t, MicroProfileToken> tokens;
+  static size_t allocated = 0;
   MicroProfileToken token;
   {
     std::lock_guard<std::mutex> lock(mutex);
     auto it = tokens.find(guest_address);
     if (it != tokens.end()) {
       token = it->second;
+    } else if (allocated >= kGuestFunctionTokenBudget) {
+      // The floor MicroProfileGetToken hits on a full table, reached earlier.
+      token = MICROPROFILE_INVALID_TOKEN;
+      tokens.emplace(guest_address, token);
     } else {
       char name[16];
       std::snprintf(name, sizeof(name), "%08X", guest_address);
       token = MicroProfileGetToken("guestfn", name, Profiler::GetColor(name),
                                    MicroProfileTokenTypeCpu);
+      if (token != MICROPROFILE_INVALID_TOKEN) {
+        ++allocated;
+      }
       tokens.emplace(guest_address, token);
     }
   }

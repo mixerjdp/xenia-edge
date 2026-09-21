@@ -93,6 +93,16 @@ DEFINE_CVar(launch_data, "",
 DEFINE_bool(dump_xex, false, "Dump the main XEX to current directory on launch",
             "General");
 
+DEFINE_string(media_type, "auto",
+              "Media the title is told it runs from. Use: [auto, hdd, odd]. "
+              "auto matches the launched image - ODD for iso/zar, HDD for a "
+              "directly launched default.xex, and STFS containers report "
+              "their type based on whether they are disc or digital dumps. "
+              "This should mostly be fine, but some disc dumps want to run "
+              "as HDD to avoid unnecessary file installs, while others may "
+              "need to run as ODD to force those installs.",
+              "Content");
+
 DEFINE_bool(allow_game_relative_writes, false,
             "Not useful to non-developers. Allows code to write to paths "
             "relative to game://. Used for "
@@ -292,7 +302,7 @@ X_STATUS Emulator::Setup(
   // 360 uses a 50MHz clock.
   Clock::set_guest_tick_frequency(50000000);
   // We could reset this with save state data/constant value to help replays.
-  Clock::set_guest_system_time_base(Clock::QueryHostSystemTime());
+  Clock::SetGuestSystemTime(Clock::QueryHostSystemTime());
   // This can be adjusted dynamically, as well.
   Clock::set_guest_time_scalar(cvars::time_scalar);
 
@@ -479,6 +489,7 @@ X_STATUS Emulator::TerminateTitle() {
 
 const std::unique_ptr<vfs::Device> Emulator::CreateVfsDevice(
     const std::filesystem::path& path, const std::string_view mount_path) {
+  std::unique_ptr<vfs::Device> device;
   // Must check if the type has changed e.g. XamSwapDisc
   switch (GetFileSignature(path)) {
     case FileSignatureType::XEX0:
@@ -488,21 +499,20 @@ const std::unique_ptr<vfs::Device> Emulator::CreateVfsDevice(
     case FileSignatureType::XEX1:
     case FileSignatureType::XEX2:
     case FileSignatureType::ELF: {
-      auto parent_path = path.parent_path();
-      return std::make_unique<vfs::HostPathDevice>(
-          mount_path, parent_path, !cvars::allow_game_relative_writes);
+      device = std::make_unique<vfs::HostPathDevice>(
+          mount_path, path.parent_path(), !cvars::allow_game_relative_writes);
     } break;
     case FileSignatureType::LIVE:
     case FileSignatureType::CON:
     case FileSignatureType::PIRS: {
-      return vfs::XContentContainerDevice::CreateContentDevice(mount_path,
-                                                               path);
+      device =
+          vfs::XContentContainerDevice::CreateContentDevice(mount_path, path);
     } break;
     case FileSignatureType::XISO: {
-      return std::make_unique<vfs::DiscImageDevice>(mount_path, path);
+      device = std::make_unique<vfs::DiscImageDevice>(mount_path, path);
     } break;
     case FileSignatureType::ZAR: {
-      return std::make_unique<vfs::DiscZarchiveDevice>(mount_path, path);
+      device = std::make_unique<vfs::DiscZarchiveDevice>(mount_path, path);
     } break;
     case FileSignatureType::XBE:
     case FileSignatureType::EXE:
@@ -511,6 +521,13 @@ const std::unique_ptr<vfs::Device> Emulator::CreateVfsDevice(
       return nullptr;
       break;
   }
+
+  // The launched title's own storage, and the only mount given request timing,
+  // since nothing streams content through the save, profile or cache mounts.
+  if (device) {
+    device->drive_timing().Configure();
+  }
+  return device;
 }
 
 uint64_t Emulator::GetPersistentEmulatorFlags() {
@@ -576,6 +593,7 @@ X_STATUS Emulator::MountPath(const std::filesystem::path& path,
   // Create symlinks to the device.
   file_system_->RegisterSymbolicLink(kDefaultGameSymbolicLink, mount_path);
   file_system_->RegisterSymbolicLink(kDefaultPartitionSymbolicLink, mount_path);
+  kernel_state_->title_mount_path_ = mount_path;
 
   return X_STATUS_SUCCESS;
 }
@@ -709,6 +727,25 @@ X_STATUS Emulator::LaunchPath(const std::filesystem::path& path) {
   }
 }
 
+void Emulator::SetDeploymentType(XDeploymentType detected_type) {
+  XDeploymentType type = detected_type;
+  if (cvars::media_type == "hdd") {
+    // kDownload is already an HDD device, and says more about the title.
+    if (detected_type != XDeploymentType::kDownload) {
+      type = XDeploymentType::kInstalledToHDD;
+    }
+  } else if (cvars::media_type == "odd") {
+    type = XDeploymentType::kOpticalDisc;
+  } else if (cvars::media_type != "auto") {
+    XELOGW("Unknown media_type '{}', using auto", cvars::media_type);
+  }
+
+  if (type != detected_type) {
+    XELOGI("Deployment type overridden to {}", cvars::media_type);
+  }
+  kernel_state_->deployment_type_ = type;
+}
+
 X_STATUS Emulator::LaunchXexFile(const std::filesystem::path& path) {
   // We create a virtual filesystem pointing to its directory and symlink
   // that to the game filesystem.
@@ -728,7 +765,7 @@ X_STATUS Emulator::LaunchXexFile(const std::filesystem::path& path) {
     return result;
   }
 
-  kernel_state_->deployment_type_ = XDeploymentType::kInstalledToHDD;
+  SetDeploymentType(XDeploymentType::kInstalledToHDD);
 
   if (!kernel::IsSystemTitle(kernel_state_->title_id())) {
     return result;
@@ -761,7 +798,7 @@ X_STATUS Emulator::LaunchDiscImage(const std::filesystem::path& path) {
   if (result == X_STATUS_NOT_FOUND && !cvars::launch_module.empty()) {
     return LaunchDefaultModule(path);
   }
-  kernel_state_->deployment_type_ = XDeploymentType::kOpticalDisc;
+  SetDeploymentType(XDeploymentType::kOpticalDisc);
   return result;
 }
 
@@ -774,7 +811,7 @@ X_STATUS Emulator::LaunchDiscArchive(const std::filesystem::path& path) {
   if (result == X_STATUS_NOT_FOUND && !cvars::launch_module.empty()) {
     return LaunchDefaultModule(path);
   }
-  kernel_state_->deployment_type_ = XDeploymentType::kOpticalDisc;
+  SetDeploymentType(XDeploymentType::kOpticalDisc);
   return result;
 }
 
@@ -785,7 +822,17 @@ X_STATUS Emulator::LaunchStfsContainer(const std::filesystem::path& path) {
   if (result == X_STATUS_NOT_FOUND && !cvars::launch_module.empty()) {
     return LaunchDefaultModule(path);
   }
-  kernel_state_->deployment_type_ = XDeploymentType::kDownload;
+
+  auto* container = dynamic_cast<vfs::XContentContainerDevice*>(
+      file_system_->GetDevice("\\Device\\Package_0"));
+  const uint32_t content_type = container ? container->content_type() : 0;
+  // A disc rip installed to the HDD still runs as a disc title.
+  const bool is_disc_content =
+      content_type == static_cast<uint32_t>(XContentType::kInstalledGame);
+  SetDeploymentType(is_disc_content ? XDeploymentType::kOpticalDisc
+                                    : XDeploymentType::kDownload);
+  XELOGI("LaunchStfsContainer: content type {:08X}, running as {}",
+         content_type, is_disc_content ? "optical disc" : "download");
   return result;
 }
 
@@ -795,12 +842,10 @@ X_STATUS Emulator::LaunchDefaultModule(const std::filesystem::path& path) {
   X_STATUS result = CompleteLaunch(path, module_path);
 
   if (XSUCCEEDED(result)) {
-    kernel_state_->deployment_type_ = XDeploymentType::kInstalledToHDD;
-    auto title_id = kernel_state_->title_id();
-    if (!kernel::IsSystemTitle(title_id)) {
-      // Assumption that any loaded game is loaded as a disc.
-      kernel_state_->deployment_type_ = XDeploymentType::kOpticalDisc;
-    }
+    // No media info on this path, so assume a disc unless it's a system title.
+    SetDeploymentType(kernel::IsSystemTitle(kernel_state_->title_id())
+                          ? XDeploymentType::kInstalledToHDD
+                          : XDeploymentType::kOpticalDisc);
   }
   return result;
 }
@@ -1325,6 +1370,7 @@ void Emulator::RelaunchTitle(const std::string& host_path,
                              const std::string& launch_module,
                              uint32_t launch_flags,
                              std::vector<uint8_t> launch_data) {
+  std::unique_lock<std::mutex> launch_lock(launch_mutex_);
   XELOGI(
       "RelaunchTitle: starting full in-process relaunch, target={}, module={}",
       host_path, launch_module);
@@ -1382,6 +1428,7 @@ void Emulator::RelaunchTitle(const std::string& host_path,
   auto launch_target =
       host_path.empty() ? last_launch_path_ : xe::to_path(host_path);
   XELOGI("RelaunchTitle: launching '{}'", xe::path_to_utf8(launch_target));
+  launch_lock.unlock();
   LaunchPath(launch_target);
 
   relaunching_ = false;
@@ -1389,6 +1436,7 @@ void Emulator::RelaunchTitle(const std::string& host_path,
 }
 
 void Emulator::ResetTitle() {
+  std::lock_guard<std::mutex> launch_lock(launch_mutex_);
   XELOGI("ResetTitle: stopping title and resetting kernel");
 
   relaunching_ = true;
@@ -1468,9 +1516,6 @@ void Emulator::MountStandardDrives() {
     }
 
     // Some (older?) games try accessing cache:\ too
-    // NOTE: this must be registered _after_ the cache0/cache1 devices, due to
-    // substring/start_with logic inside VirtualFileSystem::ResolvePath, else
-    // accesses to those devices will go here instead
     auto cache_device = std::make_unique<xe::vfs::HostPathDevice>(
         "\\CACHE", storage_root_ / "cache", false);
     if (!cache_device->Initialize()) {
@@ -1545,7 +1590,7 @@ const std::filesystem::path Emulator::GetNewDiscPath(
         if (std::filesystem::exists(game_path)) {
           initial_dir = game_path.parent_path();
           XELOGI("Setting file picker initial directory to game directory: {}",
-                 initial_dir.string().c_str());
+                 xe::path_to_utf8(initial_dir));
         }
       }
     }
@@ -1572,7 +1617,8 @@ const std::filesystem::path Emulator::GetNewDiscPath(
     xe::threading::Fence fence;
     display_window_->app_context().CallInUIThreadSynchronous([&, this]() {
       auto* dialog = new kernel::xam::ui::DiscSwapUI(
-          imgui_drawer_, window_message, disc_infos, show_error);
+          imgui_drawer_, input_system_.get(), window_message, disc_infos,
+          show_error);
       dialog->set_close_callback([&result, &selected_path, dialog]() {
         result = dialog->result();
         selected_path = dialog->selected_path();
@@ -1580,14 +1626,15 @@ const std::filesystem::path Emulator::GetNewDiscPath(
       dialog->Then(&fence);
     });
 
-    // Wait for the dialog to close
-    fence.Wait();
+    // Wait for the dialog to close. Parks the fiber the way every other xam
+    // dialog does, so the guest CPU stays free while the prompt is up.
+    kernel::GuestScheduler::WaitOnFence(fence);
 
     // Process the result
     if (result == kernel::xam::ui::DiscSwapResult::kSelected) {
       path = selected_path;
       XELOGI("GetNewDiscPath: Selected disc from saved paths: {}",
-             path.string());
+             xe::path_to_utf8(path));
       return path;
     } else if (result == kernel::xam::ui::DiscSwapResult::kBrowse) {
       use_file_picker = true;
@@ -1681,12 +1728,26 @@ bool Emulator::ExceptionCallbackThunk(Exception* ex, void* data) {
   }
 }
 
+// Resumes the faulting thread inside a halt thunk. Diverting rip keeps the
+// fault's rsp, so realign to the rsp%16 == 8 a call leaves, or the thunk's
+// aligned SSE spills fault. The null slot ends a stack walk. AArch64 sp is
+// always aligned.
+static void DivertToHaltThunk(Exception* ex, void (*thunk)()) {
+#if XE_ARCH_AMD64
+  uint64_t& rsp = ex->ModifyIntRegister(
+      uint32_t(X64Register::kRsp) - uint32_t(X64Register::kIntRegisterFirst));
+  rsp = (rsp & ~uint64_t(15)) - 8;
+  *reinterpret_cast<uint64_t*>(rsp) = 0;
+#endif  // XE_ARCH_AMD64
+  ex->set_resume_pc(reinterpret_cast<uint64_t>(thunk));
+}
+
 bool Emulator::ExceptionCallback(Exception* ex) {
   // In-process relaunch/reset frees state under still-running guest threads;
   // their faults are expected, so park them instead of crashing. The teardown
   // thread isn't a guest thread, so its own faults still surface.
   if (relaunching_ && kernel::XThread::IsInThread()) {
-    ex->set_resume_pc(reinterpret_cast<uint64_t>(&HaltDuringRelaunchThunk));
+    DivertToHaltThunk(ex, &HaltDuringRelaunchThunk);
     return true;
   }
 
@@ -1724,13 +1785,51 @@ bool Emulator::ExceptionCallback(Exception* ex) {
           fiber_self->thread_state()
               ? uint32_t(fiber_self->thread_state()->context()->lr)
               : 0;
+      // A #GP from a misaligned aligned-move arrives as an access violation
+      // reporting address -1, so the stack pointer and its alignment are what
+      // separate that from a real fault.
+      uint64_t host_sp = 0;
+      if (auto* host_context = ex->thread_context()) {
+#if XE_ARCH_AMD64
+        host_sp = host_context->rsp;
+#elif XE_ARCH_ARM64
+        host_sp = host_context->sp;
+#endif
+      }
+      const char* code_name = "unknown exception";
+      std::string fault_detail;
+      switch (ex->code()) {
+        case Exception::Code::kAccessViolation: {
+          code_name = "access violation";
+          const char* op = "unknown";
+          switch (ex->access_violation_operation()) {
+            case Exception::AccessViolationOperation::kRead:
+              op = "read";
+              break;
+            case Exception::AccessViolationOperation::kWrite:
+              op = "write";
+              break;
+            default:
+              break;
+          }
+          fault_detail =
+              fmt::format(" ({} at 0x{:016X})", op, ex->fault_address());
+        } break;
+        case Exception::Code::kIllegalInstruction:
+          code_name = "illegal instruction";
+          break;
+        default:
+          break;
+      }
       XELOGE(
           "Host-side crash on fiber thread (handle 0x{:08X}, guest tid "
-          "0x{:08X}) at host PC 0x{:016X} (module+0x{:X}, guest lr 0x{:08X}). "
+          "0x{:08X}): {}{} at host PC 0x{:016X} (module+0x{:X}, guest lr "
+          "0x{:08X}, host sp 0x{:016X}, sp%16={}). "
           "Halting fiber to keep the dispatcher alive.",
-          fiber_self->handle(), fiber_self->thread_id(), ex->pc(),
-          module_offset, guest_lr);
-      ex->set_resume_pc(reinterpret_cast<uint64_t>(&HaltCrashedFiberThunk));
+          fiber_self->handle(), fiber_self->thread_id(), code_name,
+          fault_detail, ex->pc(), module_offset, guest_lr, host_sp,
+          host_sp % 16);
+      DivertToHaltThunk(ex, &HaltCrashedFiberThunk);
       return true;
     }
     return false;
@@ -1812,7 +1911,7 @@ bool Emulator::ExceptionCallback(Exception* ex) {
   // mode suspends self. Fiber mode diverts the resume PC to a halt thunk, since
   // calling Suspend here would yield from inside the exception handler.
   if (current_thread->fiber()) {
-    ex->set_resume_pc(reinterpret_cast<uint64_t>(&HaltCrashedFiberThunk));
+    DivertToHaltThunk(ex, &HaltCrashedFiberThunk);
     return true;
   }
   current_thread->Suspend(nullptr);
@@ -1856,14 +1955,11 @@ std::string Emulator::RemountAndResolveLaunchPath(
   std::ranges::replace(normalized_path, '\\', '/');
 #endif
 
-  // Get the current game:\ symbolic link path
-  std::string symbolic_link_path;
-  if (!kernel_state_->file_system()->FindSymbolicLink(kDefaultGameSymbolicLink,
-                                                      symbolic_link_path)) {
+  if (kernel_state_->title_mount_path_.empty()) {
     return "";
   }
 
-  std::filesystem::path file_path = symbolic_link_path;
+  std::filesystem::path file_path = kernel_state_->title_mount_path_;
 
   // Remove previous symbolic links.
   // Some titles can provide root within specific directory.
@@ -1879,6 +1975,8 @@ std::string Emulator::RemountAndResolveLaunchPath(
       kDefaultPartitionSymbolicLink, xe::path_to_utf8(file_path.parent_path()));
   kernel_state_->file_system()->RegisterSymbolicLink(
       kDefaultGameSymbolicLink, xe::path_to_utf8(file_path.parent_path()));
+  kernel_state_->title_mount_path_ = xe::utf8::canonicalize_guest_path(
+      xe::path_to_utf8(file_path.parent_path()));
 
   return xe::path_to_utf8(file_path);
 }
@@ -1927,19 +2025,38 @@ static std::string format_version(xex2_version version) {
 
 X_STATUS Emulator::CompleteLaunch(const std::filesystem::path& path,
                                   const std::string_view module_path) {
-  // Making changes to the UI (setting the icon) and executing game config
-  // load callbacks which expect to be called from the UI thread.
-  // If not on UI thread, dispatch to it synchronously. Without a display
-  // window there is no UI thread to dispatch to, so run inline.
-  if (display_window_ && !display_window_->app_context().IsInUIThread()) {
-    X_STATUS result = X_STATUS_UNSUCCESSFUL;
+  std::lock_guard<std::mutex> launch_lock(launch_mutex_);
+  // The window icon and on_launch listeners need the UI thread. Under the
+  // libretro core there is no display window, and so no UI thread to dispatch
+  // to - run it inline there.
+  X_STATUS result = X_STATUS_UNSUCCESSFUL;
+  if (display_window_) {
     display_window_->app_context().CallInUIThreadSynchronous(
         [this, &path, &module_path, &result]() {
-          result = CompleteLaunch(path, module_path);
+          result = PrepareLaunch(path, module_path);
         });
+  } else {
+    result = PrepareLaunch(path, module_path);
+  }
+  if (XFAILED(result)) {
     return result;
   }
 
+  // Off the UI thread and after plugins, which patch code in place.
+  auto module = kernel_state_->GetExecutableModule();
+  if (module->xex_module()) {
+    module->xex_module()->PrecompileDiscoveredFunctions();
+    module->xex_module()->PrecompileStaticInitializers();
+  }
+
+  // Drops only the launch suspend, so a debugger break still holds.
+  main_thread_->Resume();
+
+  return X_STATUS_SUCCESS;
+}
+
+X_STATUS Emulator::PrepareLaunch(const std::filesystem::path& path,
+                                 const std::string_view module_path) {
   // Per-title config has been applied by now and no guest code has been
   // translated yet, which is the only window where this can be picked up.
   processor_->RefreshTraceCountsEnabled();
@@ -1959,13 +2076,6 @@ X_STATUS Emulator::CompleteLaunch(const std::filesystem::path& path,
   // Cache/STFC code baked into games tries reading/writing to these
   // By using a NullDevice that just returns success to all IO requests it
   // should allow games to believe cache/raw disk was accessed successfully
-
-  // NOTE: this should probably be moved to xenia_main.cc, but right now we
-  // need to register the \Device\Harddisk0\ NullDevice _after_ the
-  // \Device\Harddisk0\Partition1 HostPathDevice, otherwise requests to
-  // Partition1 will go to this. Registering during CompleteLaunch allows us
-  // to make sure any HostPathDevices are ready beforehand. (see comment above
-  // cache:\ device registration for more info about why)
   auto null_paths = {std::string("\\Partition0"), std::string("\\Cache0"),
                      std::string("\\Cache1")};
   auto null_device =
@@ -2023,8 +2133,10 @@ X_STATUS Emulator::CompleteLaunch(const std::filesystem::path& path,
 
   if (!info) {
     title_id_ = 0;
+    current_disc_number_ = 0;
   } else {
     title_id_ = info->title_id;
+    current_disc_number_ = info->disc_number;
     auto title_version = info->version();
     if (title_version.value != 0) {
       title_version_ = format_version(title_version);
@@ -2184,11 +2296,6 @@ X_STATUS Emulator::CompleteLaunch(const std::filesystem::path& path,
                                        module->hash().value());
     }
   }
-
-  // Resume the main thread now.
-  // If the debugger has requested a suspend this will just decrement the
-  // suspend count without resuming it until the debugger wants.
-  main_thread_->Resume();
 
   return X_STATUS_SUCCESS;
 }

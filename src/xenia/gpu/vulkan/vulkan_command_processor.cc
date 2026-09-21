@@ -38,6 +38,7 @@
 
 DECLARE_bool(clear_memory_page_state);
 DECLARE_bool(gpu_debug_markers);
+DECLARE_bool(memexport_enable);
 DECLARE_bool(submit_on_primary_buffer_end);
 
 DEFINE_bool(
@@ -63,14 +64,19 @@ namespace shaders {
 }  // namespace shaders
 
 constexpr VkDescriptorPoolSize
-    VulkanCommandProcessor::kDescriptorPoolSizeUniformBuffer = {
-        VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+    VulkanCommandProcessor::kDescriptorPoolSizeUniformBufferDynamic = {
+        VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
         SpirvShaderTranslator::kConstantBufferCount*
             kLinkedTypeDescriptorPoolSetCount};
 
 constexpr VkDescriptorPoolSize
     VulkanCommandProcessor::kDescriptorPoolSizeStorageBuffer = {
         VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, kLinkedTypeDescriptorPoolSetCount};
+
+constexpr VkDescriptorPoolSize
+    VulkanCommandProcessor::kDescriptorPoolSizeStorageBufferAndImage[2] = {
+        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, kLinkedTypeDescriptorPoolSetCount},
+        {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, kLinkedTypeDescriptorPoolSetCount}};
 
 // 2x descriptors for texture images because of unsigned and signed bindings.
 constexpr VkDescriptorPoolSize
@@ -92,13 +98,19 @@ VulkanCommandProcessor::VulkanCommandProcessor(
           static_cast<const ui::vulkan::VulkanProvider*>(
               graphics_system->provider())
               ->vulkan_device(),
-          &kDescriptorPoolSizeUniformBuffer, 1,
+          &kDescriptorPoolSizeUniformBufferDynamic, 1,
           kLinkedTypeDescriptorPoolSetCount),
       transient_descriptor_allocator_storage_buffer_(
           static_cast<const ui::vulkan::VulkanProvider*>(
               graphics_system->provider())
               ->vulkan_device(),
           &kDescriptorPoolSizeStorageBuffer, 1,
+          kLinkedTypeDescriptorPoolSetCount),
+      transient_descriptor_allocator_storage_buffer_and_image_(
+          static_cast<const ui::vulkan::VulkanProvider*>(
+              graphics_system->provider())
+              ->vulkan_device(),
+          kDescriptorPoolSizeStorageBufferAndImage, 2,
           kLinkedTypeDescriptorPoolSetCount),
       transient_descriptor_allocator_textures_(
           static_cast<const ui::vulkan::VulkanProvider*>(
@@ -153,6 +165,14 @@ void VulkanCommandProcessor::ClearCaches() {
 
 void VulkanCommandProcessor::InvalidateGpuMemory() {
   shared_memory_->InvalidateAllPages();
+}
+
+void VulkanCommandProcessor::ClearReadbackBuffers() {
+  if (AwaitAllQueueOperationsCompletion()) {
+    ClearReadbackStagingBuffers();
+    // Their staging buffers are gone, so there is nothing left to copy out.
+    memexport_staged_.clear();
+  }
 }
 
 void VulkanCommandProcessor::TracePlaybackWroteMemory(uint32_t base_ptr,
@@ -282,7 +302,8 @@ bool VulkanCommandProcessor::SetupContext() {
     VkDescriptorSetLayoutBinding& constants_binding =
         descriptor_set_layout_bindings_constants[i];
     constants_binding.binding = i;
-    constants_binding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    constants_binding.descriptorType =
+        VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
     constants_binding.descriptorCount = 1;
     constants_binding.pImmutableSamplers = nullptr;
   }
@@ -322,14 +343,16 @@ bool VulkanCommandProcessor::SetupContext() {
         "constant buffers");
     return false;
   }
-  // Transient: storage buffer for compute shaders.
+  // Transient: one storage buffer. Kept identically defined to the render
+  // target cache's storage buffer layout - sets from both are bound into the
+  // same slots, and stage flags are part of layout compatibility.
   VkDescriptorSetLayoutBinding descriptor_set_layout_binding_transient;
   descriptor_set_layout_binding_transient.binding = 0;
   descriptor_set_layout_binding_transient.descriptorType =
       VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
   descriptor_set_layout_binding_transient.descriptorCount = 1;
   descriptor_set_layout_binding_transient.stageFlags =
-      VK_SHADER_STAGE_COMPUTE_BIT;
+      VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT;
   descriptor_set_layout_binding_transient.pImmutableSamplers = nullptr;
   descriptor_set_layout_create_info.bindingCount = 1;
   descriptor_set_layout_create_info.pBindings =
@@ -337,11 +360,41 @@ bool VulkanCommandProcessor::SetupContext() {
   if (dfn.vkCreateDescriptorSetLayout(
           device, &descriptor_set_layout_create_info, nullptr,
           &descriptor_set_layouts_single_transient_[size_t(
-              SingleTransientDescriptorLayout::kStorageBufferCompute)]) !=
+              SingleTransientDescriptorLayout::kStorageBuffer)]) !=
       VK_SUCCESS) {
     XELOGE(
+        "Failed to create a Vulkan descriptor set layout for a storage buffer");
+    return false;
+  }
+  // Transient: the texture load scratch buffer plus the image the compute blit
+  // writes, replacing vkCmdCopyBufferToImage.
+  VkDescriptorSetLayoutBinding
+      descriptor_set_layout_bindings_storage_buffer_and_image[2] = {};
+  descriptor_set_layout_bindings_storage_buffer_and_image[0].binding = 0;
+  descriptor_set_layout_bindings_storage_buffer_and_image[0].descriptorType =
+      VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+  descriptor_set_layout_bindings_storage_buffer_and_image[0].descriptorCount =
+      1;
+  descriptor_set_layout_bindings_storage_buffer_and_image[0].stageFlags =
+      VK_SHADER_STAGE_COMPUTE_BIT;
+  descriptor_set_layout_bindings_storage_buffer_and_image[1].binding = 1;
+  descriptor_set_layout_bindings_storage_buffer_and_image[1].descriptorType =
+      VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+  descriptor_set_layout_bindings_storage_buffer_and_image[1].descriptorCount =
+      1;
+  descriptor_set_layout_bindings_storage_buffer_and_image[1].stageFlags =
+      VK_SHADER_STAGE_COMPUTE_BIT;
+  descriptor_set_layout_create_info.bindingCount = 2;
+  descriptor_set_layout_create_info.pBindings =
+      descriptor_set_layout_bindings_storage_buffer_and_image;
+  if (dfn.vkCreateDescriptorSetLayout(
+          device, &descriptor_set_layout_create_info, nullptr,
+          &descriptor_set_layouts_single_transient_[size_t(
+              SingleTransientDescriptorLayout::
+                  kStorageBufferAndStorageImage)]) != VK_SUCCESS) {
+    XELOGE(
         "Failed to create a Vulkan descriptor set layout for a storage buffer "
-        "bound to the compute shader");
+        "and a storage image");
     return false;
   }
 
@@ -1421,6 +1474,7 @@ void VulkanCommandProcessor::ShutdownContext() {
 
   // Resolve downscale cleanup.
   ClearResolveHoldSnapshots();
+  ClearReadbackStagingBuffers();
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device,
                                          resolve_downscale_buffer_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device,
@@ -1467,6 +1521,7 @@ void VulkanCommandProcessor::ShutdownContext() {
   // null (routing disabled) until the pool is recreated.
   shared_memory_host_and_edram_descriptor_set_ = VK_NULL_HANDLE;
   ResetMemexportPages();
+  memexport_staged_.clear();
   zpd_fsi_counter_descriptor_buffer_ = VK_NULL_HANDLE;
   zpd_fsi_counter_descriptor_range_ = 0;
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device,
@@ -1723,6 +1778,123 @@ void VulkanCommandProcessor::PrepareResolveHoldSnapshotEviction() {
   AwaitAllQueueOperationsCompletion();
 }
 
+bool VulkanCommandProcessor::CreateReadbackStagingBuffer(
+    ReadbackStagingBuffer& buffer, uint32_t size) {
+  const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+
+  if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
+          vulkan_device, size, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+          ui::vulkan::util::MemoryPurpose::kReadback, buffer.buffer,
+          buffer.memory, &buffer.memory_type, &buffer.memory_size)) {
+    XELOGE("Failed to create a {} KB readback staging buffer", size >> 10);
+    return false;
+  }
+  if (dfn.vkMapMemory(device, buffer.memory, 0, VK_WHOLE_SIZE, 0,
+                      &buffer.mapped) != VK_SUCCESS) {
+    buffer.mapped = nullptr;
+    ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device,
+                                           buffer.memory);
+    ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device,
+                                           buffer.buffer);
+    return false;
+  }
+  return true;
+}
+
+void VulkanCommandProcessor::DestroyReadbackStagingBuffer(
+    ReadbackStagingBuffer& buffer) {
+  const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  if (buffer.mapped != nullptr) {
+    dfn.vkUnmapMemory(device, buffer.memory);
+    buffer.mapped = nullptr;
+  }
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device,
+                                         buffer.buffer);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device,
+                                         buffer.memory);
+}
+
+// The copy into a staging buffer is recorded, so it has to drain first.
+void VulkanCommandProcessor::PrepareReadbackStagingEviction() {
+  AwaitAllQueueOperationsCompletion();
+}
+
+// Records a copy into this range's staging buffer, for the caller to copy out
+// with FinishReadbackStagingToGuestRam.
+VulkanCommandProcessor::ReadbackStagingSlot*
+VulkanCommandProcessor::StageReadbackFromBuffer(VkBuffer source_buffer,
+                                                VkDeviceSize source_offset,
+                                                uint32_t address,
+                                                uint32_t length) {
+  ReadbackStagingSlot* slot = AcquireReadbackStagingSlot(
+      MakeReadbackResolveKey(address, length), length);
+  if (slot == nullptr) {
+    return nullptr;
+  }
+  VkBuffer staging_buffer = ReadbackStagingWriteBuffer(*slot).buffer;
+  PushBufferMemoryBarrier(
+      source_buffer, source_offset, VkDeviceSize(length),
+      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | guest_shader_pipeline_stages_ |
+          VK_PIPELINE_STAGE_TRANSFER_BIT,
+      VK_PIPELINE_STAGE_TRANSFER_BIT,
+      VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+      VK_ACCESS_TRANSFER_READ_BIT);
+  OrderReadbackStagingWrite(staging_buffer);
+  SubmitBarriers(true);
+  InsertDebugMarker("Readback (staging): 0x%08X, %u bytes", address, length);
+  VkBufferCopy copy_region = {};
+  copy_region.srcOffset = source_offset;
+  copy_region.dstOffset = 0;
+  copy_region.size = length;
+  deferred_command_buffer_.CmdVkCopyBuffer(source_buffer, staging_buffer, 1,
+                                           &copy_region);
+  return slot;
+}
+
+// Orders a copy into a staging buffer against the previous one into the same
+// buffer, which may still be in flight from when the slot last came around.
+void VulkanCommandProcessor::OrderReadbackStagingWrite(
+    VkBuffer staging_buffer) {
+  PushBufferMemoryBarrier(
+      staging_buffer, 0, VK_WHOLE_SIZE, VK_PIPELINE_STAGE_TRANSFER_BIT,
+      VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+      VK_ACCESS_TRANSFER_WRITE_BIT, VK_QUEUE_FAMILY_IGNORED,
+      VK_QUEUE_FAMILY_IGNORED, false);
+}
+
+// Waits for one submission, or for everything including what is still being
+// recorded. The fence wait is what makes a copy visible to the host.
+bool VulkanCommandProcessor::AwaitReadbackStagingSubmission(
+    uint64_t submission) {
+  if (submission == UINT64_MAX) {
+    if (!AwaitAllQueueOperationsCompletion()) {
+      XELOGE(
+          "VulkanCommandProcessor: Failed to complete queue operations for "
+          "staging readback");
+      return false;
+    }
+    return true;
+  }
+  CheckSubmissionCompletionAndDeviceLoss(submission);
+  return GetCompletedSubmission() >= submission;
+}
+
+// Makes a completed GPU write to a staging buffer visible to the CPU read that
+// follows. A no-op on a coherent memory type.
+void VulkanCommandProcessor::InvalidateReadbackStaging(
+    const ReadbackStagingBuffer& buffer) {
+  if (buffer.memory == VK_NULL_HANDLE) {
+    return;
+  }
+  ui::vulkan::util::InvalidateMappedMemoryRange(
+      GetVulkanDevice(), buffer.memory, buffer.memory_type, 0,
+      buffer.memory_size);
+}
+
 void VulkanCommandProcessor::FlushResolveRangeToGuestRam(uint32_t address,
                                                          uint32_t length,
                                                          bool from_snapshot) {
@@ -1735,8 +1907,7 @@ void VulkanCommandProcessor::FlushResolveRangeToGuestRam(uint32_t address,
   // itself in zero-copy mode, since it already aliases guest RAM.
   VkBuffer host_buffer =
       zero_copy ? shared_memory_->buffer() : shared_memory_->host_buffer();
-  if (host_buffer == VK_NULL_HANDLE || !length ||
-      !IsResolveDestinationResident(address, length)) {
+  if (!length || !IsResolveDestinationResident(address, length)) {
     return;
   }
   VkBuffer source_buffer;
@@ -1760,6 +1931,17 @@ void VulkanCommandProcessor::FlushResolveRangeToGuestRam(uint32_t address,
   }
   if (!from_snapshot) {
     shared_memory_->Use(VulkanSharedMemory::Usage::kRead);
+  }
+  if (host_buffer == VK_NULL_HANDLE) {
+    // No guest RAM host buffer, so the release goes out through staging. The
+    // guest is blocked on the coherency poll that got us here, so it takes the
+    // copy just recorded rather than the previous one.
+    ReadbackStagingSlot* slot =
+        StageReadbackFromBuffer(source_buffer, source_offset, address, length);
+    if (slot != nullptr) {
+      FinishReadbackStagingToGuestRam(*slot, address, length, false);
+    }
+    return;
   }
   PushBufferMemoryBarrier(
       host_buffer, VkDeviceSize(address), VkDeviceSize(length),
@@ -2824,6 +3006,21 @@ void VulkanCommandProcessor::EndRenderPass() {
   in_render_pass_ = false;
 }
 
+void VulkanCommandProcessor::DestroyScratchImageWhenIdle(
+    VkImage image, VkImageView image_view, VkDeviceMemory memory) {
+  // GetCurrentSubmission() only grows, so the deques stay sorted by it.
+  uint64_t submission_current = GetCurrentSubmission();
+  if (image_view != VK_NULL_HANDLE) {
+    destroy_image_views_.emplace_back(submission_current, image_view);
+  }
+  if (image != VK_NULL_HANDLE) {
+    destroy_images_.emplace_back(submission_current, image);
+  }
+  if (memory != VK_NULL_HANDLE) {
+    destroy_memory_.emplace_back(submission_current, memory);
+  }
+}
+
 VkDescriptorSet VulkanCommandProcessor::AllocateSingleTransientDescriptor(
     SingleTransientDescriptorLayout transient_descriptor_layout) {
   assert_true(frame_open_);
@@ -2837,21 +3034,36 @@ VkDescriptorSet VulkanCommandProcessor::AllocateSingleTransientDescriptor(
     const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
     const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
     const VkDevice device = vulkan_device->device();
-    bool is_storage_buffer =
-        transient_descriptor_layout ==
-        SingleTransientDescriptorLayout::kStorageBufferCompute;
-    ui::vulkan::LinkedTypeDescriptorSetAllocator&
+    ui::vulkan::LinkedTypeDescriptorSetAllocator*
+        transient_descriptor_allocator;
+    VkDescriptorPoolSize descriptor_counts[2];
+    uint32_t descriptor_count_count = 1;
+    switch (transient_descriptor_layout) {
+      case SingleTransientDescriptorLayout::kStorageBuffer:
         transient_descriptor_allocator =
-            is_storage_buffer ? transient_descriptor_allocator_storage_buffer_
-                              : transient_descriptor_allocator_uniform_buffer_;
-    VkDescriptorPoolSize descriptor_count;
-    descriptor_count.type = is_storage_buffer
-                                ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER
-                                : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    descriptor_count.descriptorCount = 1;
-    descriptor_set = transient_descriptor_allocator.Allocate(
+            &transient_descriptor_allocator_storage_buffer_;
+        descriptor_counts[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        descriptor_counts[0].descriptorCount = 1;
+        break;
+      case SingleTransientDescriptorLayout::kStorageBufferAndStorageImage:
+        transient_descriptor_allocator =
+            &transient_descriptor_allocator_storage_buffer_and_image_;
+        descriptor_counts[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        descriptor_counts[0].descriptorCount = 1;
+        descriptor_counts[1].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        descriptor_counts[1].descriptorCount = 1;
+        descriptor_count_count = 2;
+        break;
+      default:
+        transient_descriptor_allocator =
+            &transient_descriptor_allocator_uniform_buffer_;
+        descriptor_counts[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        descriptor_counts[0].descriptorCount = 1;
+        break;
+    }
+    descriptor_set = transient_descriptor_allocator->Allocate(
         GetSingleTransientDescriptorLayout(transient_descriptor_layout),
-        &descriptor_count, 1);
+        descriptor_counts, descriptor_count_count);
     if (descriptor_set == VK_NULL_HANDLE) {
       return VK_NULL_HANDLE;
     }
@@ -3083,8 +3295,8 @@ VulkanCommandProcessor::AcquireScratchGpuBuffer(
   scratch_buffer_ = new_scratch_buffer;
   scratch_buffer_size_ = size;
   // Not used yet, no need for a barrier.
-  scratch_buffer_last_stage_mask_ = initial_access_mask;
-  scratch_buffer_last_access_mask_ = initial_stage_mask;
+  scratch_buffer_last_stage_mask_ = initial_stage_mask;
+  scratch_buffer_last_access_mask_ = initial_access_mask;
   scratch_buffer_last_usage_submission_ = submission_current;
   scratch_buffer_used_ = true;
   return ScratchBufferAcquisition(*this, new_scratch_buffer, initial_stage_mask,
@@ -3264,7 +3476,6 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
   VulkanShader::VulkanTranslation* vertex_shader_translation;
   VulkanShader::VulkanTranslation* pixel_shader_translation;
   bool use_interpreter = false;
-  bool drop_until_ready = false;
   uint32_t normalized_color_mask;
   reg::RB_DEPTHCONTROL normalized_depth_control;
   draw_util::HostDepthPolygonOffset host_depth_polygon_offset;
@@ -3375,6 +3586,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
     // placeholder either). These are the draws async_shader_skip_draws governs.
     // Interpreter-eligible draws and draws whose VS is already translated
     // always have a placeholder and never translate on the draw thread.
+    // Only decides whether to translate here. Whether the draw can render is
+    // read off the pipeline itself, which may have gained a placeholder since.
     bool no_placeholder = async_available && !use_interpreter &&
                           !vertex_shader_translation->is_translated();
     // The draw thread translates only for a no-placeholder draw that isn't
@@ -3387,7 +3600,6 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
         return false;
       }
     }
-    drop_until_ready = no_placeholder && cvars::async_shader_skip_draws;
 
     // Obtain the samplers. Note that the bindings don't depend on the shader
     // modification, so if on the second iteration of this loop it becomes
@@ -3492,25 +3704,13 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
     return false;
   }
 
-  if (drop_until_ready) {
-    // Non-interpretable draw whose shaders weren't translated yet - it has been
-    // queued for background creation; skip drawing it until the real pipeline
-    // is ready (a later frame renders it). Never translate/compile on the draw
-    // thread for these.
-    XELOGI(
-        "Draw skipped (no interpreter placeholder, real pipeline not ready): "
-        "VS {:016X}, PS {:016X}",
-        vertex_shader->ucode_data_hash(),
-        pixel_shader ? pixel_shader->ucode_data_hash() : 0);
-    return true;
-  }
   // If async mode is active, this may be a placeholder pipeline. The real
   // pipeline will be swapped in by the creation thread when ready.
   VkPipeline current_pipeline =
       pipeline->pipeline.load(std::memory_order_acquire);
   if (current_pipeline == VK_NULL_HANDLE) {
-    // Real pipeline not created yet and no placeholder - skip this draw rather
-    // than stalling the draw thread waiting for the background.
+    // Nothing to draw with yet - no placeholder, real pipeline still building.
+    // Skip rather than stall, a later frame renders it.
     XELOGI("Draw skipped (pipeline not ready yet): VS {:016X}, PS {:016X}",
            vertex_shader->ucode_data_hash(),
            pixel_shader ? pixel_shader->ucode_data_hash() : 0);
@@ -3529,7 +3729,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
 
   // Push debug marker with Xbox 360 draw context for RenderDoc annotation.
   // Done early so texture loads appear nested under the draw that uses them.
-  if (debug_markers_enabled_) {
+  if (debug_markers_enabled_ || cvars::log_draws) {
     char label[draw_util::kDebugMarkerLabelMaxLength];
     draw_util::FormatDrawDebugMarker(
         label, sizeof(label), prim_type, primitive_processing_result,
@@ -3646,7 +3846,13 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
       host_render_targets_used, pixel_shader && pixel_shader->writes_depth());
   gviargs.SetupRegisterValues(regs);
 
-  draw_util::GetHostViewportInfo(&gviargs, viewport_info);
+  if (gviargs == previous_viewport_info_args_) {
+    viewport_info = previous_viewport_info_;
+  } else {
+    draw_util::GetHostViewportInfo(&gviargs, viewport_info);
+    previous_viewport_info_args_ = gviargs;
+    previous_viewport_info_ = viewport_info;
+  }
   // Update dynamic graphics pipeline state.
   UpdateDynamicState(viewport_info, primitive_polygonal,
                      normalized_depth_control, draw_resolution_scale_x,
@@ -3712,9 +3918,12 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
   // host-imported buffer (aliasing guest RAM) so memexport output stays CPU
   // coherent (fixing the page false-sharing clobber) and consumers read it
   // directly. Only texture-sampled ranges are copied into the device buffer
-  // (EnsureMemexportRangeInDeviceBuffer). Inert without the host buffer.
+  // (EnsureMemexportRangeInDeviceBuffer). Off without the host buffer, where
+  // the staging readback carries the output instead, and when memexport_enable
+  // asks for device-local output.
   bool route_to_host = false;
-  if (shared_memory_host_and_edram_descriptor_set_ != VK_NULL_HANDLE) {
+  if (cvars::memexport_enable &&
+      shared_memory_host_and_edram_descriptor_set_ != VK_NULL_HANDLE) {
     route_to_host =
         memexport_used_vertex || memexport_used_pixel ||
         (any_memexport_pages_written_ &&
@@ -3942,18 +4151,109 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
                                       !route_to_host);
   }
 
-  if (route_to_host && !memexport_ranges_.empty()) {
-    // Producer draw: output landed in host_buffer_ (guest RAM), already CPU
-    // coherent, so no readback. Just record the written pages. Consumers then
-    // route to host_buffer_ (geometry) or copy their own range into the device
-    // buffer on demand (texture loads).
-    for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
-      MarkMemexportPagesWritten(memexport_range.base_address_dwords << 2,
-                                memexport_range.size_bytes);
+  if (!memexport_ranges_.empty()) {
+    if (route_to_host) {
+      // Producer draw: output landed in host_buffer_ (guest RAM), already CPU
+      // coherent, so no readback. Just record the written pages. Consumers then
+      // route to host_buffer_ (geometry) or copy their own range into the
+      // device buffer on demand (texture loads).
+      for (const draw_util::MemExportRange& memexport_range :
+           memexport_ranges_) {
+        MarkMemexportPagesWritten(memexport_range.base_address_dwords << 2,
+                                  memexport_range.size_bytes);
+      }
+    } else if (cvars::memexport_enable && !shared_memory_->is_zero_copy()) {
+      // No host buffer to route to, and buffer_ is device-local, so the CPU
+      // only sees the output if it is read back. Under zero-copy buffer_ is
+      // guest RAM already, and a readback there would clobber it.
+      StageMemexportReadback();
     }
   }
 
   return true;
+}
+
+// Records copies of this draw's export output into staging buffers. The copy
+// out waits, so it is deferred to FlushMemexportStagingReadback, where one wait
+// covers every producer since the last one.
+void VulkanCommandProcessor::StageMemexportReadback() {
+  if (memexport_ranges_.empty()) {
+    return;
+  }
+  shared_memory_->Use(VulkanSharedMemory::Usage::kRead);
+  SubmitBarriers(true);
+  VkBuffer device_buffer = shared_memory_->buffer();
+  for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
+    uint32_t base_bytes = memexport_range.base_address_dwords << 2;
+    if (base_bytes >= SharedMemory::kBufferSize) {
+      continue;
+    }
+    uint32_t size_bytes = std::min(memexport_range.size_bytes,
+                                   SharedMemory::kBufferSize - base_bytes);
+    // The declared capacity can run past what the guest committed, and the
+    // copy out would write guest memory that isn't there.
+    size_bytes = WritableGuestRangeLength(base_bytes, size_bytes);
+    if (!size_bytes) {
+      continue;
+    }
+    uint64_t key = MakeReadbackResolveKey(base_bytes, size_bytes) |
+                   kReadbackStagingMemexportTag;
+    ReadbackStagingSlot* slot = AcquireReadbackStagingSlot(key, size_bytes);
+    if (slot == nullptr) {
+      continue;
+    }
+    VkBuffer staging_buffer = ReadbackStagingWriteBuffer(*slot).buffer;
+    OrderReadbackStagingWrite(staging_buffer);
+    SubmitBarriers(true);
+    InsertDebugMarker("Memexport Readback (staging): 0x%08X, %u bytes",
+                      base_bytes, size_bytes);
+    VkBufferCopy copy_region = {};
+    copy_region.srcOffset = base_bytes;
+    copy_region.dstOffset = 0;
+    copy_region.size = size_bytes;
+    deferred_command_buffer_.CmdVkCopyBuffer(device_buffer, staging_buffer, 1,
+                                             &copy_region);
+    // Its buffer now holds the newer output, so keep one entry, at the back -
+    // copy out order is what decides overlapping ranges.
+    std::erase_if(memexport_staged_, [key](const MemexportStagedRange& staged) {
+      return staged.key == key;
+    });
+    memexport_staged_.push_back({key, base_bytes, size_bytes});
+    // The fence and coherency waits are driven by the page marks.
+    MarkMemexportPagesWritten(base_bytes, size_bytes);
+  }
+}
+
+void VulkanCommandProcessor::FlushMemexportStagingReadback() {
+  if (memexport_staged_.empty()) {
+    return;
+  }
+  // Staged output is about to reach guest RAM, so no fence need await it.
+  memexport_await_pending_ = false;
+  if (!AwaitAllQueueOperationsCompletion()) {
+    XELOGE(
+        "VulkanCommandProcessor: Failed to complete queue operations for "
+        "memexport staging readback");
+    memexport_staged_.clear();
+    return;
+  }
+  for (const MemexportStagedRange& staged : memexport_staged_) {
+    ReadbackStagingSlot* slot = FindReadbackStagingSlot(staged.key);
+    if (slot == nullptr) {
+      continue;
+    }
+    // The guest may have decommitted the range since the draw that staged it.
+    uint32_t length = WritableGuestRangeLength(staged.address, staged.length);
+    if (!length) {
+      continue;
+    }
+    // Export staging never rotates the slot, and its tagged key keeps a resolve
+    // from rotating it either.
+    const ReadbackStagingBuffer& staging = ReadbackStagingWriteBuffer(*slot);
+    InvalidateReadbackStaging(staging);
+    ReadbackStagingToGuestRam(staging, staged.address, length);
+  }
+  memexport_staged_.clear();
 }
 
 bool VulkanCommandProcessor::EnsureMemexportRangeInDeviceBuffer(
@@ -3962,7 +4262,8 @@ bool VulkanCommandProcessor::EnsureMemexportRangeInDeviceBuffer(
   // host_buffer_ (guest RAM), where it actually lives. Doing it on the GPU
   // keeps it ordered against the writes that produced it, which a CPU read
   // cannot be.
-  if (shared_memory_host_and_edram_descriptor_set_ == VK_NULL_HANDLE ||
+  if (!cvars::memexport_enable ||
+      shared_memory_host_and_edram_descriptor_set_ == VK_NULL_HANDLE ||
       !size_bytes || base_bytes >= SharedMemory::kBufferSize) {
     return false;
   }
@@ -4060,8 +4361,11 @@ bool VulkanCommandProcessor::IssueCopy() {
   // itself in zero-copy mode, since it already aliases guest RAM.
   VkBuffer resolve_host_buffer =
       zero_copy ? shared_memory_->buffer() : shared_memory_->host_buffer();
+  // Without it the output goes through a staging buffer. Which resolves are
+  // copied is decided the same way either path, but a copy that would have been
+  // asynchronous takes the previous one rather than waiting for this one.
+  const bool staging_fallback = resolve_host_buffer == VK_NULL_HANDLE;
   if (readback_mode != ReadbackResolveMode::kDisabled && written_length > 0 &&
-      resolve_host_buffer != VK_NULL_HANDLE &&
       IsResolveDestinationResident(written_address, written_length)) {
     bool stall_after_copy;
     ResolveHostCopyAction copy_action = DecideResolveHostCopy(
@@ -4078,6 +4382,10 @@ bool VulkanCommandProcessor::IssueCopy() {
       // A snapshot hold never stalls, nothing is reaching guest RAM yet.
       stall_after_copy = false;
     }
+    // A copy that would not have stalled takes the previous one instead of
+    // waiting for this one. A coherency release always stalls, so it is never
+    // handed data a frame old.
+    const bool staging_deferred = !stall_after_copy;
 
     // is_scaled reflects this resolve, not the global scale. A native resolve
     // under a scale threshold, and the fallback when the scaled buffer is
@@ -4089,10 +4397,23 @@ bool VulkanCommandProcessor::IssueCopy() {
         PopDebugMarker();
         return true;
       }
-      // Non-scaled: copy the resolved range straight from the device buffer
-      // into host_buffer_ (guest RAM).
       VkBuffer resolve_device_buffer = shared_memory_->buffer();
       shared_memory_->Use(VulkanSharedMemory::Usage::kRead);
+      if (staging_fallback) {
+        ReadbackStagingSlot* slot =
+            StageReadbackFromBuffer(resolve_device_buffer, written_address,
+                                    written_address, written_length);
+        // Closing the marker scope first - the copy out may wait for the GPU,
+        // and a label left open would be ended in the next submission.
+        PopDebugMarker();
+        if (slot != nullptr) {
+          FinishReadbackStagingToGuestRam(*slot, written_address,
+                                          written_length, staging_deferred);
+        }
+        return true;
+      }
+      // Non-scaled: copy the resolved range straight from the device buffer
+      // into host_buffer_ (guest RAM).
       // Order prior memexport and resolve writes to host_buffer_ before this
       // copy.
       PushBufferMemoryBarrier(
@@ -4181,9 +4502,11 @@ bool VulkanCommandProcessor::IssueCopy() {
     uint64_t source_offset = scaled_start - buffer_base;
 
     // The downscale writes 1x data straight into guest RAM at the resolved
-    // range, or into a hold snapshot for a held resolve.
+    // range, into a hold snapshot for a held resolve, or into a staging buffer
+    // to be copied out on the CPU where guest RAM isn't mapped for the GPU.
     VkBuffer dest_buffer = resolve_host_buffer;
     VkDeviceSize dest_offset = written_address;
+    ReadbackStagingSlot* dest_staging = nullptr;
     if (to_hold_snapshot) {
       ResolveHoldSnapshotBuffer* snapshot =
           AcquireResolveHoldSnapshot(written_address, readback_length);
@@ -4194,6 +4517,18 @@ bool VulkanCommandProcessor::IssueCopy() {
         return true;
       }
       dest_buffer = snapshot->buffer;
+      dest_offset = 0;
+    } else if (staging_fallback) {
+      dest_staging = AcquireReadbackStagingSlot(
+          MakeReadbackResolveKey(written_address, readback_length),
+          readback_length);
+      if (dest_staging == nullptr) {
+        if (debug_markers_enabled_) {
+          PopDebugMarker();
+        }
+        return true;
+      }
+      dest_buffer = ReadbackStagingWriteBuffer(*dest_staging).buffer;
       dest_offset = 0;
     }
 
@@ -4460,6 +4795,18 @@ bool VulkanCommandProcessor::IssueCopy() {
       }
       return true;
     }
+    if (dest_staging != nullptr) {
+      // Closing both marker scopes first - the copy out may wait for the GPU,
+      // and a label left open would be ended in the next submission.
+      PopDebugMarker();
+      if (debug_markers_enabled_) {
+        PopDebugMarker();
+      }
+      FinishReadbackStagingToGuestRam(*dest_staging, written_address,
+                                      readback_length, staging_deferred);
+      return true;
+    }
+
     // Make the copy visible to within-frame consumers reading host_buffer_
     // (route_to_host draws sampling guest RAM as index, vertex or texture, and
     // EnsureMemexportRangeInDeviceBuffer copying out of it).
@@ -4936,6 +5283,18 @@ void VulkanCommandProcessor::InitializeTrace() {
   if (shared_memory_submitted) {
     shared_memory_->InitializeTraceCompleteDownloads();
   }
+}
+
+bool VulkanCommandProcessor::DumpEdramSnapshotToFile(
+    const std::filesystem::path& path) {
+  if (!BeginSubmission(true)) {
+    return false;
+  }
+  if (!render_target_cache_->InitializeTraceSubmitDownloads()) {
+    return false;
+  }
+  AwaitAllQueueOperationsCompletion();
+  return render_target_cache_->WriteEdramSnapshotToFile(path);
 }
 
 void VulkanCommandProcessor::LogRecentSubmissions(const char* context) {
@@ -5571,6 +5930,10 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
     // Submission already closed now, so minus 1.
     closed_frame_submissions_[(frame_current_++) % kMaxFramesInFlight] =
         GetCurrentSubmission() - 1;
+    // Backstop for export output no fence or coherency request has asked for,
+    // so it can't sit staged indefinitely.
+    FlushMemexportStagingReadback();
+    EvictOldReadbackStaging();
 
     if (cache_clear_requested_ && AwaitAllQueueOperationsCompletion()) {
       cache_clear_requested_ = false;
@@ -5616,6 +5979,7 @@ void VulkanCommandProcessor::ClearTransientDescriptorPools() {
   }
   single_transient_descriptors_used_.clear();
   transient_descriptor_allocator_storage_buffer_.Reset();
+  transient_descriptor_allocator_storage_buffer_and_image_.Reset();
   transient_descriptor_allocator_uniform_buffer_.Reset();
 }
 
@@ -6370,34 +6734,52 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
   constexpr uint32_t kAllConstantBuffersMask =
       (UINT32_C(1) << SpirvShaderTranslator::kConstantBufferCount) - 1;
   assert_zero(current_constant_buffers_up_to_date_ & ~kAllConstantBuffersMask);
+  // The bindings are dynamic, so a new suballocation only changes the offsets
+  // passed when binding the set. The set itself has to be rewritten only when a
+  // pool page or a size changes.
+  bool constant_buffer_offsets_changed = false;
   if ((current_constant_buffers_up_to_date_ & kAllConstantBuffersMask) !=
       kAllConstantBuffersMask) {
-    current_graphics_descriptor_set_values_up_to_date_ &=
-        ~(UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetConstants);
+    constant_buffer_offsets_changed = true;
     size_t uniform_buffer_alignment =
         size_t(vulkan_device->properties().minUniformBufferOffsetAlignment);
+    auto request_constant_buffer = [&](uint32_t index,
+                                       size_t size) -> uint8_t* {
+      VkBuffer buffer = VK_NULL_HANDLE;
+      VkDeviceSize offset = 0;
+      uint8_t* mapping = uniform_buffer_pool_->Request(
+          frame_current_, size, uniform_buffer_alignment, buffer, offset);
+      if (!mapping) {
+        return nullptr;
+      }
+      VkDescriptorBufferInfo& buffer_info =
+          current_constant_buffer_infos_[index];
+      if (buffer_info.buffer != buffer ||
+          buffer_info.range != VkDeviceSize(size)) {
+        buffer_info.buffer = buffer;
+        buffer_info.range = VkDeviceSize(size);
+        current_graphics_descriptor_set_values_up_to_date_ &=
+            ~(UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetConstants);
+      }
+      current_constant_buffer_dynamic_offsets_[index] = uint32_t(offset);
+      current_constant_buffers_up_to_date_ |= UINT32_C(1) << index;
+      return mapping;
+    };
     // System constants.
     if (!(current_constant_buffers_up_to_date_ &
           (UINT32_C(1) << SpirvShaderTranslator::kConstantBufferSystem))) {
-      VkDescriptorBufferInfo& buffer_info = current_constant_buffer_infos_
-          [SpirvShaderTranslator::kConstantBufferSystem];
-      uint8_t* mapping = uniform_buffer_pool_->Request(
-          frame_current_, sizeof(SpirvShaderTranslator::SystemConstants),
-          uniform_buffer_alignment, buffer_info.buffer, buffer_info.offset);
+      uint8_t* mapping = request_constant_buffer(
+          SpirvShaderTranslator::kConstantBufferSystem,
+          sizeof(SpirvShaderTranslator::SystemConstants));
       if (!mapping) {
         return false;
       }
-      buffer_info.range = sizeof(SpirvShaderTranslator::SystemConstants);
       std::memcpy(mapping, &system_constants_,
                   sizeof(SpirvShaderTranslator::SystemConstants));
-      current_constant_buffers_up_to_date_ |=
-          UINT32_C(1) << SpirvShaderTranslator::kConstantBufferSystem;
     }
     // Vertex shader float constants.
     if (!(current_constant_buffers_up_to_date_ &
           (UINT32_C(1) << SpirvShaderTranslator::kConstantBufferFloatVertex))) {
-      VkDescriptorBufferInfo& buffer_info = current_constant_buffer_infos_
-          [SpirvShaderTranslator::kConstantBufferFloatVertex];
       // Even if the shader doesn't need any float constants, a valid binding
       // must still be provided (the pipeline layout always has float constants,
       // for both the vertex shader and the pixel shader), so if the first draw
@@ -6410,13 +6792,12 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
               ? sizeof(float) * 4 * 256
               : sizeof(float) * 4 *
                     std::max(float_constant_count_vertex, UINT32_C(1));
-      uint8_t* mapping = uniform_buffer_pool_->Request(
-          frame_current_, float_constants_size, uniform_buffer_alignment,
-          buffer_info.buffer, buffer_info.offset);
+      uint8_t* mapping = request_constant_buffer(
+          SpirvShaderTranslator::kConstantBufferFloatVertex,
+          float_constants_size);
       if (!mapping) {
         return false;
       }
-      buffer_info.range = VkDeviceSize(float_constants_size);
       if (interpreter_placeholder) {
         std::memcpy(mapping, &regs[XE_GPU_REG_SHADER_CONSTANT_000_X],
                     sizeof(float) * 4 * 256);
@@ -6436,23 +6817,18 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
           }
         }
       }
-      current_constant_buffers_up_to_date_ |=
-          UINT32_C(1) << SpirvShaderTranslator::kConstantBufferFloatVertex;
     }
     // Pixel shader float constants.
     if (!(current_constant_buffers_up_to_date_ &
           (UINT32_C(1) << SpirvShaderTranslator::kConstantBufferFloatPixel))) {
-      VkDescriptorBufferInfo& buffer_info = current_constant_buffer_infos_
-          [SpirvShaderTranslator::kConstantBufferFloatPixel];
       size_t float_constants_size =
           sizeof(float) * 4 * std::max(float_constant_count_pixel, UINT32_C(1));
-      uint8_t* mapping = uniform_buffer_pool_->Request(
-          frame_current_, float_constants_size, uniform_buffer_alignment,
-          buffer_info.buffer, buffer_info.offset);
+      uint8_t* mapping = request_constant_buffer(
+          SpirvShaderTranslator::kConstantBufferFloatPixel,
+          float_constants_size);
       if (!mapping) {
         return false;
       }
-      buffer_info.range = VkDeviceSize(float_constants_size);
       for (uint32_t i = 0; i < 4; ++i) {
         uint64_t float_constant_map_entry =
             current_float_constant_map_pixel_[i];
@@ -6467,44 +6843,31 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
           mapping += sizeof(float) * 4;
         }
       }
-      current_constant_buffers_up_to_date_ |=
-          UINT32_C(1) << SpirvShaderTranslator::kConstantBufferFloatPixel;
     }
     // Bool and loop constants.
     if (!(current_constant_buffers_up_to_date_ &
           (UINT32_C(1) << SpirvShaderTranslator::kConstantBufferBoolLoop))) {
-      VkDescriptorBufferInfo& buffer_info = current_constant_buffer_infos_
-          [SpirvShaderTranslator::kConstantBufferBoolLoop];
       constexpr size_t kBoolLoopConstantsSize = sizeof(uint32_t) * (8 + 32);
-      uint8_t* mapping = uniform_buffer_pool_->Request(
-          frame_current_, kBoolLoopConstantsSize, uniform_buffer_alignment,
-          buffer_info.buffer, buffer_info.offset);
+      uint8_t* mapping = request_constant_buffer(
+          SpirvShaderTranslator::kConstantBufferBoolLoop,
+          kBoolLoopConstantsSize);
       if (!mapping) {
         return false;
       }
-      buffer_info.range = VkDeviceSize(kBoolLoopConstantsSize);
       std::memcpy(mapping, &regs[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031],
                   kBoolLoopConstantsSize);
-      current_constant_buffers_up_to_date_ |=
-          UINT32_C(1) << SpirvShaderTranslator::kConstantBufferBoolLoop;
     }
     // Fetch constants.
     if (!(current_constant_buffers_up_to_date_ &
           (UINT32_C(1) << SpirvShaderTranslator::kConstantBufferFetch))) {
-      VkDescriptorBufferInfo& buffer_info = current_constant_buffer_infos_
-          [SpirvShaderTranslator::kConstantBufferFetch];
       constexpr size_t kFetchConstantsSize = sizeof(uint32_t) * 6 * 32;
-      uint8_t* mapping = uniform_buffer_pool_->Request(
-          frame_current_, kFetchConstantsSize, uniform_buffer_alignment,
-          buffer_info.buffer, buffer_info.offset);
+      uint8_t* mapping = request_constant_buffer(
+          SpirvShaderTranslator::kConstantBufferFetch, kFetchConstantsSize);
       if (!mapping) {
         return false;
       }
-      buffer_info.range = VkDeviceSize(kFetchConstantsSize);
       std::memcpy(mapping, &regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0],
                   kFetchConstantsSize);
-      current_constant_buffers_up_to_date_ |=
-          UINT32_C(1) << SpirvShaderTranslator::kConstantBufferFetch;
     }
   }
 
@@ -6671,7 +7034,8 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
       constants_transient_descriptors_free_.pop_back();
     } else {
       VkDescriptorPoolSize constants_descriptor_count;
-      constants_descriptor_count.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+      constants_descriptor_count.type =
+          VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
       constants_descriptor_count.descriptorCount =
           SpirvShaderTranslator::kConstantBufferCount;
       constants_descriptor_set =
@@ -6694,7 +7058,8 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
       write_constants.dstBinding = i;
       write_constants.dstArrayElement = 0;
       write_constants.descriptorCount = 1;
-      write_constants.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+      write_constants.descriptorType =
+          VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
       write_constants.pImageInfo = nullptr;
       write_constants.pBufferInfo = &current_constant_buffer_infos_[i];
       write_constants.pTexelBufferView = nullptr;
@@ -6763,6 +7128,13 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
   current_graphics_descriptor_set_values_up_to_date_ |=
       write_descriptor_set_bits;
 
+  // Dynamic offsets are supplied when binding, so a moved suballocation needs a
+  // rebind even though the set itself is unchanged.
+  if (constant_buffer_offsets_changed) {
+    current_graphics_descriptor_sets_bound_up_to_date_ &=
+        ~(UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetConstants);
+  }
+
   // Bind the new descriptor sets.
   uint32_t descriptor_sets_needed =
       (UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetCount) - 1;
@@ -6783,13 +7155,23 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
     uint32_t descriptor_set_mask_tzcnt =
         xe::tzcnt(~(descriptor_sets_remaining |
                     ((UINT32_C(1) << descriptor_set_index) - 1)));
+    // The constants are the only dynamic bindings, so their offsets are passed
+    // only by the command covering that set.
+    bool binds_constants =
+        descriptor_set_index <=
+            uint32_t(SpirvShaderTranslator::kDescriptorSetConstants) &&
+        uint32_t(SpirvShaderTranslator::kDescriptorSetConstants) <
+            descriptor_set_mask_tzcnt;
     // TODO(Triang3l): Bind to compute for memexport emulation without vertex
     // shader memory stores.
     deferred_command_buffer_.CmdVkBindDescriptorSets(
         VK_PIPELINE_BIND_POINT_GRAPHICS,
         current_guest_graphics_pipeline_layout_->GetPipelineLayout(),
         descriptor_set_index, descriptor_set_mask_tzcnt - descriptor_set_index,
-        current_graphics_descriptor_sets_ + descriptor_set_index, 0, nullptr);
+        current_graphics_descriptor_sets_ + descriptor_set_index,
+        binds_constants ? uint32_t(SpirvShaderTranslator::kConstantBufferCount)
+                        : 0,
+        binds_constants ? current_constant_buffer_dynamic_offsets_ : nullptr);
     if (descriptor_set_mask_tzcnt >= 32) {
       break;
     }

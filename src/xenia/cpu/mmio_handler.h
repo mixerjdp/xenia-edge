@@ -10,6 +10,7 @@
 #ifndef XENIA_CPU_MMIO_HANDLER_H_
 #define XENIA_CPU_MMIO_HANDLER_H_
 
+#include <atomic>
 #include <memory>
 #include <mutex>
 #include <vector>
@@ -78,6 +79,11 @@ class MMIOHandler {
     record_mmio_callback_ = callback;
   }
 
+  // Faults in the user mode views go straight to the access violation callback.
+  void SetUserMembase(uint8_t* user_membase) {
+    user_membase_.store(user_membase, std::memory_order_relaxed);
+  }
+
  protected:
   MMIOHandler(uint8_t* virtual_membase, uint8_t* physical_membase,
               uint8_t* membase_end, HostToGuestVirtual host_to_guest_virtual,
@@ -93,6 +99,7 @@ class MMIOHandler {
   uint8_t* virtual_membase_;
   uint8_t* physical_membase_;
   uint8_t* memory_end_;
+  std::atomic<uint8_t*> user_membase_{nullptr};
 
   std::vector<MMIORange> mapped_ranges_;
 

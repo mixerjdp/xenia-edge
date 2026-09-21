@@ -301,6 +301,32 @@ class DeferredCommandBuffer {
     args.filter = filter;
     return reinterpret_cast<VkImageBlit*>(args_ptr + header_size);
   }
+  VkImageCopy* CmdCopyImageEmplace(VkImage src_image,
+                                   VkImageLayout src_image_layout,
+                                   VkImage dst_image,
+                                   VkImageLayout dst_image_layout,
+                                   uint32_t region_count) {
+    const size_t header_size =
+        xe::align(sizeof(ArgsVkCopyImage), alignof(VkImageCopy));
+    uint8_t* args_ptr = reinterpret_cast<uint8_t*>(
+        WriteCommand(Command::kVkCopyImage,
+                     header_size + sizeof(VkImageCopy) * region_count));
+    auto& args = *reinterpret_cast<ArgsVkCopyImage*>(args_ptr);
+    args.src_image = src_image;
+    args.src_image_layout = src_image_layout;
+    args.dst_image = dst_image;
+    args.dst_image_layout = dst_image_layout;
+    args.region_count = region_count;
+    return reinterpret_cast<VkImageCopy*>(args_ptr + header_size);
+  }
+  void CmdVkCopyImage(VkImage src_image, VkImageLayout src_image_layout,
+                      VkImage dst_image, VkImageLayout dst_image_layout,
+                      uint32_t region_count, const VkImageCopy* regions) {
+    std::memcpy(CmdCopyImageEmplace(src_image, src_image_layout, dst_image,
+                                    dst_image_layout, region_count),
+                regions, sizeof(VkImageCopy) * region_count);
+  }
+
   void CmdVkBlitImage(VkImage src_image, VkImageLayout src_image_layout,
                       VkImage dst_image, VkImageLayout dst_image_layout,
                       uint32_t region_count, const VkImageBlit* regions,
@@ -486,6 +512,7 @@ class DeferredCommandBuffer {
     kVkCopyBufferToImage,
     kVkFillBuffer,
     kVkBlitImage,
+    kVkCopyImage,
     kVkDispatch,
     kVkDraw,
     kVkDrawIndexed,
@@ -645,6 +672,16 @@ class DeferredCommandBuffer {
     VkFilter filter;
     // Followed by aligned VkImageBlit[].
     static_assert(alignof(VkImageBlit) <= alignof(uintmax_t));
+  };
+
+  struct ArgsVkCopyImage {
+    VkImage src_image;
+    VkImageLayout src_image_layout;
+    VkImage dst_image;
+    VkImageLayout dst_image_layout;
+    uint32_t region_count;
+    // Followed by aligned VkImageCopy[].
+    static_assert(alignof(VkImageCopy) <= alignof(uintmax_t));
   };
 
   struct ArgsVkDispatch {

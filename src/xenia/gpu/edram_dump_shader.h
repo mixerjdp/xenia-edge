@@ -28,7 +28,8 @@ namespace gpu {
 //
 // With EdramDumpShaderKey::direct_resolve, the same shader stores into the
 // resolve destination in the guest texture layout instead, doing in one pass
-// what the dump and the resolve copy do in two.
+// what the dump and the resolve copy do in two - in the plain 1x1 layout or
+// the resolution-scaled group-packed one, as native_layout selects.
 
 union EdramDumpShaderKey {
   uint32_t key;
@@ -38,16 +39,19 @@ union EdramDumpShaderKey {
     // Last bit because this affects the pipeline - after sorting, only change
     // it at most once. Depth buffers have an additional stencil SRV.
     uint32_t is_depth : 1;
-    // Dumping to the scaled EDRAM layout duplicates this native render
-    // target's guest pixels.
+    // Writing this native render target into a scaled destination duplicates
+    // its guest pixels across the host pixels covering them.
     uint32_t source_scale_native : 1;
-    // source_scale_native only.
-    // Address the EDRAM buffer with the plain 1x1 tile layout.
+    // Address the destination - the EDRAM buffer, or the resolve destination
+    // for direct_resolve - with the plain 1x1 layout rather than the scaled
+    // one. Only meaningful with resolution scaling, where it marks a fully
+    // native resolve; every source of one is source_scale_native too.
     uint32_t native_layout : 1;
     // Store into the resolve destination rather than the EDRAM buffer,
-    // skipping the round trip. Only for resolves the copy would do bitwise,
-    // and only without resolution scaling - the format-converting copies and
-    // the scaled destination layout stay on the EDRAM path.
+    // skipping the round trip. Only for resolves the copy would do bitwise -
+    // the format-converting ones stay on the EDRAM path. A scaled destination
+    // is written in the group-packed layout, out of a windowed binding, so the
+    // destination base push constant is unused there.
     uint32_t direct_resolve : 1;
   };
 

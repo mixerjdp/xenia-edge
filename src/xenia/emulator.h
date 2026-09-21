@@ -101,6 +101,11 @@ class Emulator {
 
   // Name of the title in the default language.
   const std::string& title_name() const { return title_name_; }
+  // For a launcher that picks its game after launch.
+  void SetTitleName(std::string title_name) {
+    title_name_ = std::move(title_name);
+    on_title_name_change();
+  }
 
   // Version of the title as a string.
   const std::string& title_version() const { return title_version_; }
@@ -362,16 +367,20 @@ class Emulator {
   }
 
   using DiscRecorder =
-      std::function<void(uint32_t title_id, const std::string& label,
-                         const std::filesystem::path& path)>;
+      std::function<void(uint32_t title_id, const std::filesystem::path& path)>;
   void set_disc_recorder(DiscRecorder recorder) {
     disc_recorder_ = std::move(recorder);
   }
-  void RecordDisc(uint32_t title_id, const std::string& label,
-                  const std::filesystem::path& path) {
+  void RecordDisc(uint32_t title_id, const std::filesystem::path& path) {
     if (disc_recorder_) {
-      disc_recorder_(title_id, label, path);
+      disc_recorder_(title_id, path);
     }
+  }
+
+  // Disc in the drive, 1-based; follows XamSwapDisc. 0 when unknown.
+  uint8_t current_disc_number() const { return current_disc_number_; }
+  void set_current_disc_number(uint8_t disc_number) {
+    current_disc_number_ = disc_number;
   }
 
   // The game can request another title to be loaded.
@@ -383,6 +392,7 @@ class Emulator {
   xe::Delegate<uint32_t, const std::string_view> on_launch;
   xe::Delegate<bool> on_shader_storage_initialization;
   xe::Delegate<> on_patch_apply;
+  xe::Delegate<> on_title_name_change;
   xe::Delegate<> on_terminate;
   xe::Delegate<> on_exit;
 
@@ -430,8 +440,14 @@ class Emulator {
   std::string RemountAndResolveLaunchPath(const std::string& launch_path);
   std::string FindLaunchModule();
 
+  // Applies the media_type cvar override, if any.
+  void SetDeploymentType(XDeploymentType detected_type);
+
   X_STATUS CompleteLaunch(const std::filesystem::path& path,
                           const std::string_view module_path);
+  // UI-thread half of CompleteLaunch, ends with the main thread suspended.
+  X_STATUS PrepareLaunch(const std::filesystem::path& path,
+                         const std::string_view module_path);
 
   std::filesystem::path command_line_;
   std::filesystem::path last_launch_path_;  // persists across relaunch
@@ -465,11 +481,14 @@ class Emulator {
   kernel::object_ref<kernel::XThread> main_thread_;
   kernel::object_ref<kernel::XHostThread> plugin_loader_thread_;
   std::optional<uint32_t> title_id_;  // Currently running title ID
+  uint8_t current_disc_number_ = 0;
   std::unique_ptr<kernel::util::GameInfoDatabase> game_info_database_;
 
   bool paused_;
   bool restoring_;
   bool relaunching_ = false;
+  // Held across CompleteLaunch so title teardown waits for it to finish.
+  std::mutex launch_mutex_;
   threading::Fence restore_fence_;  // Fired on restore finish.
 
   // Persisted across Shutdown/Setup for relaunch.

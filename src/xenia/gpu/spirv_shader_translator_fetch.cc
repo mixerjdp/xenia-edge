@@ -19,11 +19,26 @@
 #include "xenia/gpu/render_target_cache.h"
 #include "xenia/gpu/spirv_compatibility.h"
 
+DECLARE_bool(spirv_fine_derivatives);
+
 namespace xe {
 namespace gpu {
 
+namespace {
+// The implementation picks which pixels of the quad a coarse derivative uses.
+spv::Op DerivativeXOp() {
+  return cvars::spirv_fine_derivatives ? spv::OpDPdxFine : spv::OpDPdxCoarse;
+}
+spv::Op DerivativeYOp() {
+  return cvars::spirv_fine_derivatives ? spv::OpDPdyFine : spv::OpDPdyCoarse;
+}
+}  // namespace
+
 void SpirvShaderTranslator::ProcessVertexFetchInstruction(
     const ParsedVertexFetchInstruction& instr) {
+  if (BisectSkipsInstruction()) {
+    return;
+  }
   UpdateInstructionPredication(instr.is_predicated, instr.predicate_condition);
 
   uint32_t used_result_components = instr.result.GetUsedResultComponents();
@@ -538,10 +553,14 @@ void SpirvShaderTranslator::ProcessVertexFetchInstruction(
     }
   }
   StoreResult(instr.result, result);
+  BisectSnapshotAfterInstruction();
 }
 
 void SpirvShaderTranslator::ProcessTextureFetchInstruction(
     const ParsedTextureFetchInstruction& instr) {
+  if (BisectSkipsInstruction()) {
+    return;
+  }
   UpdateInstructionPredication(instr.is_predicated, instr.predicate_condition);
 
   EnsureBuildPointAvailable();
@@ -654,8 +673,8 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
       derivative_components_remaining &=
           ~(UINT32_C(1) << derivative_component_index);
       result[derivative_component_index] = builder_->createUnaryOp(
-          (derivative_component_index & 0b01) ? spv::OpDPdyCoarse
-                                              : spv::OpDPdxCoarse,
+          (derivative_component_index & 0b01) ? DerivativeYOp()
+                                              : DerivativeXOp(),
           type_float_,
           (derivative_component_index & 0b10) ? derivative_function_y
                                               : derivative_function_x);
@@ -1841,12 +1860,15 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
               builder_->makeFloatConstant(instr.attributes.lod_bias));
         }
 
-        // Cube auto-LOD without register gradients uses implicit LOD + bias to
-        // work around wrong-mip explicit cube gradients on Vulkan. Other dims
-        // keep explicit gradients, matching the DXBC ground-truth path.
-        bool use_lod_bias = use_computed_lod &&
-                            !instr.attributes.use_register_gradients &&
-                            instr.dimension == xenos::FetchOpDimension::kCube;
+        // Cube and 3D auto-LOD without register gradients use implicit LOD +
+        // bias. Explicit cube gradients pick the wrong mip on Vulkan, and
+        // explicit 3D gradients of a coordinate that is constant across the
+        // quad make NVIDIA return a different texel in one lane of the quad.
+        // 1D and 2D keep explicit gradients.
+        bool use_lod_bias =
+            use_computed_lod && !instr.attributes.use_register_gradients &&
+            (instr.dimension == xenos::FetchOpDimension::kCube ||
+             instr.dimension == xenos::FetchOpDimension::k3DOrStacked);
 
         if (use_lod_bias) {
           // The per-axis gradient exponent biases can't be applied to the
@@ -1914,15 +1936,15 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
               // For wide 1D textures, coordinates[0] and coordinates[1]
               // have been remapped. Compute gradients from both.
               gradient_h_x = builder_->createUnaryOp(
-                  spv::OpDPdxCoarse, type_float_, coordinates[0]);
+                  DerivativeXOp(), type_float_, coordinates[0]);
               gradient_v_x = builder_->createUnaryOp(
-                  spv::OpDPdyCoarse, type_float_, coordinates[0]);
+                  DerivativeYOp(), type_float_, coordinates[0]);
               // For wide 1D textures, also compute Y gradients.
               // coordinates[1] is non-zero only for wide 1D.
               gradient_h_y = builder_->createUnaryOp(
-                  spv::OpDPdxCoarse, type_float_, coordinates[1]);
+                  DerivativeXOp(), type_float_, coordinates[1]);
               gradient_v_y = builder_->createUnaryOp(
-                  spv::OpDPdyCoarse, type_float_, coordinates[1]);
+                  DerivativeYOp(), type_float_, coordinates[1]);
               gradient_h_x = builder_->createNoContractionBinOp(
                   spv::OpFMul, type_float_, gradient_h_x, lod_gradient_scale_h);
               gradient_v_x = builder_->createNoContractionBinOp(
@@ -1982,12 +2004,10 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
                     builder_->createCompositeConstruct(type_float2_,
                                                        id_vector_temp_);
                 builder_->addCapability(spv::CapabilityDerivativeControl);
-                gradients_h =
-                    builder_->createUnaryOp(spv::OpDPdxCoarse, type_float2_,
-                                            gradient_coordinate_vector);
-                gradients_v =
-                    builder_->createUnaryOp(spv::OpDPdyCoarse, type_float2_,
-                                            gradient_coordinate_vector);
+                gradients_h = builder_->createUnaryOp(
+                    DerivativeXOp(), type_float2_, gradient_coordinate_vector);
+                gradients_v = builder_->createUnaryOp(
+                    DerivativeYOp(), type_float2_, gradient_coordinate_vector);
               }
               gradients_h = builder_->createNoContractionBinOp(
                   spv::OpVectorTimesScalar, type_float2_, gradients_h,
@@ -2029,12 +2049,10 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
                     builder_->createCompositeConstruct(type_float3_,
                                                        id_vector_temp_);
                 builder_->addCapability(spv::CapabilityDerivativeControl);
-                gradients_h =
-                    builder_->createUnaryOp(spv::OpDPdxCoarse, type_float3_,
-                                            gradient_coordinate_vector);
-                gradients_v =
-                    builder_->createUnaryOp(spv::OpDPdyCoarse, type_float3_,
-                                            gradient_coordinate_vector);
+                gradients_h = builder_->createUnaryOp(
+                    DerivativeXOp(), type_float3_, gradient_coordinate_vector);
+                gradients_v = builder_->createUnaryOp(
+                    DerivativeYOp(), type_float3_, gradient_coordinate_vector);
               }
               gradients_h = builder_->createNoContractionBinOp(
                   spv::OpVectorTimesScalar, type_float3_, gradients_h,
@@ -2086,7 +2104,7 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
           spv::Id sample_result_unsigned_3d, sample_result_signed_3d;
           {
             // 3D.
-            if (use_computed_lod) {
+            if (use_computed_lod && !use_lod_bias) {
               texture_parameters.gradX = gradients_h;
               texture_parameters.gradY = gradients_v;
             }
@@ -2105,7 +2123,7 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
           spv::Id sample_result_unsigned_stacked, sample_result_signed_stacked;
           {
             // 2D stacked.
-            if (use_computed_lod) {
+            if (use_computed_lod && !use_lod_bias) {
               // Extract 2D gradients for stacked textures which are 2D arrays.
               uint_vector_temp_.clear();
               uint_vector_temp_.push_back(0);
@@ -2129,7 +2147,7 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
             bool vol_min_filter_is_linear = instr.attributes.vol_min_filter ==
                                             xenos::TextureFilter::kLinear;
             spv::Id vol_filter_is_linear = spv::NoResult;
-            if (use_computed_lod &&
+            if (use_computed_lod && !use_lod_bias &&
                 (vol_mag_filter_is_fetch_const ||
                  vol_min_filter_is_fetch_const ||
                  vol_mag_filter_is_linear != vol_min_filter_is_linear)) {
@@ -2551,7 +2569,8 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
 
         // num_format is applied after signs/gamma. Fixed textures sample as
         // normalized host values, so integer num_format scales them back to
-        // guest integer units here.
+        // guest integer units here. Bit 24 requests rounding for normalized
+        // unsigned values.
         id_vector_temp_.clear();
         id_vector_temp_.push_back(
             builder_->makeIntConstant(kSystemConstantTextureIntegerScaleBits));
@@ -2564,6 +2583,10 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
                                         uniform_system_constants_,
                                         id_vector_temp_),
             spv::NoPrecision);
+        id_vector_temp_.clear();
+        id_vector_temp_.insert(id_vector_temp_.cend(), result, result + 4);
+        spv::Id integer_scale_result =
+            builder_->createCompositeConstruct(type_float4_, id_vector_temp_);
         {
           // Uniform early out. Zero means leave the sample alone. Only integer
           // num_format on fixed textures has scale bits.
@@ -2572,78 +2595,114 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
               builder_->makeUintConstant(0));
           SpirvBuilder::IfBuilder if_integer_scale(
               integer_scale_active, spv::SelectionControlMaskNone, *builder_);
-          spv::Id scaled_result[4] = {};
+          spv::Id integer_scale_result_converted;
           {
+            spv::Id normalized = builder_->createBinOp(
+                spv::OpINotEqual, type_bool_,
+                builder_->createBinOp(
+                    spv::OpBitwiseAnd, type_uint_, integer_scale_bits_packed,
+                    builder_->makeUintConstant(UINT32_C(1) << 24)),
+                builder_->makeUintConstant(0));
+            SpirvBuilder::IfBuilder if_normalized(
+                normalized, spv::SelectionControlMaskNone, *builder_);
+            spv::Id normalized_result = builder_->createNoContractionBinOp(
+                spv::OpVectorTimesScalar, type_float4_, integer_scale_result,
+                builder_->makeFloatConstant(65536.0f));
+            normalized_result = builder_->createUnaryBuiltinCall(
+                type_float4_, ext_inst_glsl_std_450_, GLSLstd450RoundEven,
+                normalized_result);
+            normalized_result = builder_->createNoContractionBinOp(
+                spv::OpVectorTimesScalar, type_float4_, normalized_result,
+                builder_->makeFloatConstant(1.0f / 65536.0f));
+            if_normalized.makeBeginElse();
             spv::Id const_uint_1 = builder_->makeUintConstant(1);
-            uint32_t result_remaining_components =
-                used_result_nonzero_components;
-            uint32_t result_component_index;
-            while (xe::bit_scan_forward(result_remaining_components,
-                                        &result_component_index)) {
-              result_remaining_components &=
-                  ~(UINT32_C(1) << result_component_index);
-              spv::Id scale_bits = builder_->createTriOp(
-                  spv::OpBitFieldUExtract, type_uint_,
-                  integer_scale_bits_packed,
-                  builder_->makeUintConstant(result_component_index * 6),
-                  builder_->makeUintConstant(6));
-              spv::Id scale_shift = builder_->createBinOp(
-                  spv::OpIAdd, type_uint_,
-                  builder_->createBinOp(spv::OpBitwiseAnd, type_uint_,
-                                        scale_bits,
-                                        builder_->makeUintConstant(0xF)),
-                  const_uint_1);
-              scale_shift = builder_->createBinOp(
-                  spv::OpISub, type_uint_, scale_shift,
-                  builder_->createTriOp(spv::OpBitFieldUExtract, type_uint_,
-                                        scale_bits,
-                                        builder_->makeUintConstant(4),
-                                        builder_->makeUintConstant(1)));
-              spv::Id scale_uint = builder_->createBinOp(
-                  spv::OpISub, type_uint_,
-                  builder_->createBinOp(spv::OpShiftLeftLogical, type_uint_,
-                                        const_uint_1, scale_shift),
-                  const_uint_1);
-              // Unsigned biased samples are already mapped [0, 1] to [-1, 1],
-              // so use half of the unsigned scale and subtract 0.5 to restore
-              // the guest's integer value.
-              spv::Id biased = builder_->createBinOp(
-                  spv::OpINotEqual, type_bool_,
-                  builder_->createTriOp(spv::OpBitFieldUExtract, type_uint_,
-                                        scale_bits,
-                                        builder_->makeUintConstant(5),
-                                        builder_->makeUintConstant(1)),
-                  builder_->makeUintConstant(0));
-              spv::Id scale_float = builder_->createNoContractionBinOp(
-                  spv::OpFMul, type_float_,
-                  builder_->createUnaryOp(spv::OpConvertUToF, type_float_,
-                                          scale_uint),
-                  builder_->createTriOp(spv::OpSelect, type_float_, biased,
-                                        builder_->makeFloatConstant(0.5f),
-                                        builder_->makeFloatConstant(1.0f)));
-              scaled_result[result_component_index] =
-                  builder_->createNoContractionBinOp(
-                      spv::OpFAdd, type_float_,
-                      builder_->createNoContractionBinOp(
-                          spv::OpFMul, type_float_,
-                          result[result_component_index], scale_float),
-                      builder_->createTriOp(spv::OpSelect, type_float_, biased,
-                                            builder_->makeFloatConstant(-0.5f),
-                                            builder_->makeFloatConstant(0.0f)));
+            id_vector_temp_.clear();
+            for (uint32_t i = 0; i < 4; ++i) {
+              id_vector_temp_.push_back(builder_->makeUintConstant(i * 6));
             }
+            spv::Id scale_bits = builder_->createBinOp(
+                spv::OpShiftRightLogical, type_uint4_,
+                builder_->smearScalar(spv::NoPrecision,
+                                      integer_scale_bits_packed, type_uint4_),
+                builder_->makeCompositeConstant(type_uint4_, id_vector_temp_));
+            scale_bits = builder_->createBinOp(
+                spv::OpBitwiseAnd, type_uint4_, scale_bits,
+                builder_->smearScalar(spv::NoPrecision,
+                                      builder_->makeUintConstant(0x3F),
+                                      type_uint4_));
+            spv::Id const_uint4_1 = builder_->smearScalar(
+                spv::NoPrecision, const_uint_1, type_uint4_);
+            spv::Id scale_shift = builder_->createBinOp(
+                spv::OpIAdd, type_uint4_,
+                builder_->createBinOp(
+                    spv::OpBitwiseAnd, type_uint4_, scale_bits,
+                    builder_->smearScalar(spv::NoPrecision,
+                                          builder_->makeUintConstant(0xF),
+                                          type_uint4_)),
+                const_uint4_1);
+            scale_shift = builder_->createBinOp(
+                spv::OpISub, type_uint4_, scale_shift,
+                builder_->createBinOp(
+                    spv::OpBitwiseAnd, type_uint4_,
+                    builder_->createBinOp(
+                        spv::OpShiftRightLogical, type_uint4_, scale_bits,
+                        builder_->smearScalar(spv::NoPrecision,
+                                              builder_->makeUintConstant(4),
+                                              type_uint4_)),
+                    const_uint4_1));
+            spv::Id scale_uint = builder_->createBinOp(
+                spv::OpISub, type_uint4_,
+                builder_->createBinOp(spv::OpShiftLeftLogical, type_uint4_,
+                                      const_uint4_1, scale_shift),
+                const_uint4_1);
+            // Unsigned biased samples are already mapped [0, 1] to [-1, 1],
+            // so use half of the unsigned scale and subtract 0.5 to restore
+            // the guest's integer value.
+            spv::Id biased = builder_->createBinOp(
+                spv::OpINotEqual, type_bool4_,
+                builder_->createBinOp(
+                    spv::OpBitwiseAnd, type_uint4_,
+                    builder_->createBinOp(
+                        spv::OpShiftRightLogical, type_uint4_, scale_bits,
+                        builder_->smearScalar(spv::NoPrecision,
+                                              builder_->makeUintConstant(5),
+                                              type_uint4_)),
+                    const_uint4_1),
+                const_uint4_0_);
+            spv::Id scale_float = builder_->createTriOp(
+                spv::OpSelect, type_float4_, biased,
+                builder_->smearScalar(spv::NoPrecision,
+                                      builder_->makeFloatConstant(0.5f),
+                                      type_float4_),
+                const_float4_1_);
+            spv::Id scaled_result = builder_->createNoContractionBinOp(
+                spv::OpFAdd, type_float4_,
+                builder_->createNoContractionBinOp(
+                    spv::OpFMul, type_float4_, integer_scale_result,
+                    builder_->createNoContractionBinOp(
+                        spv::OpFMul, type_float4_,
+                        builder_->createUnaryOp(spv::OpConvertUToF,
+                                                type_float4_, scale_uint),
+                        scale_float)),
+                builder_->createNoContractionBinOp(
+                    spv::OpFSub, type_float4_, scale_float, const_float4_1_));
+            if_normalized.makeEndIf();
+            integer_scale_result_converted =
+                if_normalized.createMergePhi(normalized_result, scaled_result);
           }
           if_integer_scale.makeEndIf();
           // Keep the original result when the scale branch is skipped.
-          uint32_t result_remaining_components = used_result_nonzero_components;
-          uint32_t result_component_index;
-          while (xe::bit_scan_forward(result_remaining_components,
-                                      &result_component_index)) {
-            result_remaining_components &=
-                ~(UINT32_C(1) << result_component_index);
-            result[result_component_index] = if_integer_scale.createMergePhi(
-                scaled_result[result_component_index],
-                result[result_component_index]);
-          }
+          integer_scale_result = if_integer_scale.createMergePhi(
+              integer_scale_result_converted, integer_scale_result);
+        }
+        uint32_t result_remaining_components = used_result_nonzero_components;
+        uint32_t result_component_index;
+        while (xe::bit_scan_forward(result_remaining_components,
+                                    &result_component_index)) {
+          result_remaining_components &=
+              ~(UINT32_C(1) << result_component_index);
+          result[result_component_index] = builder_->createCompositeExtract(
+              integer_scale_result, type_float_, result_component_index);
         }
 
         // Apply the exponent bias from the bits 13:18 of the fetch constant
@@ -2690,6 +2749,7 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
     result_vector = result[result_component_index];
   }
   StoreResult(instr.result, result_vector);
+  BisectSnapshotAfterInstruction();
 }
 
 size_t SpirvShaderTranslator::FindOrAddTextureBinding(

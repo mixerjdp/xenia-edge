@@ -557,6 +557,11 @@ class Fiber {
   // resume it. Switching to a terminated fiber is undefined.
   virtual void SetTerminated() = 0;
 
+  // Runs the start routine again on the same stack, abandoning the frames on
+  // it without unwinding them, so nothing they hold is released. Not valid on
+  // the current fiber or one adopted by CreateFromThread.
+  virtual void Restart() = 0;
+
   virtual void set_name(std::string name) { name_ = std::move(name); }
   const std::string& name() const { return name_; }
 

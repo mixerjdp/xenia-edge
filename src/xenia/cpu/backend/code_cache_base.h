@@ -10,6 +10,7 @@
 #ifndef XENIA_CPU_BACKEND_CODE_CACHE_BASE_H_
 #define XENIA_CPU_BACKEND_CODE_CACHE_BASE_H_
 
+#include <algorithm>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -51,6 +52,8 @@ struct EmitFunctionInfo {
   } code_size;
   size_t prolog_stack_alloc_offset;
   size_t stack_size;
+  // Set only by EmitHostToGuestThunk; a guest frame can look identical.
+  bool is_host_to_guest_thunk;
 #if XE_ARCH_ARM64
   // Offset from SP where x30 (LR) is saved.  ARM64 callees save LR
   // explicitly at varying offsets; the unwind info generator needs this
@@ -125,7 +128,47 @@ class CodeCacheBase : public CodeCache {
   }
   size_t total_size() const override { return kGeneratedCodeSize; }
 
+  bool PatchCode(void* execute_address, const void* data,
+                 size_t size) override {
+    auto* addr = reinterpret_cast<uint8_t*>(execute_address);
+    if (!generated_code_execute_base_ || !generated_code_write_base_ ||
+        addr < generated_code_execute_base_ || size > kGeneratedCodeSize ||
+        addr > generated_code_execute_base_ + (kGeneratedCodeSize - size)) {
+      return false;
+    }
+    uint8_t* write_address =
+        generated_code_write_base_ + (addr - generated_code_execute_base_);
+#if XE_PLATFORM_MAC && XE_ARCH_ARM64
+    const bool jit_write_toggle =
+        generated_code_execute_base_ == generated_code_write_base_;
+    if (jit_write_toggle) {
+      pthread_jit_write_protect_np(0);
+    }
+#endif
+    std::copy_n(static_cast<const uint8_t*>(data), size, write_address);
+#if XE_PLATFORM_MAC && XE_ARCH_ARM64
+    if (jit_write_toggle) {
+      pthread_jit_write_protect_np(1);
+    }
+#endif
+    self().FlushCodeRange(write_address, size);
+    return true;
+  }
+
   bool has_indirection_table() { return indirection_table_base_ != nullptr; }
+
+  // The guest addresses that have indirection slots.
+  static constexpr uint32_t indirection_guest_base() {
+    return uint32_t(kIndirectionTableBase);
+  }
+  static constexpr uint32_t indirection_guest_size() {
+    return uint32_t(kIndirectionTableSize);
+  }
+  static constexpr bool HasIndirectionSlot(uint32_t guest_address) {
+    return guest_address >= indirection_guest_base() &&
+           guest_address - indirection_guest_base() + 4 <=
+               indirection_guest_size();
+  }
 
   // True when slots hold encoded rel32 + tagged-external values, false when
   // fixed allocation succeeded and slots hold raw 32-bit absolute addresses.
@@ -248,6 +291,9 @@ class CodeCacheBase : public CodeCache {
                                  xe::memory::AllocationType::kReserveCommit,
                                  xe::memory::PageAccess::kExecuteReadWrite));
       generated_code_write_base_ = generated_code_execute_base_;
+      // mmap maps the whole region RWX already. EnsureCommitted's mprotect
+      // would fail with EACCES, macOS refuses it on MAP_JIT pages.
+      generated_code_commit_mark_ = kGeneratedCodeSize;
 #else
       generated_code_execute_base_ =
           reinterpret_cast<uint8_t*>(xe::memory::MapFileView(

@@ -791,10 +791,14 @@ class Shader {
     uint64_t modification() const { return modification_; }
 
     // True if the shader was translated and prepared without error.
-    bool is_valid() const { return is_valid_; }
+    bool is_valid() const { return is_valid_.load(std::memory_order_acquire); }
 
-    // True if the shader has already been translated.
-    bool is_translated() const { return is_translated_; }
+    // True if the shader has already been translated. Acquire-paired with the
+    // release store at the end of translation, so once this reads true, the
+    // validity, the errors and the translated binary are all published.
+    bool is_translated() const {
+      return is_translated_.load(std::memory_order_acquire);
+    }
 
     // For background-thread translation: atomically claim the right to
     // translate. Returns true if the caller should translate, false if another
@@ -836,7 +840,7 @@ class Shader {
         : shader_(shader), modification_(modification) {}
 
     // If there was some failure during preparation on the implementation side.
-    void MakeInvalid() { is_valid_ = false; }
+    void MakeInvalid() { is_valid_.store(false, std::memory_order_release); }
 
     std::vector<uint8_t> translated_binary_;
 
@@ -847,8 +851,8 @@ class Shader {
     Shader& shader_;
     uint64_t modification_;
 
-    bool is_valid_ = false;
-    bool is_translated_ = false;
+    std::atomic<bool> is_valid_{false};
+    std::atomic<bool> is_translated_{false};
     std::atomic_flag translation_claimed_ = ATOMIC_FLAG_INIT;
     std::vector<Error> errors_;
     std::string host_disassembly_;

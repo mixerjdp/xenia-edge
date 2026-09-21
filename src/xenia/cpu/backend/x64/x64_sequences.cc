@@ -1431,15 +1431,17 @@ EMITTER_OPCODE_TABLE(OPCODE_DID_SATURATE, DID_SATURATE);
 // An invalid operation with no NaN operand answers with the default QNaN, and
 // x86's is negative where PPC's is positive. Only a NaN result can need the
 // fixup, so the test stays off the result's dependency chain and the work goes
-// to a tail block. The arithmetic lands in xmm2 because dest may share a
-// register with a source, and the tail needs the operands to tell a propagated
-// NaN from a generated one.
+// to a tail block.
 template <typename ARGS, typename FN>
 static void EmitBinaryFpWithPpcDefaultNan_F64(X64Emitter& e, const ARGS& i,
                                               FN&& emit_op) {
+  // The tail reads the original operands, so an aliased dest stages via xmm2.
+  const bool aliased = (!i.src1.is_constant && i.dest.reg() == i.src1.reg()) ||
+                       (!i.src2.is_constant && i.dest.reg() == i.src2.reg());
+  const Xmm target = aliased ? e.xmm2 : i.dest.reg();
   Xbyak::Label& done = e.NewCachedLabel();
   Xbyak::Label& invalid =
-      e.AddToTail([i, &done](X64Emitter& e, Xbyak::Label& tail) {
+      e.AddToTail([i, aliased, &done](X64Emitter& e, Xbyak::Label& tail) {
         e.L(tail);
         Xbyak::Label propagate;
         // Re-derive rather than capture: a constant operand lives in xmm0 or
@@ -1454,15 +1456,19 @@ static void EmitBinaryFpWithPpcDefaultNan_F64(X64Emitter& e, const ARGS& i,
         e.vmovq(i.dest, e.rax);
         e.jmp(done, X64Emitter::T_NEAR);
         e.L(propagate);
-        e.vmovapd(i.dest, e.xmm2);
+        if (aliased) {
+          e.vmovapd(i.dest, e.xmm2);
+        }
         e.jmp(done, X64Emitter::T_NEAR);
       });
   Xmm src1 = GetInputRegOrConstant(e, i.src1, e.xmm0);
   Xmm src2 = GetInputRegOrConstant(e, i.src2, e.xmm1);
-  emit_op(e, e.xmm2, src1, src2);
-  e.vucomisd(e.xmm2, e.xmm2);
+  emit_op(e, target, src1, src2);
+  e.vucomisd(target, target);
   e.jp(invalid, X64Emitter::T_NEAR);
-  e.vmovapd(i.dest, e.xmm2);
+  if (aliased) {
+    e.vmovapd(i.dest, e.xmm2);
+  }
   e.L(done);
 }
 
@@ -1799,7 +1805,9 @@ struct MUL_V128 : Sequence<MUL_V128, I<OPCODE_MUL, V128Op, V128Op, V128Op>> {
     e.ChangeMxcsrMode(MXCSRMode::Vmx);
     Xmm src1 = GetInputRegOrConstant(e, i.src1, e.xmm0);
     Xmm src2 = GetInputRegOrConstant(e, i.src2, e.xmm1);
-    e.vmulps(i.dest, src1, src2);
+    EmitVmxFloatBinOp(e, i.dest, src1, src2,
+                      [](X64Emitter& e, const Xmm& d, const Xmm& a,
+                         const Xmm& b) { e.vmulps(d, a, b); });
   }
 };
 EMITTER_OPCODE_TABLE(OPCODE_MUL, MUL_I8, MUL_I16, MUL_I32, MUL_I64, MUL_F32,
@@ -2880,14 +2888,44 @@ struct AND_I32 : Sequence<AND_I32, I<OPCODE_AND, I32Op, I32Op, I32Op>> {
     EmitAndXX<AND_I32, Reg32>(e, i);
   }
 };
+// btr/bts is 5 bytes where movabs + and/or is 10; nothing consumes the flags.
+static bool TryEmitSingleBitMask(X64Emitter& e, const I64Op& dest,
+                                 const I64Op& src, uint64_t constant,
+                                 bool set) {
+  const uint64_t bit = set ? constant : ~constant;
+  if (!bit || (bit & (bit - 1))) {
+    return false;
+  }
+  if (static_cast<int64_t>(constant) ==
+      static_cast<int64_t>(static_cast<int32_t>(constant))) {
+    return false;
+  }
+  if (dest != src.reg()) {
+    e.mov(dest, src);
+  }
+  if (set) {
+    e.bts(dest, xe::tzcnt(bit));
+  } else {
+    e.btr(dest, xe::tzcnt(bit));
+  }
+  return true;
+}
 struct AND_I64 : Sequence<AND_I64, I<OPCODE_AND, I64Op, I64Op, I64Op>> {
   static void Emit(X64Emitter& e, const EmitArgType& i) {
     if (i.src2.is_constant && i.src2.constant() == 0xFFFFFFFF) {
       // special case for rlwinm codegen
       e.mov(((Reg64)i.dest).cvt32(), ((Reg64)i.src1).cvt32());
-    } else {
-      EmitAndXX<AND_I64, Reg64>(e, i);
+      return;
     }
+    if (i.src2.is_constant && !i.src1.is_constant &&
+        TryEmitSingleBitMask(e, i.dest, i.src1, i.src2.constant(), false)) {
+      return;
+    }
+    if (i.src1.is_constant && !i.src2.is_constant &&
+        TryEmitSingleBitMask(e, i.dest, i.src2, i.src1.constant(), false)) {
+      return;
+    }
+    EmitAndXX<AND_I64, Reg64>(e, i);
   }
 };
 struct AND_V128 : Sequence<AND_V128, I<OPCODE_AND, V128Op, V128Op, V128Op>> {
@@ -3035,6 +3073,14 @@ struct OR_I32 : Sequence<OR_I32, I<OPCODE_OR, I32Op, I32Op, I32Op>> {
 };
 struct OR_I64 : Sequence<OR_I64, I<OPCODE_OR, I64Op, I64Op, I64Op>> {
   static void Emit(X64Emitter& e, const EmitArgType& i) {
+    if (i.src2.is_constant && !i.src1.is_constant &&
+        TryEmitSingleBitMask(e, i.dest, i.src1, i.src2.constant(), true)) {
+      return;
+    }
+    if (i.src1.is_constant && !i.src2.is_constant &&
+        TryEmitSingleBitMask(e, i.dest, i.src2, i.src1.constant(), true)) {
+      return;
+    }
     EmitOrXX<OR_I64, Reg64>(e, i);
   }
 };
@@ -3688,6 +3734,36 @@ std::string FormatSequenceKey(uint64_t key) {
   return result;
 }
 
+// The emitted code reads a stale register in place of the constant.
+static void ReportConstantReadAsReg(const X64Emitter& e, const Instr* i,
+                                    const InstrKey& key) {
+  // The nearest SOURCE_OFFSET before it names the guest instruction.
+  uint32_t guest_address = 0;
+  for (const Instr* p = i; p;) {
+    if (p->GetOpcodeNum() == OPCODE_SOURCE_OFFSET) {
+      guest_address = static_cast<uint32_t>(p->src1.offset);
+      break;
+    }
+    p = p->prev ? p->prev
+                : (p->block->prev ? p->block->prev->instr_tail : nullptr);
+  }
+  static constexpr const char* kTypeNames[] = {"i8",  "i16", "i32", "i64",
+                                               "f32", "f64", "v128"};
+  auto describe = [](uint32_t key_type, const Value* value) -> std::string {
+    if (key_type < OPCODE_SIG_TYPE_V) {
+      return "-";
+    }
+    return fmt::format("{}{}", kTypeNames[key_type - OPCODE_SIG_TYPE_V],
+                       value->IsConstant() ? " const" : "");
+  };
+  XELOGE(
+      "x64: {} read a constant operand as a register in function {:08X} at "
+      "guest {:08X} (flags {:X}, src1 {}, src2 {}, src3 {})",
+      GetOpcodeName(i->opcode), e.current_guest_function(), guest_address,
+      i->flags, describe(key.src1, i->src1.value),
+      describe(key.src2, i->src2.value), describe(key.src3, i->src3.value));
+}
+
 bool SelectSequence(X64Emitter* e, const Instr* i, const Instr** new_tail) {
   if ((i->backend_flags & INSTR_X64_FLAGS_ELIMINATED) != 0) {
     // skip
@@ -3700,7 +3776,12 @@ bool SelectSequence(X64Emitter* e, const Instr* i, const Instr** new_tail) {
     auto it = table.find(key);
     if (it != table.end()) {
       const size_t size_before = e->getSize();
-      if (it->second(*e, i, key)) {
+      constant_read_as_reg = false;
+      const bool emitted = it->second(*e, i, key);
+      if (constant_read_as_reg) {
+        ReportConstantReadAsReg(*e, i, key);
+      }
+      if (emitted) {
         // Skip the bookkeeping opcodes: they carry no guest work, and
         // SOURCE_OFFSET would otherwise charge the coverage counter's own
         // code to the instruction it is counting.

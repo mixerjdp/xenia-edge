@@ -12,11 +12,13 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <functional>
 #include <memory>
 #include <mutex>
 #include <queue>
 #include <unordered_set>
+#include <vector>
 
 #include "xenia/base/threading.h"
 
@@ -65,6 +67,10 @@ class GuestScheduler {
   // change. No-op if not queued.
   void RequeueForPriority(XThread* thread);
 
+  // Moves a ready thread to the CPU its guest affinity now names, which the
+  // dispatch loop only does once the old CPU dequeues it.
+  void MigrateForAffinity(XThread* thread);
+
   // Yields from a spin loop. On a fiber this hands the dispatch thread to the
   // next ready fiber, since a co-resident holder can only run if we yield.
   // Off the fiber path it yields (or briefly sleeps) the host thread.
@@ -82,23 +88,26 @@ class GuestScheduler {
   // which remains the backstop throughout.
   void WakeForSignal(const XObject* object);
 
-  // Runs |fn|, a blocking host call such as a disc read, without stalling the
-  // dispatch thread. On a fiber it hands |fn| to the I/O worker and parks until
-  // it finishes, otherwise it runs inline. The single worker serializes all
-  // offloaded I/O, which the vfs devices require since a zarchive reader and an
-  // STFS block file are shared across the files opened from them.
-  template <typename Fn>
-  void RunBlockingHostCall(Fn&& fn) {
-    if (!CurrentThreadOffloadsBlockingCalls()) {
-      fn();
-      return;
-    }
-    RunBlockingHostCallOffloaded(std::function<void()>(std::forward<Fn>(fn)));
-  }
+  // Whether an offloaded call may overlap the others. Set from the device, see
+  // vfs::Device::supports_concurrent_io.
+  enum class BlockingCallClass {
+    kSerial,
+    kConcurrent,
+  };
+
+  // Runs |fn|, a blocking host call such as a disc read, on an I/O worker
+  // without waiting. kSerial calls share one worker, kConcurrent calls go to a
+  // pool so one slow call cannot hold up the rest. Runs inline once shutdown
+  // has begun.
+  void PostHostCall(std::function<void()> fn, BlockingCallClass call_class);
 
   // True when the calling thread is a scheduler-managed fiber, so a blocking
   // host call would stall other fibers and should be offloaded instead.
   static bool CurrentThreadOffloadsBlockingCalls();
+
+  // True inside a call posted by PostHostCall, so on a shared I/O worker
+  // rather than a guest thread.
+  static bool CurrentThreadIsBlockingCallWorker();
 
   // Dispatch thread index a guest CPU maps to, for co-residency checks.
   int DispatchCpuOf(uint8_t guest_cpu) const;
@@ -110,6 +119,11 @@ class GuestScheduler {
 
   // Counts a safepoint preemption forced through a deferring IRQL.
   void NoteForcedPreempt();
+
+  // Opens a background-scheduling window on the background processors, as the
+  // console does from its vblank DPC. Those CPUs prefer the low priority band
+  // for its duration. Safe to call off a dispatch thread.
+  void EnterBackgroundMode();
 
   // Yields the running guest fiber back to its CPU's idle fiber. Returns (on
   // the calling fiber) once the dispatcher switches back into it.
@@ -123,6 +137,9 @@ class GuestScheduler {
   // Returns true if another fiber ran on this CPU during the yield, so
   // NtYieldExecution can report NO_YIELD_PERFORMED like NT.
   bool YieldCurrentThread(bool quantum_end, bool to_lower = true);
+
+  // YieldCurrentThread, returning false without a switch if nothing could run.
+  bool YieldExecution(bool quantum_end);
 
   // Parks the running guest fiber on its CPU's blocked list and yields. Returns
   // once the dispatcher re-readies it so the wait can re-poll. A single-object
@@ -179,7 +196,7 @@ class GuestScheduler {
     // levels so the highest ready priority is one bit scan away.
     XThread* ready_head[32] = {};
     XThread* ready_tail[32] = {};
-    uint32_t ready_summary = 0;
+    std::atomic<uint32_t> ready_summary{0};
     // The fiber currently running on this CPU, for the preemption check.
     XThread* current_thread = nullptr;
     // Set under lock_ by a voluntary yield, so the next DequeueReady prefers
@@ -210,6 +227,12 @@ class GuestScheduler {
     // Counts fiber dispatches on this CPU, so a yielder can tell whether
     // anything else ran before it resumed.
     std::atomic<uint64_t> switch_seq{0};
+    // Raw-tick end of an open background-scheduling window, 0 if none. While
+    // set, DequeueReady prefers the low priority band. Guarded by lock_.
+    uint64_t background_until_tick = 0;
+    // Earliest raw tick a new window may open, so the duty cycle stays put
+    // however often the vblank hook fires. Guarded by lock_.
+    uint64_t background_next_tick = 0;
     // Absolute host ms of the next forced full re-poll. Guarded by lock_.
     uint64_t next_force_repoll_ms = 0;
     // Absolute host ms of the next timed re-poll: the earliest gated
@@ -242,11 +265,19 @@ class GuestScheduler {
   // Raises preempt_requested on any CPU whose running fiber outlived its
   // slice, since a dispatch thread cannot tick while it runs a fiber.
   void WatchdogLoop();
-  // Offload path of RunBlockingHostCall: queue to the I/O worker and park.
-  void RunBlockingHostCallOffloaded(const std::function<void()>& fn);
-  // Lazily starts the single I/O worker on first RunBlockingHostCall.
+  struct BlockingCall;
+  // False once shutdown has begun.
+  bool EnqueueBlockingCall(BlockingCall* call, BlockingCallClass call_class);
+  // Lazily starts the serial I/O worker on the first kSerial offload.
   void EnsureIoWorker();
   void IoWorkerLoop();
+  // Queues a kConcurrent call, growing the pool when every worker is busy.
+  bool EnqueuePoolCall(BlockingCall* call);
+  // Caller holds io_pool_lock_.
+  void StartPoolWorkerLocked();
+  void IoPoolWorkerLoop();
+  // Runs one queued call, accumulates its counters and frees it.
+  void RunBlockingCall(BlockingCall* call);
   // Unlinks |thread| from a singly-linked list (ready_next), fixing up tail.
   static void UnlinkLocked(XThread*& head, XThread*& tail, XThread* thread);
   // Appends to a singly-linked list (ready_next), fixing up tail.
@@ -259,11 +290,20 @@ class GuestScheduler {
   void LinkReadyLocked(Cpu& cpu, XThread* thread, bool at_head);
   // Out-of-line so the yield fast path stays a single relaxed bool load.
   void ReportGlobalLockHazard();
+  // Counts and reports one starvation promotion on |cpu_index|.
+  void NoteStarvation(int cpu_index, XThread* runner, XThread* victim,
+                      uint32_t spun);
+  // Microseconds |thread| has spent in a ready list, 0 if never stamped.
+  uint64_t ready_wait_us(XThread* thread) const;
 
   KernelState* kernel_state_;
 
   // Preemption timeslice in raw host ticks, calibrated once in EnsureStarted.
   uint64_t quantum_ticks_ = 0;
+  // Length of a background-scheduling window, in raw host ticks.
+  uint64_t background_ticks_ = 0;
+  // Minimum spacing between windows, in raw host ticks.
+  uint64_t background_period_ticks_ = 0;
   std::unique_ptr<xe::threading::Thread> watchdog_thread_;
   std::unique_ptr<xe::threading::Event> watchdog_event_;
   // No-progress detection. The stall detector above only catches a CPU that
@@ -305,27 +345,40 @@ class GuestScheduler {
   std::atomic<bool> dispatched_any_{false};
   std::atomic<bool> never_dispatched_warned_{false};
 
-  // Lives on the parked caller's fiber stack, which persists until done is set.
+  // Heap-owned, deleted by the worker after running.
   struct BlockingCall {
-    const std::function<void()>* fn = nullptr;
-    std::atomic<bool> done{false};
+    std::function<void()> fn;
     // Raw host ticks when queued, for the I/O wait-time counter.
     uint64_t queued_ns = 0;
   };
   // Cheap counters for the costs this scheduler adds on a mobile SoC: how
   // often parked waiters force a dispatch CPU awake, and how long offloaded
-  // blocking calls queue behind the single I/O worker. Reported by
+  // blocking calls queue behind an I/O worker. Reported by
   // ReportStatsIfDue when guest_scheduler_stats is set.
   struct Stats {
     std::atomic<uint64_t> repolls{0};          // RereadyBlocked passes
     std::atomic<uint64_t> rereadied{0};        // waiters actually re-readied
     std::atomic<uint64_t> idle_wakes{0};       // timed wakes of a parked CPU
     std::atomic<uint64_t> switches{0};         // fiber dispatches
+    std::atomic<uint64_t> skipped_yields{0};   // yields with nothing to run
     std::atomic<uint64_t> forced_preempts{0};  // IRQL defers escaped
+    std::atomic<uint64_t> yield_downs{0};      // yields that ran a lower prio
+    // Of those, the ones the starvation escape hatch forced.
+    std::atomic<uint64_t> starvation_yields{0};
+    std::atomic<uint64_t> background_windows{0};  // vblanks that opened one
+    std::atomic<uint64_t> background_picks{0};    // dispatches the mask steered
+    // Ready-list wait before dispatch, the direct measure of priority
+    // inversion. Only accumulated while guest_scheduler_stats is set.
+    std::atomic<uint64_t> ready_wait_ticks{0};
+    std::atomic<uint64_t> ready_wait_count{0};
+    std::atomic<uint64_t> ready_wait_max_ticks{0};
     std::atomic<uint64_t> io_calls{0};
     std::atomic<uint64_t> io_queue_ns{0};  // time queued before the worker ran
     std::atomic<uint64_t> io_run_ns{0};    // time inside the blocking call
     std::atomic<uint64_t> io_queue_max_ns{0};
+    // Most pool workers inside a call at once. Queue wait cannot show this.
+    // An idle worker takes a call immediately, so it stays low either way.
+    std::atomic<uint64_t> io_peak_inflight{0};
   };
   Stats stats_;
   uint64_t stats_last_report_ms_ = 0;
@@ -339,6 +392,18 @@ class GuestScheduler {
   std::queue<BlockingCall*> io_queue_;
   std::unique_ptr<xe::threading::Thread> io_thread_;
   std::unique_ptr<xe::threading::Event> io_event_;
+
+  // Pool for the calls a device lets overlap, grown on demand. The workers
+  // sit blocked in a host read, so the bound is not a host core count.
+  static constexpr size_t kMaxIoPoolThreads = 4;
+  std::mutex io_pool_lock_;
+  std::condition_variable io_pool_cv_;
+  std::queue<BlockingCall*> io_pool_queue_;
+  std::vector<std::unique_ptr<xe::threading::Thread>> io_pool_threads_;
+  // Pool workers currently inside a call, under io_pool_lock_.
+  size_t io_pool_busy_ = 0;
+  // Mirrors io_pool_threads_.size() so the stats report skips io_pool_lock_.
+  std::atomic<size_t> io_pool_size_{0};
 };
 
 }  // namespace kernel

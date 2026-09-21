@@ -74,7 +74,6 @@ target_link_libraries(xenia-app PRIVATE
   aes_128
   capstone
   fmt
-  dxbc
   discord-rpc
   imgui
   libavcodec

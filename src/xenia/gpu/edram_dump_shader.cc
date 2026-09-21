@@ -34,6 +34,8 @@ constexpr uint32_t kResolveEdramInfoBaseTilesShift =
     xenos::kEdramPitchTilesBits + xenos::kMsaaSamplesBits + 1;
 constexpr uint32_t kResolveEdramInfoFormatShift =
     kResolveEdramInfoBaseTilesShift + xenos::kEdramBaseTilesBits;
+constexpr uint32_t kResolveEdramInfoFillHalfPixelOffsetShift =
+    kResolveEdramInfoFormatShift + xenos::kRenderTargetFormatBits + 1;
 
 constexpr uint32_t kResolveCoordinateInfoOffsetXShift = 0;
 constexpr uint32_t kResolveCoordinateInfoOffsetYShift = 4;
@@ -81,6 +83,18 @@ constexpr uint32_t TiledAddressXInMacroXor(uint32_t x,
                              (x >> 3) & 0x3, 0);
 }
 
+// XeniaTextureResolutionScaledGroupBlocksLog2 in texture_address.xesli - the
+// host blocks a resolution-scaled group holds, sized so runs along X stay at
+// least as contiguous as guest tiling makes them.
+constexpr uint32_t ResolutionScaledGroupBlocksXLog2(
+    uint32_t bytes_per_block_log2) {
+  return bytes_per_block_log2 >= 3 ? 5 - bytes_per_block_log2 : 4;
+}
+constexpr uint32_t ResolutionScaledGroupBlocksYLog2(
+    uint32_t bytes_per_block_log2) {
+  return 3 - (bytes_per_block_log2 < 2 ? bytes_per_block_log2 : 2);
+}
+
 }  // namespace
 
 std::vector<uint32_t> BuildEdramDumpShaderSpirv(
@@ -107,11 +121,6 @@ std::vector<uint32_t> BuildEdramDumpShaderSpirv(
   spv::Id type_uint4 = builder.makeVectorType(type_uint, 4);
   spv::Id type_float = builder.makeFloatType(32);
   spv::Id type_bool = builder.makeBoolType();
-
-  // A direct resolve leaves EDRAM alone, so it can't be the scaled layout or a
-  // native source dumped into one.
-  assert_false(key.direct_resolve && draw_resolution_scaled);
-  assert_false(key.direct_resolve && key.native_layout);
 
   // Bindings.
   // Destination buffer - EDRAM in whole samples, or the resolve destination
@@ -255,6 +264,16 @@ std::vector<uint32_t> BuildEdramDumpShaderSpirv(
   };
   auto multiply = [&](spv::Id a, spv::Id b) {
     return builder.createBinOp(spv::OpIMul, type_uint, a, b);
+  };
+  // The scale is a compile-time constant, so this and the group addressing it
+  // feeds drop out entirely at 1x.
+  auto scale_up = [&](spv::Id value, uint32_t scale) {
+    return scale > 1 ? multiply(value, builder.makeUintConstant(scale)) : value;
+  };
+  auto divide_down = [&](spv::Id value, uint32_t scale) {
+    return scale > 1 ? builder.createBinOp(spv::OpUDiv, type_uint, value,
+                                           builder.makeUintConstant(scale))
+                     : value;
   };
   auto equals = [&](spv::Id value, uint32_t constant) {
     return builder.createBinOp(spv::OpIEqual, type_bool, value,
@@ -489,10 +508,14 @@ std::vector<uint32_t> BuildEdramDumpShaderSpirv(
   };
 
   // Tile geometry and the per-dispatch constants, shared by both paths.
-  // Dumps for fully native resolves address the EDRAM buffer with the plain
-  // 1x1 tile layout.
+  // native_layout means the destination - the EDRAM buffer when dumping, the
+  // resolve destination when resolving directly - is the plain 1x1 layout,
+  // which is what a fully native resolve writes whatever the draw scale is.
   uint32_t layout_scale_x = key.native_layout ? 1 : options.resolution_scale_x;
   uint32_t layout_scale_y = key.native_layout ? 1 : options.resolution_scale_y;
+  // Whether the destination is the group-packed resolution-scaled layout, the
+  // host bytes of a guest block packed together after it.
+  bool dest_scaled = !key.native_layout && draw_resolution_scaled;
   uint32_t tile_width =
       (xenos::kEdramTileWidthSamples >> uint32_t(format_is_64bpp)) *
       layout_scale_x;
@@ -611,28 +634,62 @@ std::vector<uint32_t> BuildEdramDumpShaderSpirv(
     spv::Id source_pixel_x = source_sample_x, source_pixel_y = source_sample_y;
     spv::Id source_sample_id = spv::NoResult;
     if (source_is_multisampled) {
+      // source_sample_x/y hold the canonical sample coordinates within the
+      // EDRAM layout. Convert them into the pixel and the sample of the
+      // multisampled view using the canonical layout formulas, at guest pixel
+      // granularity when the layout is scaled.
+      bool layout_scaled = layout_scale_x > 1 || layout_scale_y > 1;
       spv::Id const_uint_1 = builder.makeUintConstant(1);
-      source_pixel_y = builder.createBinOp(spv::OpShiftRightLogical, type_uint,
-                                           source_sample_y, const_uint_1);
+      spv::Id const_uint_2 = builder.makeUintConstant(2);
+      spv::Id canonical_u = source_sample_x;
+      spv::Id canonical_v = source_sample_y;
+      spv::Id subpixel_x = spv::NoResult, subpixel_y = spv::NoResult;
+      spv::Id const_layout_scale_x = spv::NoResult;
+      spv::Id const_layout_scale_y = spv::NoResult;
+      if (layout_scaled) {
+        const_layout_scale_x = builder.makeUintConstant(layout_scale_x);
+        const_layout_scale_y = builder.makeUintConstant(layout_scale_y);
+        canonical_u = builder.createBinOp(
+            spv::OpUDiv, type_uint, source_sample_x, const_layout_scale_x);
+        subpixel_x = builder.createBinOp(spv::OpUMod, type_uint,
+                                         source_sample_x, const_layout_scale_x);
+        canonical_v = builder.createBinOp(
+            spv::OpUDiv, type_uint, source_sample_y, const_layout_scale_y);
+        subpixel_y = builder.createBinOp(spv::OpUMod, type_uint,
+                                         source_sample_y, const_layout_scale_y);
+      }
       if (key.msaa_samples >= xenos::MsaaSamples::k4X) {
-        source_pixel_x = builder.createBinOp(
-            spv::OpShiftRightLogical, type_uint, source_sample_x, const_uint_1);
-        // 4x MSAA source texture sample index - bit 0 for horizontal, bit 1 for
-        // vertical.
+        // 4x MSAA source texture sample index - bit 0 for horizontal, bit 1
+        // for vertical, same as the canonical layout.
+        // sample = ((u >> 1) & 1) | (((v >> 1) & 1) << 1)
         source_sample_id = builder.createQuadOp(
             spv::OpBitFieldInsert, type_uint,
-            builder.createBinOp(spv::OpBitwiseAnd, type_uint, source_sample_x,
-                                const_uint_1),
-            source_sample_y, const_uint_1, const_uint_1);
+            builder.createTriOp(spv::OpBitFieldUExtract, type_uint, canonical_u,
+                                const_uint_1, const_uint_1),
+            builder.createTriOp(spv::OpBitFieldUExtract, type_uint, canonical_v,
+                                const_uint_1, const_uint_1),
+            const_uint_1, const_uint_1);
+        // Guest pixel per axis = ((c >> 2) << 1) | (c & 1).
+        source_pixel_x = builder.createQuadOp(
+            spv::OpBitFieldInsert, type_uint, canonical_u,
+            builder.createBinOp(spv::OpShiftRightLogical, type_uint,
+                                canonical_u, const_uint_2),
+            const_uint_1, builder.makeUintConstant(31));
+        source_pixel_y = builder.createQuadOp(
+            spv::OpBitFieldInsert, type_uint, canonical_v,
+            builder.createBinOp(spv::OpShiftRightLogical, type_uint,
+                                canonical_v, const_uint_2),
+            const_uint_1, builder.makeUintConstant(31));
       } else {
-        // 2x MSAA source texture sample index - convert from the guest to
-        // the Vulkan standard sample locations.
+        // At 2x the guest sample sits in canonical U bit 1 and one guest pixel
+        // X bit sits in canonical V bit 1. Convert the guest sample index to
+        // the Vulkan standard sample order.
         source_sample_id = builder.createTriOp(
             spv::OpSelect, type_uint,
             builder.createBinOp(
-                spv::OpINotEqual, builder.makeBoolType(),
-                builder.createBinOp(spv::OpBitwiseAnd, type_uint,
-                                    source_sample_y, const_uint_1),
+                spv::OpINotEqual, type_bool,
+                builder.createBinOp(spv::OpBitwiseAnd, type_uint, canonical_u,
+                                    const_uint_2),
                 const_uint_0),
             builder.makeUintConstant(
                 draw_util::GetD3D10SampleIndexForGuest2xMSAA(
@@ -640,13 +697,43 @@ std::vector<uint32_t> BuildEdramDumpShaderSpirv(
             builder.makeUintConstant(
                 draw_util::GetD3D10SampleIndexForGuest2xMSAA(
                     0, options.msaa_2x_attachments_supported)));
+        // Guest pixel X = (u & ~2) | (v & 2).
+        source_pixel_x = builder.createBinOp(
+            spv::OpBitwiseOr, type_uint,
+            builder.createBinOp(spv::OpBitwiseAnd, type_uint, canonical_u,
+                                builder.makeUintConstant(~uint32_t(2))),
+            builder.createBinOp(spv::OpBitwiseAnd, type_uint, canonical_v,
+                                const_uint_2));
+        // Guest pixel Y = ((v & ~3) >> 1) | (v & 1).
+        source_pixel_y = builder.createBinOp(
+            spv::OpBitwiseOr, type_uint,
+            builder.createBinOp(
+                spv::OpShiftRightLogical, type_uint,
+                builder.createBinOp(spv::OpBitwiseAnd, type_uint, canonical_v,
+                                    builder.makeUintConstant(~uint32_t(3))),
+                const_uint_1),
+            builder.createBinOp(spv::OpBitwiseAnd, type_uint, canonical_v,
+                                const_uint_1));
       }
-    }
-    if (key.source_scale_native && !key.native_layout &&
-        draw_resolution_scaled) {
-      // Native source dumped to the scaled EDRAM layout. Duplicate each pixel
-      // into all the scaled sample slots covering it. Done after the sample
-      // index is extracted since MSAA isn't affected by scale.
+      if (!key.source_scale_native && layout_scaled) {
+        // Scaled source in the scaled layout. Restore the subpixel position.
+        source_pixel_x = builder.createBinOp(
+            spv::OpIAdd, type_uint,
+            builder.createBinOp(spv::OpIMul, type_uint, source_pixel_x,
+                                const_layout_scale_x),
+            subpixel_x);
+        source_pixel_y = builder.createBinOp(
+            spv::OpIAdd, type_uint,
+            builder.createBinOp(spv::OpIMul, type_uint, source_pixel_y,
+                                const_layout_scale_y),
+            subpixel_y);
+      }
+      // With a native source and a scaled layout, the guest pixel position
+      // comes directly from the source texture position, and all the scaled
+      // sample slots covering one guest sample receive its value.
+    } else if (key.source_scale_native && dest_scaled) {
+      // Native single sampled source dumped to the scaled EDRAM layout.
+      // Duplicate each pixel into all the scaled sample slots covering it.
       source_pixel_x = builder.createBinOp(
           spv::OpUDiv, type_uint, source_pixel_x,
           builder.makeUintConstant(options.resolution_scale_x));
@@ -713,28 +800,40 @@ std::vector<uint32_t> BuildEdramDumpShaderSpirv(
 
     // The tile this run falls in, and its position within it. A run never
     // crosses a tile edge - the tile is a whole number of runs wide and the
-    // dispatch starts on a tile boundary. Tiles are a power of two pixels
-    // tall, but not wide.
+    // dispatch starts on a tile boundary. Neither axis can be reduced to a
+    // shift and a mask: tiles aren't a power of two pixels wide, and an odd
+    // resolution scale makes them not a power of two tall either. Both counts
+    // are compile-time constants, so this is a shift and a mask again wherever
+    // it can be.
     spv::Id tile_x =
         add(extract(dispatch_tile, 0, xenos::kEdramPitchTilesBits),
             builder.createBinOp(spv::OpUDiv, type_uint, run_x,
                                 builder.makeUintConstant(tile_pixels_x)));
-    spv::Id tile_y = add(extract(dispatch_tile, xenos::kEdramPitchTilesBits,
-                                 xenos::kEdramPitchTilesBits),
-                         shift_right(run_y, xe::log2_floor(tile_pixels_y)));
+    spv::Id tile_y =
+        add(extract(dispatch_tile, xenos::kEdramPitchTilesBits,
+                    xenos::kEdramPitchTilesBits),
+            builder.createBinOp(spv::OpUDiv, type_uint, run_y,
+                                builder.makeUintConstant(tile_pixels_y)));
     spv::Id pixel_in_tile_x = builder.createBinOp(
         spv::OpUMod, type_uint, run_x, builder.makeUintConstant(tile_pixels_x));
-    spv::Id pixel_in_tile_y = bitwise_and(run_y, tile_pixels_y - 1);
+    spv::Id pixel_in_tile_y = builder.createBinOp(
+        spv::OpUMod, type_uint, run_y, builder.makeUintConstant(tile_pixels_y));
 
     // The destination pixel, relative to the resolve rectangle. The first tile
     // starts before it when the rectangle is offset within the tile, and those
     // pixels wrap around to fail the width comparison.
-    spv::Id resolve_offset_x = shift_left(
-        extract(resolve_coordinate_info, kResolveCoordinateInfoOffsetXShift, 4),
-        xenos::kResolveAlignmentPixelsLog2);
-    spv::Id resolve_offset_y = shift_left(
-        extract(resolve_coordinate_info, kResolveCoordinateInfoOffsetYShift, 1),
-        xenos::kResolveAlignmentPixelsLog2);
+    // dest_x/dest_y are host pixels because the tile geometry above is, so
+    // every guest-pixel quantity they're compared or combined with is scaled.
+    spv::Id resolve_offset_x =
+        scale_up(shift_left(extract(resolve_coordinate_info,
+                                    kResolveCoordinateInfoOffsetXShift, 4),
+                            xenos::kResolveAlignmentPixelsLog2),
+                 layout_scale_x);
+    spv::Id resolve_offset_y =
+        scale_up(shift_left(extract(resolve_coordinate_info,
+                                    kResolveCoordinateInfoOffsetYShift, 1),
+                            xenos::kResolveAlignmentPixelsLog2),
+                 layout_scale_y);
     spv::Id dest_x = builder.createBinOp(
         spv::OpISub, type_uint,
         add(multiply(tile_x, builder.makeUintConstant(tile_pixels_x)),
@@ -747,28 +846,68 @@ std::vector<uint32_t> BuildEdramDumpShaderSpirv(
         resolve_offset_y);
     spv::Id write_condition = builder.createBinOp(
         spv::OpLogicalAnd, type_bool,
-        builder.createBinOp(spv::OpULessThan, type_bool, dest_x,
-                            shift_left(extract(resolve_coordinate_info,
-                                               kResolveCoordinateInfoWidthShift,
-                                               kResolveCoordinateInfoWidthBits),
-                                       xenos::kResolveAlignmentPixelsLog2)),
+        builder.createBinOp(
+            spv::OpULessThan, type_bool, dest_x,
+            scale_up(shift_left(extract(resolve_coordinate_info,
+                                        kResolveCoordinateInfoWidthShift,
+                                        kResolveCoordinateInfoWidthBits),
+                                xenos::kResolveAlignmentPixelsLog2),
+                     layout_scale_x)),
         builder.createBinOp(
             spv::OpULessThan, type_bool, dest_y,
-            shift_left(load_push_constant(
-                           kEdramDumpShaderPushConstantResolveHeightDiv8),
-                       xenos::kResolveAlignmentPixelsLog2)));
+            scale_up(
+                shift_left(load_push_constant(
+                               kEdramDumpShaderPushConstantResolveHeightDiv8),
+                           xenos::kResolveAlignmentPixelsLog2),
+                layout_scale_y)));
 
-    // The sample this pixel resolves from, following XeEdramOffsetBytes: the
-    // pixel scaled by the MSAA dimensions, plus bit 1 of the sample index on X
-    // and bit 0 on Y. Eligibility guarantees a single selected sample, so
-    // XeResolveFirstSampleIndex is the raw field.
+    // The half-pixel offset fill hack, which the scaled copy shaders apply and
+    // a direct resolve has to reproduce: the first surely covered host column
+    // and row are stretched into the gap the D3D9 half-pixel offset leaves on
+    // the left and top sides of the resolve area. Expressed as a bias on the
+    // source position, since the destination position is what's covered - and
+    // the band is at most half the scale wide, so only the first few pixels of
+    // a run can fall in it.
+    uint32_t fill_extent_x = dest_scaled ? layout_scale_x >> 1 : 0;
+    uint32_t fill_extent_y = dest_scaled ? layout_scale_y >> 1 : 0;
+    spv::Id fill_bias_y = spv::NoResult;
+    std::vector<spv::Id> fill_bias_x(fill_extent_x);
+    if (fill_extent_x || fill_extent_y) {
+      spv::Id fill_enabled = builder.createBinOp(
+          spv::OpINotEqual, type_bool,
+          bitwise_and(resolve_edram_info,
+                      uint32_t(1) << kResolveEdramInfoFillHalfPixelOffsetShift),
+          const_uint_0);
+      // How far past a destination coordinate the fill source sits, 0 outside
+      // the band. Unwritten pixels wrap around to huge values, which take the
+      // same zero branch as anything past it.
+      auto fill_bias = [&](spv::Id dest_coordinate, uint32_t fill_extent) {
+        spv::Id fill_offset = builder.createTriOp(
+            spv::OpSelect, type_uint, fill_enabled,
+            builder.makeUintConstant(fill_extent), const_uint_0);
+        return builder.createTriOp(
+            spv::OpSelect, type_uint,
+            builder.createBinOp(spv::OpULessThan, type_bool, dest_coordinate,
+                                fill_offset),
+            builder.createBinOp(spv::OpISub, type_uint, fill_offset,
+                                dest_coordinate),
+            const_uint_0);
+      };
+      if (fill_extent_y) {
+        fill_bias_y = fill_bias(dest_y, fill_extent_y);
+      }
+      for (uint32_t i = 0; i < fill_extent_x; ++i) {
+        fill_bias_x[i] =
+            fill_bias(i ? add(dest_x, builder.makeUintConstant(i)) : dest_x,
+                      fill_extent_x);
+      }
+    }
+
+    // The sample this pixel resolves from. Eligibility guarantees a single
+    // selected sample, so XeResolveFirstSampleIndex is the raw field.
     spv::Id sample_select =
         extract(resolve_dest_coordinate_info,
                 kResolveDestCoordinateInfoSampleSelectShift, 3);
-    spv::Id tile_sample_x = add(shift_left(pixel_in_tile_x, msaa_x_log2),
-                                bitwise_and(shift_right(sample_select, 1), 1));
-    spv::Id tile_sample_y = add(shift_left(pixel_in_tile_y, msaa_y_log2),
-                                bitwise_and(sample_select, 1));
     spv::Id edram_tile_index =
         add(add(extract(resolve_edram_info, kResolveEdramInfoBaseTilesShift,
                         xenos::kEdramBaseTilesBits),
@@ -788,38 +927,44 @@ std::vector<uint32_t> BuildEdramDumpShaderSpirv(
     spv::Id source_pitch_tiles = builder.createTriOp(
         spv::OpBitFieldUExtract, type_uint, pitches_constant,
         const_edram_pitch_tiles_bits, const_edram_pitch_tiles_bits);
-    spv::Id source_sample_x = add(
-        multiply(const_tile_width,
+
+    // The canonical sample rearrangement of XeEdramOffsetBytes only permutes
+    // the samples within a tile, so the source pixel is the source tile's
+    // origin plus the position within the tile, and the selected sample is the
+    // same for every pixel of the run.
+    spv::Id source_pixel_x = add(
+        multiply(builder.makeUintConstant(tile_pixels_x),
                  builder.createBinOp(spv::OpUMod, type_uint, source_tile_index,
                                      source_pitch_tiles)),
-        tile_sample_x);
-    spv::Id source_sample_y = add(
-        multiply(const_tile_height,
+        pixel_in_tile_x);
+    spv::Id source_pixel_y = add(
+        multiply(builder.makeUintConstant(tile_pixels_y),
                  builder.createBinOp(spv::OpUDiv, type_uint, source_tile_index,
                                      source_pitch_tiles)),
-        tile_sample_y);
-
-    // The sample index is uniform across the run - the MSAA shift puts the
-    // selected sample's bits below the pixel, and the run only advances the
-    // pixel.
-    spv::Id source_pixel_x = shift_right(source_sample_x, msaa_x_log2);
-    spv::Id source_pixel_y = shift_right(source_sample_y, msaa_y_log2);
+        pixel_in_tile_y);
+    if (fill_bias_y != spv::NoResult) {
+      source_pixel_y = add(source_pixel_y, fill_bias_y);
+    }
+    // A native render target feeding a scaled destination has one texel per
+    // guest pixel, so every host pixel covering it reads the same one. X is
+    // divided per pixel of the run below, after the run offset is added.
+    bool source_native_in_scaled_dest = key.source_scale_native && dest_scaled;
+    if (source_native_in_scaled_dest) {
+      source_pixel_y = divide_down(source_pixel_y, options.resolution_scale_y);
+    }
     spv::Id source_sample_id = spv::NoResult;
     if (source_is_multisampled) {
-      spv::Id const_uint_1 = builder.makeUintConstant(1);
       if (key.msaa_samples >= xenos::MsaaSamples::k4X) {
-        // 4x MSAA source texture sample index - bit 0 for horizontal, bit 1
-        // for vertical.
-        source_sample_id = builder.createQuadOp(
-            spv::OpBitFieldInsert, type_uint, bitwise_and(source_sample_x, 1),
-            source_sample_y, const_uint_1, const_uint_1);
+        // The guest 4x sample numbering matches the host one, bit 0 horizontal
+        // and bit 1 vertical, so the selected sample passes through.
+        source_sample_id = bitwise_and(sample_select, 3);
       } else {
         // 2x MSAA source texture sample index - convert from the guest to the
         // Vulkan standard sample locations.
         source_sample_id = builder.createTriOp(
             spv::OpSelect, type_uint,
             builder.createBinOp(spv::OpINotEqual, type_bool,
-                                bitwise_and(source_sample_y, 1), const_uint_0),
+                                bitwise_and(sample_select, 1), const_uint_0),
             builder.makeUintConstant(
                 draw_util::GetD3D10SampleIndexForGuest2xMSAA(
                     1, options.msaa_2x_attachments_supported)),
@@ -839,9 +984,15 @@ std::vector<uint32_t> BuildEdramDumpShaderSpirv(
                                     dwords_per_pixel);
     for (uint32_t i = 0; i < pixels_per_thread; ++i) {
       spv::Id pixel_packed[2] = {};
-      load_and_pack(
-          i ? add(source_pixel_x, builder.makeUintConstant(i)) : source_pixel_x,
-          source_pixel_y, source_sample_id, pixel_packed);
+      spv::Id pixel_x =
+          i ? add(source_pixel_x, builder.makeUintConstant(i)) : source_pixel_x;
+      if (i < fill_extent_x) {
+        pixel_x = add(pixel_x, fill_bias_x[i]);
+      }
+      if (source_native_in_scaled_dest) {
+        pixel_x = divide_down(pixel_x, options.resolution_scale_x);
+      }
+      load_and_pack(pixel_x, source_pixel_y, source_sample_id, pixel_packed);
       for (uint32_t j = 0; j < dwords_per_pixel; ++j) {
         run_packed[i * dwords_per_pixel + j] = pixel_packed[j];
       }
@@ -958,18 +1109,62 @@ std::vector<uint32_t> BuildEdramDumpShaderSpirv(
     }
 
     // XeResolveDestPixelAddress for the start of the run, then
-    // XenosTextureTiledAddressXInMacroXor to step to the second block -
-    // within a run, consecutive pixels are consecutive in the tiled layout,
-    // but the two halves are not adjacent.
+    // XeResolveLocalXAddressXor to step to the second block - within a run,
+    // consecutive pixels are consecutive in both layouts, but in the tiled one
+    // the two halves are not adjacent.
     spv::Id tiled_x = add(
-        dest_x, shift_left(extract(resolve_dest_coordinate_info,
-                                   kResolveDestCoordinateInfoOffsetXShift, 4),
-                           xenos::kResolveAlignmentPixelsLog2));
+        dest_x,
+        scale_up(shift_left(extract(resolve_dest_coordinate_info,
+                                    kResolveDestCoordinateInfoOffsetXShift, 4),
+                            xenos::kResolveAlignmentPixelsLog2),
+                 layout_scale_x));
     spv::Id tiled_y = add(
-        dest_y, shift_left(extract(resolve_dest_coordinate_info,
-                                   kResolveDestCoordinateInfoOffsetYShift, 4),
-                           xenos::kResolveAlignmentPixelsLog2));
+        dest_y,
+        scale_up(shift_left(extract(resolve_dest_coordinate_info,
+                                    kResolveDestCoordinateInfoOffsetYShift, 4),
+                            xenos::kResolveAlignmentPixelsLog2),
+                 layout_scale_y));
     uint32_t bytes_per_block_log2 = 2 + uint32_t(format_is_64bpp);
+    // XeniaTextureGetResolutionScaledAddressing. A scaled destination tiles
+    // whole guest groups, and packs the host bytes covering a guest group
+    // together after its tiled address - so the tiled maths below runs on the
+    // guest group origin, and what's left of the position becomes a byte
+    // offset within the group. The run of pixels a thread stores stays inside
+    // one host group: it starts group-aligned and is no wider than the group.
+    spv::Id host_byte_offset_in_guest_group = spv::NoResult;
+    if (dest_scaled) {
+      uint32_t group_blocks_x_log2 =
+          ResolutionScaledGroupBlocksXLog2(bytes_per_block_log2);
+      uint32_t group_blocks_y_log2 =
+          ResolutionScaledGroupBlocksYLog2(bytes_per_block_log2);
+      spv::Id host_group_x = shift_right(tiled_x, group_blocks_x_log2);
+      spv::Id host_group_y = shift_right(tiled_y, group_blocks_y_log2);
+      spv::Id guest_group_x = divide_down(host_group_x, layout_scale_x);
+      spv::Id guest_group_y = divide_down(host_group_y, layout_scale_y);
+      spv::Id host_group_in_guest_x =
+          builder.createBinOp(spv::OpISub, type_uint, host_group_x,
+                              scale_up(guest_group_x, layout_scale_x));
+      spv::Id host_group_in_guest_y =
+          builder.createBinOp(spv::OpISub, type_uint, host_group_y,
+                              scale_up(guest_group_y, layout_scale_y));
+      // Host groups are column-major within a guest group.
+      spv::Id host_group_index =
+          add(scale_up(host_group_in_guest_x, layout_scale_y),
+              host_group_in_guest_y);
+      uint32_t group_width_bytes_log2 =
+          group_blocks_x_log2 + bytes_per_block_log2;
+      uint32_t group_blocks_x_mask = (uint32_t(1) << group_blocks_x_log2) - 1;
+      uint32_t group_blocks_y_mask = (uint32_t(1) << group_blocks_y_log2) - 1;
+      host_byte_offset_in_guest_group = bitwise_or(
+          bitwise_or(shift_left(host_group_index,
+                                group_width_bytes_log2 + group_blocks_y_log2),
+                     shift_left(bitwise_and(tiled_y, group_blocks_y_mask),
+                                group_width_bytes_log2)),
+          shift_left(bitwise_and(tiled_x, group_blocks_x_mask),
+                     bytes_per_block_log2));
+      tiled_x = shift_left(guest_group_x, group_blocks_x_log2);
+      tiled_y = shift_left(guest_group_y, group_blocks_y_log2);
+    }
     spv::Id dest_pitch_macro_tiles = extract(
         resolve_dest_coordinate_info, 0, kResolveDestCoordinateInfoPitchBits);
     // XenosTextureTiledAddressCombine.
@@ -1045,15 +1240,24 @@ std::vector<uint32_t> BuildEdramDumpShaderSpirv(
                                                << kResolveDestInfoIsArrayShift),
             const_uint_0),
         address_3d, address_2d);
-    dest_address =
-        add(dest_address,
-            load_push_constant(kEdramDumpShaderPushConstantResolveDestBase));
+    if (dest_scaled) {
+      dest_address =
+          add(scale_up(dest_address, layout_scale_x * layout_scale_y),
+              host_byte_offset_in_guest_group);
+    } else {
+      dest_address =
+          add(dest_address,
+              load_push_constant(kEdramDumpShaderPushConstantResolveDestBase));
+    }
 
     for (uint32_t block = 0; block < 2; ++block) {
       spv::Id block_address =
           block ? add(dest_address,
-                      builder.makeUintConstant(TiledAddressXInMacroXor(
-                          pixels_per_store, bytes_per_block_log2)))
+                      builder.makeUintConstant(
+                          dest_scaled
+                              ? pixels_per_store << bytes_per_block_log2
+                              : TiledAddressXInMacroXor(pixels_per_store,
+                                                        bytes_per_block_log2)))
                 : dest_address;
       spv::Id block_index = shift_right(block_address, 4);
       // Four dwords either way - four 32bpp pixels, or two 64bpp ones.

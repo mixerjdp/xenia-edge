@@ -3568,8 +3568,11 @@ bool MetalRenderTargetCache::Resolve(Memory& memory, uint32_t& written_address,
   // RT ownership into EDRAM, then resolve from EDRAM to shared memory.
   // Resolve-time blend fallback is not correct because blending state is
   // per-draw, not per-resolve.
+  // Metal's direct resolve only ever writes shared memory - it has neither the
+  // native 1x1 copy nor a binding of the resolution-scaled resolve buffer, so
+  // anything under scaling takes the EDRAM round trip.
   bool resolved_directly = false;
-  if (::cvars::direct_host_resolve &&
+  if (::cvars::direct_host_resolve && !draw_resolution_scaled &&
       GetDirectResolveEligibility(resolve_info, copy_shader) ==
           DirectResolveEligibility::kEligible) {
     resolved_directly = DirectResolveRenderTargets(

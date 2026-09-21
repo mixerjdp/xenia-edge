@@ -36,9 +36,10 @@
 // them verbatim before it includes microprofile for the implementation. Keep
 // the two lists in sync.
 #define MICROPROFILE_MAX_THREADS 256
-// Do not raise. One token is taken per guest function and the table saturating
-// is what stops FTRACE logging every guest call: past the cap GetToken hands
-// back MICROPROFILE_INVALID_TOKEN, which MicroProfileEnter drops on the floor.
+// Do not raise. One token is taken per guest function and the guest budget in
+// profiling.cc is what stops FTRACE logging every guest call: past it
+// GetGuestFunctionToken hands back MICROPROFILE_INVALID_TOKEN, which
+// MicroProfileEnter drops on the floor.
 // With more tokens the command processor thread overruns its log ring within a
 // frame and microprofile's asserts, which are live in release builds, fire.
 // Per function execution counts come from the coverage counters instead.

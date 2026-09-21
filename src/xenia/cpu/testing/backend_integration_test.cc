@@ -14,6 +14,12 @@
 #include <cstring>
 
 #include "xenia/base/platform.h"
+#if XE_ARCH_AMD64
+#include "xenia/cpu/backend/x64/x64_code_cache.h"
+#elif XE_ARCH_ARM64
+#include "xenia/cpu/backend/a64/a64_code_cache.h"
+#include "xenia/cpu/backend/a64/a64_stack_layout.h"
+#endif  // XE_ARCH
 
 using namespace xe;
 using namespace xe::cpu;
@@ -1273,5 +1279,132 @@ TEST_CASE("PPC_RESTGPRLR_INLINED_TAIL_DISPATCH", "[backend]") {
   REQUIRE(ctx->lr == kTailTargetAddr);
 
   memory->SystemHeapFree(frame_address);
+  memory->SystemHeapFree(stack_address);
+}
+
+// =============================================================================
+// Stackpoints describe the frame they were recorded in
+// =============================================================================
+// A stackpoint is recorded once the prolog has allocated the frame, so
+// host_stack_ is that frame's own stack pointer. The sync helper restores it as
+// it stands and ResolveDynamicReturn reads the host return address at a fixed
+// offset from it, neither of which a test can reach through a longjmp.
+
+#if XE_ARCH_AMD64
+using ProbeBackend = xe::cpu::backend::x64::X64Backend;
+#elif XE_ARCH_ARM64
+using ProbeBackend = xe::cpu::backend::a64::A64Backend;
+#endif  // XE_ARCH
+
+namespace {
+std::atomic<int> stackpoint_probe_calls{0};
+uint32_t probe_depth = 0;
+uint64_t probe_host_stacks[2] = {0, 0};
+uint32_t probe_guest_stacks[2] = {0, 0};
+uint64_t probe_host_return = 0;
+
+// Runs with the caller and callee guest frames both live.
+void StackpointProbeHandler(ppc::PPCContext* ctx, void* arg0, void* arg1) {
+  stackpoint_probe_calls.fetch_add(1);
+  auto backend = static_cast<ProbeBackend*>(ctx->processor->backend());
+  auto bctx = backend->BackendContextForGuestContext(ctx);
+  probe_depth = bctx->current_stackpoint_depth;
+  if (!bctx->stackpoints || probe_depth < 2) {
+    return;
+  }
+  for (int i = 0; i < 2; ++i) {
+    probe_host_stacks[i] = bctx->stackpoints[i].host_stack_;
+    probe_guest_stacks[i] = bctx->stackpoints[i].guest_stack_;
+  }
+#if XE_ARCH_AMD64
+  // Read it the way ResolveDynamicReturn does, below the caller's record.
+  probe_host_return = *reinterpret_cast<const uint64_t*>(
+      bctx->stackpoints[0].host_stack_ - sizeof(uint64_t));
+#elif XE_ARCH_ARM64
+  // Read it the way ResolveDynamicReturn does, inside the callee's frame.
+  probe_host_return = *reinterpret_cast<const uint64_t*>(
+      bctx->stackpoints[1].host_stack_ +
+      xe::cpu::backend::a64::StackLayout::HOST_RET_ADDR);
+#endif  // XE_ARCH
+}
+}  // namespace
+
+TEST_CASE("STACKPOINT_DESCRIBES_ITS_OWN_FRAME", "[backend]") {
+  constexpr uint32_t kProbeCallerAddr = 0x80000000;
+  constexpr uint32_t kProbeCalleeAddr = 0x80001000;
+
+  stackpoint_probe_calls = 0;
+  probe_depth = 0;
+  probe_host_return = 0;
+
+  auto memory = std::make_unique<Memory>();
+  memory->Initialize();
+
+  auto backend = CreateBackend();
+  REQUIRE(backend);
+
+  auto processor = std::make_unique<Processor>(memory.get(), nullptr);
+  processor->Setup(std::move(backend));
+
+  auto* probe_fn = processor->DefineBuiltin(
+      "StackpointProbe", StackpointProbeHandler, nullptr, nullptr);
+  REQUIRE(probe_fn != nullptr);
+
+  int gen_invocation = 0;
+  Function* callee_fn = nullptr;
+  auto module_owner = std::make_unique<TestModule>(
+      processor.get(), "Test",
+      [](uint32_t address) {
+        return address == kProbeCallerAddr || address == kProbeCalleeAddr;
+      },
+      [&](HIRBuilder& b) {
+        if (gen_invocation++ == 0) {
+          b.CallExtern(probe_fn);
+          b.Return();
+        } else {
+          REQUIRE(callee_fn != nullptr);
+          b.Call(callee_fn);
+          b.Return();
+        }
+        return true;
+      },
+      /*skip_cf_simplification=*/true);
+  processor->AddModule(std::move(module_owner));
+  processor->backend()->CommitExecutableRange(kProbeCallerAddr,
+                                              kProbeCalleeAddr + 0x1000);
+
+  callee_fn = processor->ResolveFunction(kProbeCalleeAddr);
+  REQUIRE(callee_fn != nullptr);
+  auto* caller_fn = processor->ResolveFunction(kProbeCallerAddr);
+  REQUIRE(caller_fn != nullptr);
+
+  uint32_t stack_size = 64 * 1024;
+  uint32_t stack_address = memory->SystemHeapAlloc(stack_size);
+  auto thread_state = std::make_unique<ThreadState>(processor.get(), 0x100,
+                                                    stack_address + stack_size);
+  auto ctx = thread_state->context();
+  ctx->lr = 0xBCBCBCBC;
+  const uint32_t entry_guest_stack = uint32_t(ctx->r[1]);
+
+  caller_fn->Call(thread_state.get(), uint32_t(ctx->lr));
+
+  REQUIRE(stackpoint_probe_calls == 1);
+  // Both guest frames were recorded, the caller at 0 and the callee at 1.
+  REQUIRE(probe_depth == 2);
+  // A frame's own stack pointer is 16 byte aligned. A record taken before the
+  // prolog allocated would hold the entry stack pointer, which on x64 still
+  // carries the pushed return address and is 8 off.
+  REQUIRE(probe_host_stacks[0] % 16 == 0);
+  REQUIRE(probe_host_stacks[1] % 16 == 0);
+  REQUIRE(probe_host_stacks[1] < probe_host_stacks[0]);
+  // Neither function touches r1.
+  REQUIRE(probe_guest_stacks[0] == entry_guest_stack);
+  REQUIRE(probe_guest_stacks[1] == entry_guest_stack);
+  // The host return address ResolveDynamicReturn reads lands in the caller.
+  REQUIRE(probe_host_return != 0);
+  auto* code_cache =
+      static_cast<ProbeBackend*>(processor->backend())->code_cache();
+  REQUIRE(code_cache->LookupFunction(probe_host_return) == caller_fn);
+
   memory->SystemHeapFree(stack_address);
 }

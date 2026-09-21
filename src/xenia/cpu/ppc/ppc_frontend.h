@@ -44,7 +44,6 @@ class PPCFrontend {
   bool Initialize();
 
   Processor* processor() const { return processor_; }
-  Memory* memory() const;
   PPCBuiltins* builtins() { return &builtins_; }
 
   bool DeclareFunction(GuestFunction* function);

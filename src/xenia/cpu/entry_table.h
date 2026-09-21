@@ -10,11 +10,11 @@
 #ifndef XENIA_CPU_ENTRY_TABLE_H_
 #define XENIA_CPU_ENTRY_TABLE_H_
 
+#include <map>
 #include <unordered_map>
 #include <vector>
 
 #include "xenia/base/mutex.h"
-#include "xenia/base/split_map.h"
 namespace xe {
 namespace cpu {
 
@@ -52,14 +52,18 @@ class EntryTable {
   void MarkReady(Entry* entry, Function* function, uint32_t end_address);
   void MarkFailed(Entry* entry);
   void Delete(uint32_t address);
+  // Drops every ready entry overlapping [start, end] and returns what they
+  // compiled, so the caller can let their modules forget them too.
+  std::vector<Function*> DeleteRange(uint32_t start, uint32_t end);
 
   std::vector<Function*> FindWithAddress(uint32_t address);
 
  private:
   xe::global_critical_region global_critical_region_;
-  // TODO(benvanik): replace with a better data structure.
-  xe::split_map<uint32_t, Entry*> map_;
-  // std::unordered_map<uint32_t, Entry*> map_;
+  std::unordered_map<uint32_t, Entry*> map_;
+  // Ready entries by start address, for range scans.
+  std::map<uint32_t, Entry*> ready_by_address_;
+  uint32_t max_ready_span_ = 0;
 };
 
 }  // namespace cpu

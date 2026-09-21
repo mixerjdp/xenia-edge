@@ -276,9 +276,8 @@ void Presenter::PaintFromUIThread(bool force_paint) {
       // is consistent with painting from the UI thread.
       SetPaintModeFromUIThread(PaintMode::kUIThreadOnRequest);
 
-      // Record whether a new guest output frame arrived since the previous
-      // paint. UI drawers and the UI tick rate limit use it to avoid presenting
-      // faster than the guest produces frames.
+      // Whether a guest frame arrived since the previous paint, used by the
+      // UI tick rate limit to avoid outpacing the guest
       uint64_t guest_output_refresh_count =
           guest_output_refresh_count_.load(std::memory_order_relaxed);
       guest_output_drove_current_ui_paint_ =
@@ -432,6 +431,9 @@ bool Presenter::RefreshGuestOutput(
   // Count this frame so the UI thread can tell the guest output is driving the
   // paint cadence and UI drawers don't request extra repaints on top of it.
   guest_output_refresh_count_.fetch_add(1, std::memory_order_relaxed);
+  guest_output_last_refresh_ticks_.store(
+      std::chrono::steady_clock::now().time_since_epoch().count(),
+      std::memory_order_relaxed);
 
   // Trigger the presentation on the host.
   PaintResult paint_result = PaintResult::kNotPresented;
@@ -577,6 +579,14 @@ void Presenter::RemoveUIDrawerFromUIThread(UIDrawer* drawer) {
     HandleUIDrawersChangeFromUIThread(false);
     return;
   }
+}
+
+bool Presenter::IsGuestOutputDrivingPaints() const {
+  std::chrono::steady_clock::time_point last_refresh(
+      std::chrono::steady_clock::duration(
+          guest_output_last_refresh_ticks_.load(std::memory_order_relaxed)));
+  return std::chrono::steady_clock::now() - last_refresh <
+         std::chrono::milliseconds(kGuestOutputStallTimeoutMillis);
 }
 
 void Presenter::RequestUIPaintFromUIThread() {

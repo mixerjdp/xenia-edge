@@ -574,15 +574,60 @@ def get_cc(cc=None):
         return (cc, cc + "++")
     return (os.environ.get("CC", "clang"), os.environ.get("CXX", "clang++"))
 
+def resolve_python_launcher(binary):
+    """Maps a pip console-script .exe to the native binary it wraps.
+
+    These launchers restart Python on every call, which dominates the runtime
+    of per-file loops. Returns None when binary is not such a launcher or the
+    wheel ships no native binary.
+    """
+    if sys.platform != "win32":
+        return None
+    try:
+        # Real toolchain binaries are megabytes, the launcher stub is ~100 KB.
+        if os.path.getsize(binary) > 512 * 1024:
+            return None
+        with zipfile.ZipFile(binary) as launcher:
+            entry = launcher.read("__main__.py").decode("utf-8", "replace")
+    except (OSError, KeyError, zipfile.BadZipFile):
+        return None
+    module = None
+    for line in entry.splitlines():
+        parts = line.split()
+        if len(parts) >= 4 and parts[0] == "from" and parts[2] == "import":
+            module = parts[1]
+            break
+    # A dotted import means a Python entry point, so there is nothing to skip to.
+    if not module or "." in module:
+        return None
+    # Wheels carrying a binary place it in <module>/data/bin.
+    scripts_dir = os.path.dirname(os.path.abspath(binary))
+    for site_dir in ("site-packages", os.path.join("Lib", "site-packages")):
+        native = os.path.join(os.path.dirname(scripts_dir), site_dir, module,
+                              "data", "bin", os.path.basename(binary))
+        if os.path.isfile(native):
+            return native
+    return None
+
+
 def get_clang_format_binary():
     # Use pre-vsvars PATH so VS's bundled Llvm clang-format doesn't shadow the user's.
     binary = shutil_which("clang-format", path=_user_path) or "clang-format"
     try:
         out = subprocess.check_output([binary, "--version"], text=True)
-        print(out)
     except (subprocess.CalledProcessError, OSError):
         print_error("clang-format is not on PATH")
         sys.exit(1)
+    native = resolve_python_launcher(binary)
+    if native:
+        try:
+            # Only skip the launcher if it really fronts this binary.
+            if subprocess.check_output([native, "--version"], text=True) == out:
+                binary = native
+                print(f"- skipping Python launcher, using {native}")
+        except (subprocess.CalledProcessError, OSError):
+            pass
+    print(out)
     return binary
 
 
@@ -788,8 +833,8 @@ def download_slang():
 def run_cmake_configure(cc=None, generator=None, build_tests=False,
                         disable_lto=False, enable_profiler=False,
                         enable_itrace=False, enable_dtrace=False,
-                        enable_ftrace=False, build_misc=False,
-                        build_libretro=False,
+                        enable_ftrace=False, enable_gpu_trace=False,
+                        build_misc=False, build_libretro=False,
                         target_arch=None, config=None):
     """Runs `cmake` to (re)configure build/ from the source root.
 
@@ -800,7 +845,9 @@ def run_cmake_configure(cc=None, generator=None, build_tests=False,
     (faster Release link, at the cost of LTO's whole-program opts);
     enable_profiler toggles -DXENIA_ENABLE_PROFILER=ON (microprofile
     instrumentation; UI overlay only in Debug, profile.html dump on
-    shutdown otherwise); build_misc toggles -DXENIA_BUILD_MISC=ON (trace
+    shutdown otherwise); enable_gpu_trace toggles
+    -DXENIA_ENABLE_GPU_TRACE=ON (GPU trace capture in Release, which
+    Debug always has); build_misc toggles -DXENIA_BUILD_MISC=ON (trace
     viewers and dumps, shader compiler, vfs-dump, demos);
     build_libretro toggles -DXENIA_BUILD_LIBRETRO=ON (the
     xenia_libretro shared library for libretro frontends).
@@ -898,6 +945,8 @@ def run_cmake_configure(cc=None, generator=None, build_tests=False,
     args += [f"-DXENIA_ENABLE_ITRACE={'ON' if enable_itrace else 'OFF'}"]
     args += [f"-DXENIA_ENABLE_DTRACE={'ON' if enable_dtrace else 'OFF'}"]
     args += [f"-DXENIA_ENABLE_FTRACE={'ON' if enable_ftrace else 'OFF'}"]
+    args += [
+        f"-DXENIA_ENABLE_GPU_TRACE={'ON' if enable_gpu_trace else 'OFF'}"]
     args += [f"-DXENIA_BUILD_MISC={'ON' if build_misc else 'OFF'}"]
     args += [f"-DXENIA_BUILD_LIBRETRO={'ON' if build_libretro else 'OFF'}"]
     if config:
@@ -1177,6 +1226,12 @@ class BaseBuildCommand(Command):
             help="Enables JIT per-function-call tracing to the log (sets "
                  "-DXENIA_ENABLE_FTRACE=ON). For debugging only.")
         self.parser.add_argument(
+            "--enable-gpu-trace", dest="enable_gpu_trace",
+            action="store_true", default=False,
+            help="Enables GPU trace capture in Release builds (sets "
+                 "-DXENIA_ENABLE_GPU_TRACE=ON). Debug always has it. Costs "
+                 "0.40-0.60%% CPU from the trace hooks.")
+        self.parser.add_argument(
             "--build-misc", dest="build_misc", action="store_true",
             default=False,
             help="Enables building the misc subprojects (sets "
@@ -1206,6 +1261,7 @@ class BaseBuildCommand(Command):
                 enable_itrace=args["enable_itrace"],
                 enable_dtrace=args["enable_dtrace"],
                 enable_ftrace=args["enable_ftrace"],
+                enable_gpu_trace=args["enable_gpu_trace"],
                 build_misc=args["build_misc"],
                 build_libretro=args["build_libretro"],
                 target_arch=target_arch,
@@ -1469,12 +1525,28 @@ class GenTestsCommand(Command):
                 shell_call([f"./{shell_script}"])
                 os.chdir(original_dir)
             elif sys.platform == "win32":
-                # On Windows, add Cygwin to PATH and run bash
-                cygwin_bin = r"C:\cygwin64\bin"
-                os.environ["PATH"] = f"{cygwin_bin}{os.pathsep}{os.environ['PATH']}"
+                # Absolute bash path: a bare "bash" may resolve to WSL and
+                # build Linux binaries.
+                msys2_bash = r"C:\msys64\usr\bin\bash.exe"
+                cygwin_bash = r"C:\cygwin64\bin\bash.exe"
+                env = os.environ.copy()
+                if os.path.exists(msys2_bash):
+                    env["MSYSTEM"] = "MINGW64"
+                    env["CHERE_INVOKING"] = "1"
+                    command = [msys2_bash, "-l", shell_script]
+                elif os.path.exists(cygwin_bash):
+                    env["PATH"] = f"{os.path.dirname(cygwin_bash)}{os.pathsep}{env['PATH']}"
+                    command = [cygwin_bash, "-o", "igncr", shell_script]
+                else:
+                    print_error("binutils build requires MSYS2 (C:\\msys64) or Cygwin (C:\\cygwin64).")
+                    return 1
                 os.chdir(binutils_dir)
-                shell_call(["bash", shell_script])
+                subprocess.check_call(command, env=env)
                 os.chdir(original_dir)
+
+            if not os.path.exists(ppc_as_check):
+                print_error(f"binutils build did not produce {ppc_as_check}.")
+                return 1
 
         test_src = os.path.join("src", "xenia", "cpu", "ppc", "testing")
         test_bin = os.path.join(test_src, "bin")

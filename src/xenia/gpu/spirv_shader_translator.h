@@ -36,13 +36,12 @@ namespace gpu {
 class SpirvShaderTranslator : public ShaderTranslator {
  public:
   union Modification {
-    // If anything in this is structure is changed in a way not compatible with
+    // If anything in this structure is changed in a way not compatible with
     // the previous layout, invalidate the pipeline storages by increasing this
-    // version number (0xYYYYMMDD)!
-    // TODO(Triang3l): Change to 0xYYYYMMDD once it's out of the rapid
-    // prototyping stage (easier to do small granular updates with an
-    // incremental counter).
-    static constexpr uint32_t kVersion = 20;
+    // version number! Backends add it to their dated
+    // PipelineDescription::kVersion, so bumping either one is enough. Only
+    // ever raise it, a reverted layout change needs another bump.
+    static constexpr uint32_t kVersion = 22;
 
     enum class DepthStencilMode : uint32_t {
       kNoModifiers,
@@ -115,7 +114,9 @@ class SpirvShaderTranslator : public ShaderTranslator {
       // must not be set for other primitive types - enables the point sprite
       // coordinates input, and also effects the flag bits in PsParamGen.
       uint32_t param_gen_point : 1;
-      // For host render targets - depth / stencil output mode.
+      // For host render targets - depth / stencil output mode. The FSI path
+      // has no such state, so it aliases these bits as fsi_msaa_samples. The
+      // two paths are mutually exclusive per device.
       DepthStencilMode depth_stencil_mode : 3;
       // For host render targets with MIN/MAX blend op - the source blend factor
       // to pre-multiply the shader output by (since Vulkan/D3D12 MIN/MAX
@@ -126,13 +127,82 @@ class SpirvShaderTranslator : public ShaderTranslator {
       // For host render targets - which color render targets are actually
       // bound.
       uint32_t color_targets_used : xenos::kMaxColorRenderTargets;
-      // Whether to use manual barycentric interpolation for precision.
-      uint32_t precise_interpolation : 1;
+      // FSI path - set when no render target the shader writes has blending
+      // enabled, so the EDRAM ROP skips emitting the blending path entirely.
+      // Zero on the host render target path.
+      uint32_t fsi_no_blending : 1;
       // PsParamGen and the memexport dedup must act like there's no resolution
       // scaling. Doesn't affect fetch offsets, those follow texture scale, not
       // from the draw. This is only set when the draw is native because of a
       // set scale threshold (FBO only).
       uint32_t resolution_scale_native : 1;
+
+      // The host render target path's fields, assembled into one value so
+      // the FSI path can carve them up without its own uses colliding. Safe
+      // because GetPixelShaderModification only writes the fields themselves
+      // on the host path, and a device is on one path or the other.
+      static constexpr uint32_t kFsiBitCount = 18;
+      static constexpr uint32_t kFsiRtFormatsShift = xenos::kMsaaSamplesBits;
+      static_assert(
+          kFsiRtFormatsShift + xenos::kMaxColorRenderTargets *
+                                   xenos::kColorRenderTargetFormatBits <=
+              kFsiBitCount,
+          "The FSI fields have to fit in the host render target bits");
+
+      // The shifts assume the widths declared above. Nothing in C++ can
+      // measure a bitfield, so set_fsi_bits round-trips as the guard.
+      uint32_t fsi_bits() const {
+        return uint32_t(depth_stencil_mode) |
+               (uint32_t(rt0_blend_rgb_factor_for_premult) << 3) |
+               (uint32_t(rt0_blend_a_factor_for_premult) << 8) |
+               (color_targets_used << 13) | (resolution_scale_native << 17);
+      }
+      void set_fsi_bits(uint32_t bits) {
+        assert_zero(bits >> kFsiBitCount);
+        depth_stencil_mode = DepthStencilMode(bits & 0x7);
+        rt0_blend_rgb_factor_for_premult =
+            xenos::BlendFactor((bits >> 3) & 0x1F);
+        rt0_blend_a_factor_for_premult = xenos::BlendFactor((bits >> 8) & 0x1F);
+        color_targets_used = (bits >> 13) & 0xF;
+        resolution_scale_native = (bits >> 17) & 1;
+        // Catches a field having been narrowed under the shifts above.
+        assert_true(fsi_bits() == bits);
+      }
+
+      xenos::MsaaSamples fsi_msaa_samples() const {
+        return xenos::MsaaSamples(
+            fsi_bits() & ((uint32_t(1) << xenos::kMsaaSamplesBits) - 1));
+      }
+      void set_fsi_msaa_samples(xenos::MsaaSamples msaa_samples) {
+        // The per-sample code is emitted for 1 << this many samples, and the
+        // render target cache rejects the draw above 4x before this is read.
+        assert_true(msaa_samples <= xenos::MsaaSamples::k4X);
+        constexpr uint32_t kMask = (uint32_t(1) << xenos::kMsaaSamplesBits) - 1;
+        set_fsi_bits((fsi_bits() & ~kMask) | uint32_t(msaa_samples));
+      }
+
+      // Only meaningful for render targets the shader writes, the rest stay
+      // at zero.
+      xenos::ColorRenderTargetFormat fsi_rt_format(uint32_t rt) const {
+        assert_true(rt < xenos::kMaxColorRenderTargets);
+        constexpr uint32_t kMask =
+            (uint32_t(1) << xenos::kColorRenderTargetFormatBits) - 1;
+        return xenos::ColorRenderTargetFormat(
+            (fsi_bits() >>
+             (kFsiRtFormatsShift + rt * xenos::kColorRenderTargetFormatBits)) &
+            kMask);
+      }
+      void set_fsi_rt_format(uint32_t rt,
+                             xenos::ColorRenderTargetFormat format) {
+        assert_true(rt < xenos::kMaxColorRenderTargets);
+        assert_zero(uint32_t(format) >> xenos::kColorRenderTargetFormatBits);
+        uint32_t shift =
+            kFsiRtFormatsShift + rt * xenos::kColorRenderTargetFormatBits;
+        uint32_t mask =
+            ((uint32_t(1) << xenos::kColorRenderTargetFormatBits) - 1) << shift;
+        set_fsi_bits((fsi_bits() & ~mask) |
+                     ((uint32_t(format) << shift) & mask));
+      }
     } pixel;
     uint64_t value = 0;
 
@@ -300,9 +370,9 @@ class SpirvShaderTranslator : public ShaderTranslator {
 
     uint32_t edram_rt_base_dwords_scaled[4];
 
-    // RT format combined with RenderTargetCache::kPSIColorFormatFlag values
-    // (pass via RenderTargetCache::AddPSIColorFormatFlags).
-    uint32_t edram_rt_format_flags[4];
+    // xenos_draw.glsli reads the tessellation fields below at fixed std140
+    // offsets, so these bytes can't be reclaimed.
+    uint32_t padding_after_rt_base_dwords_scaled[4];
 
     // Render target blending options - RB_BLENDCONTROL, with only the relevant
     // options (factors and operations - AND 0x1FFF1FFF). If 0x00010001
@@ -349,6 +419,7 @@ class SpirvShaderTranslator : public ShaderTranslator {
     // bits 0:3 = component_bits - 1
     // bit 4 = signed
     // bit 5 = unsigned-biased
+    // bit 24 = normalized
     // Zero means no scale.
     // Appended at the very tail (std140 uint4 [35]) so it disturbs neither the
     // xenos_draw.glsli tessellation offsets nor the interpreter [34] slot.
@@ -465,12 +536,16 @@ class SpirvShaderTranslator : public ShaderTranslator {
                         bool native_2x_msaa_with_attachments,
                         bool native_2x_msaa_no_attachments,
                         bool edram_fragment_shader_interlock,
-                        uint32_t draw_resolution_scale_x = 1,
-                        uint32_t draw_resolution_scale_y = 1)
+                        bool precise_interpolation,
+                        // No defaults - a missing argument would shift the
+                        // ones after it and silently take a wrong scale.
+                        uint32_t draw_resolution_scale_x,
+                        uint32_t draw_resolution_scale_y)
       : features_(features),
         native_2x_msaa_with_attachments_(native_2x_msaa_with_attachments),
         native_2x_msaa_no_attachments_(native_2x_msaa_no_attachments),
         edram_fragment_shader_interlock_(edram_fragment_shader_interlock),
+        precise_interpolation_(precise_interpolation),
         draw_resolution_scale_x_(draw_resolution_scale_x),
         draw_resolution_scale_y_(draw_resolution_scale_y) {}
 
@@ -507,8 +582,11 @@ class SpirvShaderTranslator : public ShaderTranslator {
   // writes the result to gl_FragDepth - matching the substitute pixel shader
   // the DXBC backend uses when a guest draw has no pixel shader.
   std::vector<uint8_t> CreateDepthOnlyFragmentShader(
-      Modification::DepthStencilMode depth_stencil_mode =
-          Modification::DepthStencilMode::kNoModifiers);
+      Modification::DepthStencilMode depth_stencil_mode);
+  // FSI variant - specialized for one guest sample count instead of a host
+  // depth / stencil mode.
+  std::vector<uint8_t> CreateDepthOnlyFragmentShader(
+      xenos::MsaaSamples fsi_msaa_samples);
 
   // Common functions useful not only for the translator, but also for EDRAM
   // emulation via conventional render targets.
@@ -631,11 +709,18 @@ class SpirvShaderTranslator : public ShaderTranslator {
                Shader::HostVertexShaderType::kRectangleListAsTriangleStrip;
   }
 
+  // The host render target path's fields of the pixel modification. The FSI
+  // path keeps the EDRAM ROP's specialization in those same bits, so reading
+  // them there is a bug - assert rather than leave it to review.
+  Modification GetHostRtShaderModification() const {
+    assert_false(edram_fragment_shader_interlock_);
+    return GetSpirvShaderModification();
+  }
+
   bool IsExecutionModeEarlyFragmentTests() const {
-    return is_pixel_shader() &&
-           GetSpirvShaderModification().pixel.depth_stencil_mode ==
+    return !edram_fragment_shader_interlock_ && is_pixel_shader() &&
+           GetHostRtShaderModification().pixel.depth_stencil_mode ==
                Modification::DepthStencilMode::kEarlyHint &&
-           !edram_fragment_shader_interlock_ &&
            current_shader().implicit_early_z_write_allowed();
   }
 
@@ -645,7 +730,7 @@ class SpirvShaderTranslator : public ShaderTranslator {
       return false;
     }
     Modification::DepthStencilMode depth_stencil_mode =
-        GetSpirvShaderModification().pixel.depth_stencil_mode;
+        GetHostRtShaderModification().pixel.depth_stencil_mode;
     return depth_stencil_mode ==
                Modification::DepthStencilMode::kFloat24Truncating ||
            depth_stencil_mode == Modification::DepthStencilMode::
@@ -662,7 +747,7 @@ class SpirvShaderTranslator : public ShaderTranslator {
       return false;
     }
     Modification::DepthStencilMode depth_stencil_mode =
-        GetSpirvShaderModification().pixel.depth_stencil_mode;
+        GetHostRtShaderModification().pixel.depth_stencil_mode;
     return depth_stencil_mode ==
                Modification::DepthStencilMode::kPolygonOffset ||
            depth_stencil_mode == Modification::DepthStencilMode::
@@ -853,6 +938,28 @@ class SpirvShaderTranslator : public ShaderTranslator {
                           spv::Id sampler, spv::Id is_all_signed);
 
   spv::Id LoadMsaaSamplesFromFlags();
+  // The guest sample count baked into the modification, so the MSAA dependent
+  // code is emitted for that count alone rather than selected at runtime.
+  xenos::MsaaSamples FSI_GetMsaaSamples() const {
+    assert_true(edram_fragment_shader_interlock_);
+    return GetSpirvShaderModification().pixel.fsi_msaa_samples();
+  }
+  // Set when nothing the shader writes blends, so the blending path can be
+  // left out entirely.
+  bool FSI_GetNoBlending() const {
+    assert_true(edram_fragment_shader_interlock_);
+    return GetSpirvShaderModification().pixel.fsi_no_blending != 0;
+  }
+  // Only call for render targets the shader writes.
+  xenos::ColorRenderTargetFormat FSI_GetRtFormat(uint32_t rt) const {
+    assert_true(edram_fragment_shader_interlock_);
+    return GetSpirvShaderModification().pixel.fsi_rt_format(rt);
+  }
+  // Guest samples per pixel - how many of main_fsi_sample_mask_'s per-sample
+  // bits and of the EDRAM ROP code are meaningful.
+  uint32_t FSI_GetSampleCount() const {
+    return uint32_t(1) << uint32_t(FSI_GetMsaaSamples());
+  }
   // Whether it's possible and worth skipping running the translated shader for
   // 2x2 quads.
   bool FSI_IsDepthStencilEarly() const {
@@ -861,16 +968,15 @@ class SpirvShaderTranslator : public ShaderTranslator {
            !current_shader().writes_depth() &&
            !current_shader().memexport_eM_written();
   }
-  void FSI_LoadSampleMask(spv::Id msaa_samples);
-  void FSI_LoadEdramOffsets(spv::Id msaa_samples);
+  void FSI_LoadSampleMask();
+  void FSI_LoadEdramOffsets();
   // The address must be a signed int. Whether the render target is 64bpp, if
   // present at all, must be a bool (if it's NoResult, 32bpp will be assumed).
   spv::Id FSI_AddSampleOffset(spv::Id sample_0_address, uint32_t sample_index,
                               spv::Id is_64bpp = spv::NoResult);
   // Updates main_fsi_sample_mask_. Must be called outside non-uniform control
   // flow because of taking derivatives of the fragment depth.
-  void FSI_DepthStencilTest(spv::Id msaa_samples,
-                            bool sample_mask_potentially_narrowed_previouly);
+  void FSI_DepthStencilTest(bool sample_mask_potentially_narrowed_previouly);
 
   // Adds the surviving coverage MSAA counts from FSI to the active ZPD counter
   // slot after final PS depth/stencil.
@@ -886,10 +992,12 @@ class SpirvShaderTranslator : public ShaderTranslator {
   // Alpha to coverage main function.
   void FSI_AlphaToMask();
   // Returns the first and the second 32 bits as two uints.
-  std::array<spv::Id, 2> FSI_ClampAndPackColor(spv::Id color_float4,
-                                               spv::Id format_with_flags);
+  // Both are specialized for the render target's format through the
+  // modification - only that format's path is emitted.
+  std::array<spv::Id, 2> FSI_ClampAndPackColor(
+      spv::Id color_float4, xenos::ColorRenderTargetFormat format);
   std::array<spv::Id, 4> FSI_UnpackColor(std::array<spv::Id, 2> color_packed,
-                                         spv::Id format_with_flags);
+                                         xenos::ColorRenderTargetFormat format);
   // The bounds must have the same number of components as the color or alpha.
   spv::Id FSI_FlushNaNClampAndInBlending(spv::Id color_or_alpha,
                                          spv::Id is_fixed_point,
@@ -924,17 +1032,17 @@ class SpirvShaderTranslator : public ShaderTranslator {
 
   // Scale of the draw being translated. All position-dependent paths use
   // these. Only fetch offset scaling uses draw_resolution_scale_x_/y_ directly.
+  // The scale threshold is host render target state - the FSI path has no
+  // host targets and stores RT formats in that bit, so it always scales.
+  bool IsCurrentDrawScaleNative() const {
+    return !edram_fragment_shader_interlock_ && is_pixel_shader() &&
+           GetHostRtShaderModification().pixel.resolution_scale_native;
+  }
   uint32_t GetCurrentDrawResolutionScaleX() const {
-    return is_pixel_shader() &&
-                   GetSpirvShaderModification().pixel.resolution_scale_native
-               ? 1
-               : draw_resolution_scale_x_;
+    return IsCurrentDrawScaleNative() ? 1 : draw_resolution_scale_x_;
   }
   uint32_t GetCurrentDrawResolutionScaleY() const {
-    return is_pixel_shader() &&
-                   GetSpirvShaderModification().pixel.resolution_scale_native
-               ? 1
-               : draw_resolution_scale_y_;
+    return IsCurrentDrawScaleNative() ? 1 : draw_resolution_scale_y_;
   }
 
   // For safety with different drivers (even though fragment shader interlock in
@@ -945,6 +1053,8 @@ class SpirvShaderTranslator : public ShaderTranslator {
   // flow of the main function, and that there are no returns before either
   // (there's a single return from the shader).
   bool edram_fragment_shader_interlock_;
+  // A device and cvar constant, not draw state.
+  bool precise_interpolation_;
 
   // Is currently writing the empty depth-only pixel shader, such as for depth
   // and stencil testing with fragment shader interlock.
@@ -1055,7 +1165,6 @@ class SpirvShaderTranslator : public ShaderTranslator {
     kSystemConstantEdramStencilFront,
     kSystemConstantEdramStencilBack,
     kSystemConstantEdramRTBaseDwordsScaled,
-    kSystemConstantEdramRTFormatFlags,
     kSystemConstantEdramRTBlendFactorsOps,
     // Accessed as float4[2], not float2[4], due to std140 array stride
     // alignment.
@@ -1206,6 +1315,18 @@ class SpirvShaderTranslator : public ShaderTranslator {
   spv::Id var_main_tfetch_gradients_v_;
   // float4[register_count()].
   spv::Id var_main_registers_;
+
+  // Guest instruction bisect, snapshotting a register to color 0.
+  bool BisectTargetsCurrentShader() const;
+  bool BisectSkipsInstruction();
+  void BisectSnapshotAfterInstruction();
+  void BisectStoreSnapshot();
+  void BisectOverrideColorOutput();
+  uint32_t bisect_instruction_index_;
+  uint32_t bisect_current_instruction_;
+  bool bisect_snapshot_emitted_;
+  // float4 holding the watched register at the chosen instruction.
+  spv::Id var_main_bisect_snapshot_;
   // Memory export variables are created only when needed.
   // float4.
   spv::Id var_main_memexport_address_;

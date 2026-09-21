@@ -288,6 +288,12 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
         }
       }
     }
+    for (const auto& requested_extension : requested_extensions) {
+      if (!*requested_extension.second) {
+        XELOGI("Vulkan device extension not available: {}",
+               requested_extension.first);
+      }
+    }
   }
 
   if (with_swapchain && !device->extensions_.ext_KHR_swapchain) {

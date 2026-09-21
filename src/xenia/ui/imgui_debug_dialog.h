@@ -95,7 +95,6 @@ class ImGuiDebugDialog : public ImGuiGamepadDialog {
   // Shader / Driver Workarounds
   bool use_fuzzy_alpha_epsilon_;
   bool precise_interpolation_;
-  bool dxbc_switch_;
   // EDRAM / Draw Heuristics
   bool execute_unclipped_draw_vs_on_cpu_;
   bool execute_unclipped_draw_vs_on_cpu_for_psi_render_backend_;
@@ -121,6 +120,12 @@ class ImGuiDebugDialog : public ImGuiGamepadDialog {
   uint32_t log_mask_;
   bool log_high_frequency_kernel_calls_;
   bool occlusion_query_log_;
+  bool log_draws_;
+  bool log_resolves_;
+  bool log_transfers_;
+  bool log_samplers_;
+  bool log_texture_loads_;
+  bool trace_gpu_stream_;
   bool gpu_debug_markers_;
   bool disassemble_pm4_;
   bool log_guest_driven_gpu_register_written_values_;

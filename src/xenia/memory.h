@@ -10,6 +10,7 @@
 #ifndef XENIA_MEMORY_H_
 #define XENIA_MEMORY_H_
 
+#include <atomic>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -217,6 +218,9 @@ class BaseHeap {
   // address.
   bool QueryProtect(uint32_t address, uint32_t* out_protect);
 
+  // True when no allocation covers any page in the range.
+  bool IsRangeUnallocated(uint32_t address, uint32_t size);
+
   // Queries the currently strictest readability and writability for the entire
   // range.
   xe::memory::PageAccess QueryRangeAccess(uint32_t low_address,
@@ -236,6 +240,20 @@ class BaseHeap {
 
   // Rebuilds free_blocks_ by scanning page_table_. Used after Restore.
   void RebuildFreeBlocks();
+
+  // Applies `protect` to the host mapping backing the inclusive guest page
+  // range. Handles a host page larger than the guest page by protecting whole
+  // host pages with the most permissive access any guest page inside one
+  // needs, so a neighbour's protection is never tightened. page_table_ is read
+  // for pages outside the range, so it must still hold their current state.
+  bool ApplyHostProtect(uint32_t start_page_number, uint32_t end_page_number,
+                        uint32_t protect, uint32_t* old_protect);
+
+  // Backs the guest page range on the host at commit time. Equivalent to a
+  // host commit where the guest page size is host-page-aligned, and falls back
+  // to ApplyHostProtect where it is not (4 KB guest pages on a 16 KB host).
+  bool CommitHostPages(uint32_t start_page_number, uint32_t page_count,
+                       uint32_t protect);
 
   // Removes (or splits) the free block covering the given page range.
   void RemoveFreeBlock(uint32_t start_page, uint32_t page_count);
@@ -328,6 +346,9 @@ class PhysicalHeap : public BaseHeap {
                         bool invalidate_unwatched = false);
 
   uint32_t GetPhysicalAddress(uint32_t address) const;
+
+  // The 0-512mb heap every physical allocation is recorded in.
+  BaseHeap* parent_heap() const { return parent_heap_; }
 
   uint32_t SystemPagenumToGuestPagenum(uint32_t num) const {
     uint32_t system_base = num << system_page_shift_;
@@ -619,6 +640,42 @@ class Memory {
   // Frees memory allocated with SystemHeapAlloc.
   void SystemHeapFree(uint32_t address, uint32_t* out_region_size = nullptr);
 
+  // Records the page table KeCreateUserMode was given, before the views exist.
+  void SetUserPageTable(uint32_t descriptor_address);
+
+  // Maps the address space user mode code runs in, empty in a driven segment.
+  bool EnableUserModeViews();
+
+  // Drops every page mapped through the page table, which flushing the TB does.
+  void FlushUserPageTable();
+
+  // Base of the user mode address space, null until it is created.
+  inline uint8_t* user_virtual_membase() const {
+    return user_virtual_membase_.load(std::memory_order_relaxed);
+  }
+
+  // The kernel address with the same contents as a user mode address.
+  uint32_t UserModeKernelAddress(uint32_t user_address) {
+    uint32_t physical_address;
+    if (TranslateUserPage(user_address, &physical_address)) {
+      // The 64 KB page window shows every physical address the table can name.
+      return 0xA0000000 + physical_address +
+             (user_address & (kUserPageSize - 1));
+    }
+    if (user_address - kUserAliasBase < kUserAliasSize) {
+      return user_address + 0x80000000;
+    }
+    return user_address;
+  }
+
+  // The inverse of UserModeKernelAddress for the alias, which is all it covers.
+  static uint32_t KernelModeUserAddress(uint32_t kernel_address) {
+    if (kernel_address - 0xA0000000 < kUserAliasSize) {
+      return kernel_address - 0x80000000;
+    }
+    return kernel_address;
+  }
+
   // Gets the heap for the address space containing the given address.
   XE_NOALIAS
   const BaseHeap* LookupHeap(uint32_t address) const;
@@ -654,6 +711,29 @@ class Memory {
 #endif
   int MapViews(uint8_t* mapping_base);
   void UnmapViews();
+  bool MapUserViews(uint8_t* user_membase);
+  void UnmapUserViews();
+
+  // The file offset the user mode address space shows at an address.
+  uint64_t UserViewFileOffset(uint32_t user_address) const;
+  // The physical address the page table translates a user mode address to.
+  bool TranslateUserPage(uint32_t user_address, uint32_t* out_physical_address);
+  // Shows the page a user mode address falls in, on the fault under the lock.
+  bool MapUserPage(uint32_t user_address);
+
+  static constexpr uint32_t kUserAliasBase = 0x20000000;
+  static constexpr uint32_t kUserAliasSize = 0x20000000;
+
+  // The host allocation granularity, so a 4 KB page segment cannot be driven.
+  static constexpr uint32_t kUserPageSize = 0x10000;
+  static constexpr uint32_t kUserPageCount = 0x100000000ull / kUserPageSize;
+  // A PTE is the physical address with the protection in its low bits.
+  static constexpr uint32_t kUserTableLarge = 0x400;   // u32[256], by >> 24
+  static constexpr uint32_t kUserTableMedium = 0x800;  // u16[32], by >> 27
+  static constexpr uint32_t kUserTableKind = 0x840;    // u8[16], by >> 28
+  // The segment kinds a host view can match, unlike the 4 KB pages.
+  static constexpr uint8_t kUserSegmentLarge = 0x3;   // 16 MB pages, inline
+  static constexpr uint8_t kUserSegmentMedium = 0x6;  // 64 KB pages, a table
 
   static uint32_t HostToGuestVirtualThunk(const void* context,
                                           const void* host_address);
@@ -687,6 +767,17 @@ class Memory {
     };
     uint8_t* all_views[9];
   } views_ = {{0}};
+  std::atomic<uint8_t*> user_virtual_membase_{nullptr};
+  struct UserView {
+    uint8_t* base;
+    size_t length;
+  };
+  std::vector<UserView> user_views_;
+  // Set before the views are mapped and never changed, so read unlocked.
+  uint32_t user_page_table_ = 0;
+  uint32_t user_page_table_segments_ = 0;
+  // One bit per user mode page mapped from the table, under the global lock.
+  std::vector<uint64_t> user_page_mapped_;
 
   std::unique_ptr<cpu::MMIOHandler> mmio_handler_;
 
@@ -697,6 +788,7 @@ class Memory {
     VirtualHeap v90000000;
 
     VirtualHeap physical;
+    PhysicalHeap v7F000000;
     PhysicalHeap vA0000000;
     PhysicalHeap vC0000000;
     PhysicalHeap vE0000000;

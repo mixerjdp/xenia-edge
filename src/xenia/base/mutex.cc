@@ -12,14 +12,27 @@
 #include "xenia/base/platform_win.h"
 #elif XE_PLATFORM_LINUX == 1
 #include <linux/futex.h>
+#include <pthread.h>
 #include <sys/syscall.h>
 #include <unistd.h>
-#elif XE_PLATFORM_APPLE == 1
+#elif XE_PLATFORM_MAC == 1
 #include <os/lock.h>
 #include <pthread.h>
 #endif
 
 namespace xe {
+
+#if XE_PLATFORM_LINUX == 1 || XE_PLATFORM_MAC == 1
+namespace {
+// Cheap, stable per-thread identity. pthread_self() reads thread-local storage
+// with no syscall and is unique among live threads. It is only ever compared
+// for equality here, to detect recursive acquisition by the current owner.
+inline uint64_t xe_current_thread_id() {
+  return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(pthread_self()));
+}
+}  // namespace
+#endif
+
 #if XE_PLATFORM_WIN32 == 1 && XE_ENABLE_FAST_WIN32_MUTEX == 1
 
 // xe_global_mutex: recursive mutex via SRWLOCK
@@ -95,13 +108,11 @@ inline int futex_wake(std::atomic<uint32_t>* addr, int count) {
                  0);
 }
 
-inline pid_t gettid() { return static_cast<pid_t>(syscall(SYS_gettid)); }
-
 }  // namespace
 
 // xe_global_mutex implementation (recursive)
 void xe_global_mutex::lock() {
-  pid_t self = gettid();
+  uint64_t self = xe_current_thread_id();
 
   // Fast path: check if we already own it (recursive lock)
   if (owner_.load(std::memory_order_relaxed) == self) {
@@ -122,7 +133,7 @@ void xe_global_mutex::lock() {
 }
 
 void xe_global_mutex::lock_slow() {
-  pid_t self = gettid();
+  uint64_t self = xe_current_thread_id();
 
   // Spin phase
   for (int i = 0; i < XE_LINUX_MUTEX_SPINCOUNT; ++i) {
@@ -175,7 +186,7 @@ void xe_global_mutex::unlock() {
 }
 
 bool xe_global_mutex::try_lock() {
-  pid_t self = gettid();
+  uint64_t self = xe_current_thread_id();
 
   // Check for recursive lock
   if (owner_.load(std::memory_order_relaxed) == self) {
@@ -194,7 +205,7 @@ bool xe_global_mutex::try_lock() {
 }
 
 bool xe_global_mutex::is_held_by_current_thread() const {
-  return owner_.load(std::memory_order_relaxed) == gettid();
+  return owner_.load(std::memory_order_relaxed) == xe_current_thread_id();
 }
 
 // xe_fast_mutex implementation (non-recursive)
@@ -254,16 +265,7 @@ bool xe_fast_mutex::try_lock() {
                                         std::memory_order_relaxed);
 }
 
-#elif XE_PLATFORM_APPLE == 1 && XE_ENABLE_FAST_APPLE_MUTEX == 1
-
-namespace {
-// Cheap, stable per-thread identity. pthread_self() reads thread-local storage
-// (no syscall) and is unique among live threads; it is only ever compared for
-// equality here to detect recursive acquisition by the current owner.
-inline uint64_t xe_current_thread_id() {
-  return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(pthread_self()));
-}
-}  // namespace
+#elif XE_PLATFORM_MAC == 1 && XE_ENABLE_FAST_APPLE_MUTEX == 1
 
 // xe_global_mutex implementation (recursive, built on os_unfair_lock).
 // os_unfair_lock is non-recursive, so the owner thread and recursion depth are
@@ -299,6 +301,10 @@ bool xe_global_mutex::try_lock() {
     return true;
   }
   return false;
+}
+
+bool xe_global_mutex::is_held_by_current_thread() const {
+  return owner_.load(std::memory_order_relaxed) == xe_current_thread_id();
 }
 
 // xe_fast_mutex implementation (non-recursive).

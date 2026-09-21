@@ -20,6 +20,7 @@
 #include <memory>
 #include <mutex>
 #include <queue>
+#include <set>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -40,6 +41,7 @@
 #include "xenia/gpu/metal/metal_zpd_visibility_pool.h"
 #include "xenia/gpu/metal/msl_bindings.h"
 #include "xenia/gpu/metal/msl_shader.h"
+#include "xenia/gpu/shader_storage.h"
 #include "xenia/gpu/spirv_shader_translator.h"
 #include "xenia/ui/metal/metal_api.h"
 #include "xenia/ui/metal/metal_provider.h"
@@ -232,7 +234,9 @@ class MetalCommandProcessor : public CommandProcessor {
   // draws overwrote while sharing the guest's render encoder.
   void InvalidateRenderEncoderStateAfterDrawPassTransfers(
       MetalRenderTargetCache::DrawPassTransferEncoderMutationMask mutations);
-  bool CanEndSubmissionImmediately();
+  // Blocks until the compile threads have drained. For work that needs the
+  // guest's exact shaders rather than a placeholder or a skipped draw.
+  void AwaitAsyncCompiles();
   // Blocks until the given submission's command buffer has completed. The
   // submission must already be committed.
   void AwaitSubmissionCompletion(uint64_t submission);
@@ -334,52 +338,88 @@ class MetalCommandProcessor : public CommandProcessor {
       xenos::Endian index_endian, const draw_util::ViewportInfo& viewport_info,
       uint32_t used_texture_mask, reg::RB_DEPTHCONTROL normalized_depth_control,
       uint32_t normalized_color_mask);
-  enum class MslShaderCompileStatus {
+  enum class ShaderCompileStatus {
     kReady,
     kPending,
     kFailed,
     kNotQueued,
   };
-  enum class MslPipelineCompileStatus {
+  enum class PipelineCompileStatus {
     kReady,
     kPending,
     kFailed,
   };
-  struct MslPipelineCompileRequest;
-  void InitializeMslAsyncCompilation();
-  void ShutdownMslAsyncCompilation();
-  MslShaderCompileStatus GetMslShaderCompileStatus(
-      MslShader::MslTranslation* translation);
-  bool EnqueueMslShaderCompilation(MslShader::MslTranslation* translation,
-                                   bool is_ios, uint8_t priority);
-  bool EnqueueMslPipelineCompilation(const MslPipelineCompileRequest& request);
+  struct PipelineCompileRequest;
+  void InitializeAsyncCompilation();
+  void ShutdownAsyncCompilation();
+  ShaderCompileStatus GetShaderCompileStatus(Shader::Translation* translation);
+  // For a translation the caller has just read as kNotQueued. False means there
+  // is no worker pool, so the caller has to compile it itself.
+  bool EnqueueShaderCompilation(Shader::Translation* translation, bool is_ios,
+                                uint8_t priority);
+  // Records a translation the draw thread could not translate to SPIR-V, so
+  // the failure is reported once rather than retried by every later draw.
+  void NoteShaderCompileFailed(Shader::Translation* translation);
+  // Claimed so only one thread translates it. kPending means another holds the
+  // claim and the caller should retry rather than wait.
+  ShaderCompileStatus EnsureTranslationSpirv(Shader::Translation* translation,
+                                             SpirvShaderTranslator& translator);
+  // Builds the Metal function of one translation on whichever guest shader
+  // path is active: SPIR-V -> MSL, or SPIR-V -> DXIL -> AIR.
+  bool CompileHostShader(Shader::Translation* translation, bool is_ios);
+  std::unique_ptr<SpirvShaderTranslator> CreateSpirvShaderTranslator() const;
+  // The compiled function of a translation on the active path, null until
+  // CompileHostShader has succeeded for it.
+  static MTL::Function* GetHostShaderFunction(
+      const Shader::Translation* translation);
+  bool EnqueuePipelineCompilation(const PipelineCompileRequest& request);
+  // Rate-limited "draw skipped, still compiling" logging, shared by both guest
+  // shader paths.
+  void LogShaderCompilePending(const Shader::Translation* translation,
+                               const char* stage_tag);
+  void LogPipelineCompilePending(const Shader::Translation* vertex_translation,
+                                 const Shader::Translation* pixel_translation);
+  void LogPlaceholderDraw(const Shader::Translation* vertex_translation,
+                          const Shader::Translation* pixel_translation);
+  // Both require async_compile_mutex_ held.
+  bool IsAsyncCompileIdleLocked() const;
+  void FinishAsyncCompileTaskLocked();
   // Formats, write masks and blend state, shared by the render and mesh
   // pipeline descriptors.
   static void ApplyColorAttachmentState(
       MTL::RenderPipelineColorAttachmentDescriptorArray* attachments,
-      const MslPipelineCompileRequest& request);
-  MTL::RenderPipelineState* CreateMslPipelineState(
-      const MslPipelineCompileRequest& request, std::string* error_out);
-  void MslShaderCompileThread(size_t thread_index);
+      const PipelineCompileRequest& request);
+  MTL::RenderPipelineState* CreatePipelineState(
+      const PipelineCompileRequest& request, std::string* error_out);
+  void AsyncCompileThread(size_t thread_index);
   // Fills a request's attachment formats and blend state from the active render
   // pass and the registers, returning the pipeline cache key. The translations
   // only identify the shaders within that key.
   uint64_t PopulatePipelineCompileRequest(
       const RegisterFile& regs, const Shader::Translation* vertex_translation,
       const Shader::Translation* pixel_translation,
-      MslPipelineCompileRequest& request);
-  MTL::RenderPipelineState* GetOrCreateMslPipelineState(
-      MslShader::MslTranslation* vertex_translation,
-      MslShader::MslTranslation* pixel_translation, const RegisterFile& regs,
-      MslPipelineCompileStatus* compile_status_out = nullptr);
+      PipelineCompileRequest& request);
+  MTL::RenderPipelineState* GetOrCreatePipelineState(
+      const Shader::Translation* vertex_translation,
+      const Shader::Translation* pixel_translation, const RegisterFile& regs,
+      PipelineCompileStatus* compile_status_out = nullptr);
+  // Shared by every pipeline kind. A compile thread can reach neither the
+  // register file nor the render pass, so the request must carry it all.
+  MTL::RenderPipelineState* AcquirePipelineState(
+      const PipelineCompileRequest& request, bool allow_async,
+      PipelineCompileStatus* compile_status_out);
+  // Stands in for a pipeline whose pixel shader isn't compiled yet: the vertex
+  // shader alone, color writes off. Shared across that shader's pipelines.
+  MTL::RenderPipelineState* GetOrCreatePlaceholderPipelineState(
+      const Shader::Translation* vertex_translation, const RegisterFile& regs);
 
-  // TODO(macos): compile these on the MSL compile threads, which are keyed on
-  // MslShader::MslTranslation today, instead of on the draw thread.
-  DxilShader::DxilTranslation* GetOrCreateDxilTranslation(
-      DxilShader& shader, uint64_t modification);
-  MTL::RenderPipelineState* GetOrCreateDxilPipelineState(
-      DxilShader::DxilTranslation* vertex_translation,
-      DxilShader::DxilTranslation* pixel_translation, const RegisterFile& regs);
+  // Never null - an unbuildable one reports kFailed, so later draws don't retry
+  // it. allow_async false builds it here and waits for one already queued.
+  // TODO(macos): translate the guest ucode to SPIR-V on the compile threads
+  // too, instead of on the draw thread.
+  Shader::Translation* GetOrCreateHostTranslation(
+      SpirvShader& shader, uint64_t modification, bool allow_async,
+      ShaderCompileStatus* compile_status_out);
 
   // One MSC stage of a tessellated draw.
   struct DxilTessellationStage {
@@ -392,19 +432,47 @@ class MetalCommandProcessor : public CommandProcessor {
   // Tessellation emulation links all three together, so they are cached as a
   // unit rather than per stage.
   struct DxilTessellationShaders {
+    DxilTessellationShaders() = default;
+    DxilTessellationShaders(const DxilTessellationShaders&) = delete;
+    DxilTessellationShaders& operator=(const DxilTessellationShaders&) = delete;
+    ~DxilTessellationShaders() {
+      for (DxilTessellationStage* stage : {&vertex, &hull, &domain}) {
+        if (stage->function) {
+          stage->function->release();
+        }
+        if (stage->library) {
+          stage->library->release();
+        }
+      }
+    }
+
     DxilTessellationStage vertex;
     DxilTessellationStage hull;
     DxilTessellationStage domain;
-    // Pipelines built from these, keyed by render state.
-    std::unordered_map<uint64_t, MTL::RenderPipelineState*> pipelines;
   };
-  DxilTessellationShaders* GetOrCreateDxilTessellationShaders(
+  // The three linked stages for one guest domain shader. A compile thread
+  // builds them, so this reports kPending until it lands.
+  DxilTessellationShaders* GetDxilTessellationShaders(
       DxilShader& domain_shader, uint64_t domain_modification,
       xenos::TessellationMode tessellation_mode,
-      Shader::HostVertexShaderType host_vertex_shader_type);
+      Shader::HostVertexShaderType host_vertex_shader_type, bool allow_async,
+      ShaderCompileStatus* compile_status_out);
   MTL::RenderPipelineState* GetOrCreateDxilTessellationPipelineState(
-      DxilTessellationShaders& shaders,
-      DxilShader::DxilTranslation* pixel_translation, const RegisterFile& regs);
+      const DxilTessellationShaders& shaders,
+      const Shader::Translation* domain_translation,
+      xenos::TessellationMode tessellation_mode,
+      Shader::HostVertexShaderType host_vertex_shader_type,
+      DxilShader::DxilTranslation* pixel_translation, const RegisterFile& regs,
+      PipelineCompileStatus* compile_status_out);
+  MTL::RenderPipelineState* CreateDxilTessellationPipelineState(
+      const PipelineCompileRequest& request, std::string* error_out);
+  // Builds one linked stage set. Runs on a compile thread, from the domain
+  // SPIR-V the draw thread already produced.
+  bool BuildDxilTessellationShaders(
+      const std::vector<uint8_t>& domain_spirv, uint64_t domain_ucode_hash,
+      xenos::TessellationMode tessellation_mode,
+      Shader::HostVertexShaderType host_vertex_shader_type,
+      DxilTessellationShaders& shaders_out);
   // MSC's tessellator lookup tables, allocated once and kept resident.
   bool EnsureTessellatorTablesBuffer();
 
@@ -457,15 +525,18 @@ class MetalCommandProcessor : public CommandProcessor {
   StringBuffer ucode_disasm_buffer_;
 
   // The cache holds MslShader or DxilShader depending on the active path; both
-  // derive from SpirvShader and share this translator's output.
+  // derive from SpirvShader and share this translator's output. The translator
+  // is not thread safe, so each compile thread builds its own.
   std::unique_ptr<SpirvShaderTranslator> spirv_shader_translator_;
+  SpirvShaderTranslator::Features spirv_translator_features_{false};
+  bool spirv_translator_native_2x_msaa_ = false;
+  uint32_t spirv_translator_resolution_scale_x_ = 1;
+  uint32_t spirv_translator_resolution_scale_y_ = 1;
   std::unordered_map<uint64_t, std::unique_ptr<SpirvShader>>
       guest_shader_cache_;
   // Owns the root signature the DXIL shaders are compiled against.
   MetalShaderConverter metal_shader_converter_;
   MetalDxilBinder dxil_binder_;
-  std::unordered_map<uint64_t, MTL::RenderPipelineState*> dxil_pipeline_cache_;
-  std::unordered_set<Shader::Translation*> dxil_translation_failed_;
   // Keyed by domain shader hash, modification, tessellation mode and host
   // vertex shader type, which together pick all three linked stages.
   std::unordered_map<uint64_t, std::unique_ptr<DxilTessellationShaders>>
@@ -474,65 +545,150 @@ class MetalCommandProcessor : public CommandProcessor {
   bool mesh_shader_supported_ = false;
   // Includes user clip planes and tessellation constants.
   SpirvShaderTranslator::SystemConstants spirv_system_constants_ = {};
-  struct MslShaderCompileRequest {
-    MslShader::MslTranslation* translation = nullptr;
+  struct ShaderCompileRequest {
+    Shader::Translation* translation = nullptr;
     uint64_t shader_hash = 0;
     uint64_t modification = 0;
     bool is_ios = false;
     uint8_t priority = 0;
   };
-  struct MslPipelineCompileRequest {
+  // What a queued pipeline request builds. Each kind reads a different subset
+  // of the request, but all of them are captured on the draw thread.
+  enum class PipelineKind : uint32_t {
+    kRender,
+    kMslTessellation,
+    kDxilTessellation,
+  };
+  static constexpr bool IsTessellationPipelineKind(PipelineKind kind) {
+    return kind == PipelineKind::kMslTessellation ||
+           kind == PipelineKind::kDxilTessellation;
+  }
+  // Everything that distinguishes one pipeline, in a form that survives to
+  // disk. Its hash is the cache key, so replay lands where a draw looks.
+  // Update kVersion if anything here changes!
+  XEPACKEDSTRUCT(PipelineDescription, {
+    uint64_t vertex_shader_hash;
+    uint64_t vertex_shader_modification;
+    // 0 with no pixel shader - the depth-only and placeholder pipelines.
+    uint64_t pixel_shader_hash;
+    uint64_t pixel_shader_modification;
+
+    uint32_t color_formats[4];  // MTL::PixelFormat
+    uint32_t depth_format;
+    uint32_t stencil_format;
+    uint32_t blendcontrol[4];  // RB_BLENDCONTROL, zeroed for unwritten targets
+    uint32_t normalized_color_mask;
+    uint32_t sample_count;
+
+    PipelineKind kind : 2;                          // 2
+    uint32_t alpha_to_mask_enable : 1;              // 3
+    xenos::TessellationMode tessellation_mode : 2;  // 5
+    Shader::HostVertexShaderType host_vertex_shader_type
+        : Shader::kHostVertexShaderTypeBitCount;  // 9
+    uint32_t padding : 23;                        // 32
+
+    // Increment when the layout or its meaning changes.
+    static constexpr uint32_t kVersion = 0x20260830;
+
+    // Copied whole, padding included, because the hash covers every byte.
+    PipelineDescription() { Reset(); }
+    PipelineDescription(const PipelineDescription& other) {
+      std::memcpy(this, &other, sizeof(*this));
+    }
+    PipelineDescription& operator=(const PipelineDescription& other) {
+      std::memcpy(this, &other, sizeof(*this));
+      return *this;
+    }
+    void Reset() { std::memset(this, 0, sizeof(*this)); }
+    uint64_t GetHash() const { return XXH3_64bits(this, sizeof(*this)); }
+    bool operator==(const PipelineDescription& other) const {
+      return std::memcmp(this, &other, sizeof(*this)) == 0;
+    }
+  });
+  XEPACKEDSTRUCT(PipelineStoredDescription, {
+    uint64_t description_hash;
+    PipelineDescription description;
+  });
+  static constexpr uint32_t kPipelineStorageAPIMagicMetal = 'MTLP';
+
+  struct PipelineCompileRequest {
+    PipelineDescription description;
+    // description.GetHash(), the key into async_pipeline_cache_.
     uint64_t pipeline_key = 0;
-    uint64_t vertex_shader_hash = 0;
-    uint64_t vertex_modification = 0;
-    uint64_t pixel_shader_hash = 0;
-    uint64_t pixel_modification = 0;
     MTL::Function* vertex_function = nullptr;
     MTL::Function* fragment_function = nullptr;
-    uint32_t sample_count = 1;
-    MTL::PixelFormat color_formats[4] = {
-        MTL::PixelFormatInvalid, MTL::PixelFormatInvalid,
-        MTL::PixelFormatInvalid, MTL::PixelFormatInvalid};
-    MTL::PixelFormat depth_format = MTL::PixelFormatInvalid;
-    MTL::PixelFormat stencil_format = MTL::PixelFormatInvalid;
-    uint32_t normalized_color_mask = 0;
-    uint32_t alpha_to_mask_enable = 0;
-    uint32_t blendcontrol[4] = {};
     uint8_t priority = 0;
+    // kDxilTessellation: owned by dxil_tessellation_cache_, which outlives
+    // every compile thread, as does the fragment library's translation.
+    const DxilTessellationShaders* tessellation_shaders = nullptr;
+    MTL::Library* fragment_library = nullptr;
+    std::string fragment_function_name;
   };
-  struct MslShaderCompileRequestCompare {
-    bool operator()(const MslShaderCompileRequest& a,
-                    const MslShaderCompileRequest& b) const {
+  // Building one DxilTessellationShaders set, off the draw thread.
+  struct TessellationShadersCompileRequest {
+    uint64_t key = 0;
+    // Points into the domain Translation, which is immutable once translated.
+    const std::vector<uint8_t>* domain_spirv = nullptr;
+    uint64_t domain_ucode_hash = 0;
+    xenos::TessellationMode tessellation_mode =
+        xenos::TessellationMode::kDiscrete;
+    Shader::HostVertexShaderType host_vertex_shader_type =
+        Shader::HostVertexShaderType::kVertex;
+  };
+  struct ShaderCompileRequestCompare {
+    bool operator()(const ShaderCompileRequest& a,
+                    const ShaderCompileRequest& b) const {
       return a.priority < b.priority;
     }
   };
-  struct MslPipelineCompileRequestCompare {
-    bool operator()(const MslPipelineCompileRequest& a,
-                    const MslPipelineCompileRequest& b) const {
+  struct PipelineCompileRequestCompare {
+    bool operator()(const PipelineCompileRequest& a,
+                    const PipelineCompileRequest& b) const {
       return a.priority < b.priority;
     }
   };
-  std::priority_queue<MslShaderCompileRequest,
-                      std::vector<MslShaderCompileRequest>,
-                      MslShaderCompileRequestCompare>
-      msl_shader_compile_queue_;
-  std::priority_queue<MslPipelineCompileRequest,
-                      std::vector<MslPipelineCompileRequest>,
-                      MslPipelineCompileRequestCompare>
-      msl_pipeline_compile_queue_;
-  std::unordered_set<MslShader::MslTranslation*> msl_shader_compile_pending_;
-  std::unordered_set<MslShader::MslTranslation*> msl_shader_compile_failed_;
-  std::unordered_set<uint64_t> msl_pipeline_compile_pending_;
-  std::unordered_set<uint64_t> msl_pipeline_compile_failed_;
-  std::mutex msl_shader_compile_mutex_;
-  std::condition_variable msl_shader_compile_cv_;
-  std::vector<std::thread> msl_shader_compile_threads_;
-  size_t msl_shader_compile_busy_ = 0;
-  bool msl_shader_compile_shutdown_ = false;
-  std::atomic<int64_t> msl_shader_compile_failure_last_log_ns_{0};
-  std::atomic<int64_t> msl_pipeline_compile_failure_last_log_ns_{0};
-  std::atomic<int64_t> msl_pipeline_pending_last_log_ns_{0};
-  std::unordered_map<uint64_t, MTL::RenderPipelineState*> msl_pipeline_cache_;
+  std::priority_queue<ShaderCompileRequest, std::vector<ShaderCompileRequest>,
+                      ShaderCompileRequestCompare>
+      async_shader_queue_;
+  std::priority_queue<PipelineCompileRequest,
+                      std::vector<PipelineCompileRequest>,
+                      PipelineCompileRequestCompare>
+      async_pipeline_queue_;
+  std::unordered_set<Shader::Translation*> async_shader_pending_;
+  std::unordered_set<Shader::Translation*> async_shader_failed_;
+  std::unordered_set<uint64_t> async_pipeline_pending_;
+  std::unordered_set<uint64_t> async_pipeline_failed_;
+  std::queue<TessellationShadersCompileRequest> async_tess_shaders_queue_;
+  std::unordered_set<uint64_t> async_tess_shaders_pending_;
+  std::unordered_set<uint64_t> async_tess_shaders_failed_;
+  std::mutex async_compile_mutex_;
+  std::condition_variable async_compile_cv_;
+  // Signalled when the last in-flight task finishes, for AwaitAsyncCompiles.
+  std::condition_variable async_compile_idle_cv_;
+  std::vector<std::thread> async_compile_threads_;
+  size_t async_compile_busy_ = 0;
+  bool async_compile_shutdown_ = false;
+  std::atomic<int64_t> async_shader_failure_last_log_ns_{0};
+  std::atomic<int64_t> async_pipeline_failure_last_log_ns_{0};
+  std::atomic<int64_t> async_shader_pending_last_log_ns_{0};
+  std::atomic<int64_t> async_pipeline_pending_last_log_ns_{0};
+  std::atomic<int64_t> async_placeholder_last_log_ns_{0};
+  std::atomic<int64_t> async_compile_drain_last_log_ns_{0};
+  // Guest ucode (.xsh, shared with the other backends) and this backend's
+  // pipeline descriptions (.metal.xpso), replayed at startup.
+  ShaderStorageWriter<PipelineStoredDescription> storage_writer_;
+  bool shader_storage_flush_needed_ = false;
+  bool pipeline_storage_flush_needed_ = false;
+  // Set while rebuilding from storage, so replay doesn't re-record what it
+  // read.
+  bool replaying_stored_pipelines_ = false;
+  // Turns the stored (ucode hash, modification) pairs into compiled shaders.
+  void TranslateShadersForStorage(
+      const std::set<std::pair<uint64_t, uint64_t>>& translations_needed);
+  // Rebuilds the stored pipelines. Returns how many were created.
+  size_t CreateStoredPipelines(
+      const std::vector<PipelineStoredDescription>& stored_descriptions);
+  std::unordered_map<uint64_t, MTL::RenderPipelineState*> async_pipeline_cache_;
 
   // SPIRV-Cross tessellation support.
   MTL::ComputePipelineState* tess_factor_pipeline_tri_ = nullptr;
@@ -543,15 +699,15 @@ class MetalCommandProcessor : public CommandProcessor {
   MTL::ComputePipelineState* tess_factor_pipeline_adaptive_quad_ = nullptr;
   MTL::Buffer* tess_factor_buffer_ = nullptr;
   uint32_t tess_factor_buffer_patch_capacity_ = 0;
-  std::unordered_map<uint64_t, MTL::RenderPipelineState*>
-      msl_tess_pipeline_cache_;
   bool InitializeMslTessellation();
   void ShutdownMslTessellation();
   MTL::RenderPipelineState* GetOrCreateMslTessPipelineState(
       MslShader::MslTranslation* domain_translation,
       MslShader::MslTranslation* pixel_translation,
       Shader::HostVertexShaderType host_vertex_shader_type,
-      const RegisterFile& regs);
+      const RegisterFile& regs, PipelineCompileStatus* compile_status_out);
+  MTL::RenderPipelineState* CreateMslTessellationPipelineState(
+      const PipelineCompileRequest& request, std::string* error_out);
   bool EnsureTessFactorBuffer(uint32_t patch_count);
 
   struct DepthStencilStateKey {
@@ -771,8 +927,16 @@ class MetalCommandProcessor : public CommandProcessor {
   uint32_t current_draw_index_ = 0;
   bool copy_resolve_writes_pending_ = false;
 
+  // Host viewport of the previous draw, reused while the inputs it was derived
+  // from stay the same.
+  draw_util::GetViewportInfoArgs previous_viewport_info_args_{};
+  draw_util::ViewportInfo previous_viewport_info_{};
+
   // Memexport tracking for shared memory invalidation.
   std::vector<draw_util::MemExportRange> memexport_ranges_;
+  // Export output lands in guest RAM through the shared buffer, so nothing is
+  // ever staged for readback.
+  void FlushMemexportStagingReadback() {}
   // Page tracking so a fence the guest reads can await export output. The
   // fragment's host/device routing half is unused - Metal has one buffer.
 #include "../command_processor_memexport.inc"

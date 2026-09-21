@@ -4,13 +4,14 @@ target_include_directories(xenia-gpu PRIVATE
   ${PROJECT_SOURCE_DIR}/third_party/glslang
   ${PROJECT_SOURCE_DIR}/third_party/Vulkan-Headers/include
 )
-target_link_libraries(xenia-gpu PUBLIC dxbc fmt snappy xxhash xenia-base xenia-ui)
+target_link_libraries(xenia-gpu PUBLIC fmt snappy xxhash xenia-base xenia-ui)
 target_link_libraries(xenia-gpu PRIVATE glslang-spirv)
 # spirv_to_dxil_compiler.cc wraps Mesa for the backends that take the guest
 # SPIR-V to DXIL: D3D12 on Windows, and Metal (by way of the Metal Shader
-# Converter) on macOS. Mesa is built on those two platforms only.
+# Converter) on macOS. Mesa is built on those two platforms only. dxbc is there
+# for DXBCChecksum, which stamps the container digest of the produced DXIL.
 if(WIN32 OR APPLE)
-  target_link_libraries(xenia-gpu PUBLIC spirv_to_dxil)
+  target_link_libraries(xenia-gpu PUBLIC spirv_to_dxil dxbc)
 endif()
 xe_target_defaults(xenia-gpu)
 
@@ -36,7 +37,7 @@ if(XENIA_BUILD_MISC)
     xenia-apu xenia-apu-nop xenia-base xenia-core xenia-cpu
     xenia-gpu xenia-hid xenia-hid-nop xenia-hid-portal
     xenia-kernel xenia-patcher xenia-ui xenia-ui-vulkan xenia-vfs
-    aes_128 capstone dxbc fmt glslang-spirv imgui libavcodec libavutil mspack
+    aes_128 capstone fmt glslang-spirv imgui libavcodec libavutil mspack
     snappy xxhash
   )
   if(XE_TARGET_X86_64)

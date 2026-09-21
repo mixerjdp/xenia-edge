@@ -10,6 +10,7 @@
 #ifndef XENIA_CPU_PROCESSOR_H_
 #define XENIA_CPU_PROCESSOR_H_
 
+#include <atomic>
 #include <cstdio>
 #include <map>
 #include <memory>
@@ -111,14 +112,33 @@ class Processor {
                           BuiltinFunction::Handler handler, void* arg0,
                           void* arg1);
 
+  // Runs for a guest sc before the default handling, true if it handled it.
+  using SyscallHook = bool (*)(ppc::PPCContext* context);
+  SyscallHook syscall_hook() const { return syscall_hook_.load(); }
+  void set_syscall_hook(SyscallHook hook) { syscall_hook_.store(hook); }
+
+  // Lets guest code run from committed memory that no module claims.
+  void EnableDynamicCode();
+  bool dynamic_code_enabled() const {
+    return dynamic_code_enabled_.load(std::memory_order_relaxed);
+  }
+
   Function* QueryFunction(uint32_t address);
   std::vector<Function*> FindFunctionsWithAddress(uint32_t address);
   void RemoveFunctionByAddress(uint32_t address);
+  // Forgets code compiled from [address, address + length), so the next call
+  // into it compiles what the guest has since written there.
+  void InvalidateCodeRange(uint32_t address, uint32_t length);
 
   Function* LookupFunction(uint32_t address);
   Module* LookupModule(uint32_t address);
   Function* LookupFunction(Module* module, uint32_t address);
   Function* ResolveFunction(uint32_t address);
+  // |expand| appends more addresses to resolve from each resolved function.
+  size_t ResolveFunctionsInParallel(
+      std::vector<uint32_t> addresses,
+      const std::function<void(Function*, std::vector<uint32_t>&)>& expand =
+          {});
 
   bool Execute(ThreadState* thread_state, uint32_t address);
   bool ExecuteRaw(ThreadState* thread_state, uint32_t address);
@@ -325,6 +345,10 @@ class Processor {
   std::vector<std::unique_ptr<Module>> modules_;
   Module* builtin_module_ = nullptr;
   uint32_t next_builtin_address_ = 0xFFFF0000u;
+  // Consulted after modules_, so a loaded module always takes precedence.
+  std::unique_ptr<Module> dynamic_code_module_;
+  std::atomic<bool> dynamic_code_enabled_{false};
+  std::atomic<SyscallHook> syscall_hook_{nullptr};
 
   // Maps thread ID to state. Updated on thread create, and threads are never
   // removed. Must be guarded with the global lock.

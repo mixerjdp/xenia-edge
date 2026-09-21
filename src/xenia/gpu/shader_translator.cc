@@ -678,7 +678,6 @@ bool ShaderTranslator::TranslateAnalyzedShader(
 
   translation.errors_ = std::move(errors_);
   translation.translated_binary_ = CompleteTranslation();
-  translation.is_translated_ = true;
 
   bool is_valid = true;
   for (const auto& error : translation.errors_) {
@@ -687,19 +686,24 @@ bool ShaderTranslator::TranslateAnalyzedShader(
       break;
     }
   }
-  translation.is_valid_ = is_valid;
+  translation.is_valid_.store(is_valid, std::memory_order_relaxed);
 
   PostTranslation();
 
+  // Publish last: a thread that lost TryClaimTranslation spins on
+  // is_translated() and reads the validity and the binary right after, so all
+  // of the above has to be visible once it observes this.
+  translation.is_translated_.store(true, std::memory_order_release);
+
   // In case is_valid_ is modified by PostTranslation, reload.
-  if (translation.is_valid_) {
+  if (translation.is_valid()) {
     XELOGI("Shader {:016X} {} translated successfully ({} bytes)",
            shader.ucode_data_hash(),
            shader.type() == xenos::ShaderType::kVertex ? "vertex" : "pixel",
            translation.translated_binary_.size());
   }
 
-  return translation.is_valid_;
+  return translation.is_valid();
 }
 
 void ShaderTranslator::EmitTranslationError(const char* message,

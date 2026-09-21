@@ -11,13 +11,11 @@
 #define XENIA_GPU_D3D12_PIPELINE_CACHE_H_
 
 #include <atomic>
-#include <condition_variable>
 #include <cstdio>
 #include <deque>
 #include <functional>
 #include <memory>
 #include <mutex>
-#include <queue>
 #include <set>
 #include <string>
 #include <thread>
@@ -31,9 +29,9 @@
 #include "xenia/base/string_buffer.h"
 #include "xenia/base/threading.h"
 #include "xenia/gpu/d3d12/d3d12_render_target_cache.h"
-#include "xenia/gpu/d3d12/dxc_compiler.h"
 #include "xenia/gpu/gpu_flags.h"
 #include "xenia/gpu/guest_spirv_shader_cache.h"
+#include "xenia/gpu/pipeline_creation_queue.h"
 #include "xenia/gpu/primitive_processor.h"
 #include "xenia/gpu/register_file.h"
 #include "xenia/gpu/registers.h"
@@ -120,7 +118,7 @@ class PipelineCache : public GuestSpirvShaderCache::Host {
   // translator (standard feature set), one per creation thread plus the main
   // thread (the translator is not thread safe).
   std::unique_ptr<SpirvShaderTranslator> CreateTranslator() const override;
-  bool precise_interpolation_supported() const override;
+  bool precise_interpolation_supported() const;
   bool depth_float24_round() const override {
     return render_target_cache_.depth_float24_round();
   }
@@ -182,18 +180,26 @@ class PipelineCache : public GuestSpirvShaderCache::Host {
     return reinterpret_cast<const Pipeline*>(handle)->is_placeholder.load(
         std::memory_order_acquire);
   }
-  // Loads the current pipeline state once and reports whether it is the ucode
-  // interpreter placeholder. When it is, the draw must bind this concrete PSO
-  // (not the swappable handle) and feed interpreter constants, because the real
-  // VS reads a different (packed) float constant layout.
+  // Loads the current pipeline state once and reports whether it is a
+  // placeholder, and whether that placeholder is the ucode interpreter one.
+  // A placeholder draw must bind this concrete PSO instead of the swappable
+  // handle: the handle is resolved again when the deferred command list is
+  // replayed, so a real pipeline hot-swapped in meanwhile would run against
+  // bindings built for the placeholder - an empty bindless texture/sampler
+  // index buffer for the still-translating pixel shader, and (interpreter) the
+  // full-256 float constants the real VS doesn't use.
   ID3D12PipelineState* GetD3D12PipelineForDraw(
-      void* handle, bool* is_interpreter_placeholder_out) const {
+      void* handle, bool* is_placeholder_out,
+      bool* is_interpreter_placeholder_out) const {
     const Pipeline* pipeline = reinterpret_cast<const Pipeline*>(handle);
     ID3D12PipelineState* state =
         pipeline->state.load(std::memory_order_acquire);
-    *is_interpreter_placeholder_out =
+    bool is_placeholder =
         state != nullptr &&
-        state == pipeline->placeholder_state.load(std::memory_order_acquire) &&
+        state == pipeline->placeholder_state.load(std::memory_order_acquire);
+    *is_placeholder_out = is_placeholder;
+    *is_interpreter_placeholder_out =
+        is_placeholder &&
         pipeline->uses_interpreter.load(std::memory_order_acquire);
     return state;
   }
@@ -316,6 +322,10 @@ class PipelineCache : public GuestSpirvShaderCache::Host {
     uint32_t use_mesa_dxil : 1;  // 28
     // Native draw (scale threshold), keeps slope-scale unscaled.
     uint32_t resolution_scale_native : 1;  // 29
+    // ROV only - selects the depth-only pixel shader, which is specialized
+    // for the guest count. host_msaa_samples can't, guest 2x is rasterized as
+    // host 4x there.
+    xenos::MsaaSamples guest_msaa_samples : 2;  // 31
 
     uint32_t stencil_write_mask : 8;                   // 8
     xenos::StencilOp stencil_front_fail_op : 3;        // 11
@@ -332,8 +342,9 @@ class PipelineCache : public GuestSpirvShaderCache::Host {
     inline bool operator==(const PipelineDescription& other) const;
     // Bumped to invalidate caches: vertex/pixel_shader_modification are now
     // the canonical SPIR-V (spirv_to_dxil) modifications, not DXBC; then
-    // again for the constant-alpha blend state.
-    static constexpr uint32_t kVersion = 0x20260822;
+    // again for the constant-alpha blend state; then again for
+    // guest_msaa_samples changing the bitfield layout.
+    static constexpr uint32_t kVersion = 0x20260907;
   });
 
   XEPACKEDSTRUCT(PipelineStoredDescription, {
@@ -405,8 +416,8 @@ class PipelineCache : public GuestSpirvShaderCache::Host {
                           uint64_t data_hash);
 
   // Analyzes shaders in parallel for storage loading. D3D12 renders only
-  // through spirv_to_dxil, so only the ucode analysis is needed here, which
-  // the pipeline recreation reads for priority.
+  // through spirv_to_dxil, so only the ucode analysis is needed here, ahead of
+  // the translations the creation threads run.
   void AnalyzeShadersForStorage(
       const std::set<std::pair<uint64_t, uint64_t>>& translations_needed);
 
@@ -471,10 +482,6 @@ class PipelineCache : public GuestSpirvShaderCache::Host {
   // Temporary storage for AnalyzeUcode calls on the processor thread.
   StringBuffer ucode_disasm_buffer_;
 
-  // Kept only as an init-time presence check for dxcompiler.dll, which the Mesa
-  // DXIL signing path requires (see spirv_to_dxil_compiler).
-  std::unique_ptr<DxcCompiler> dxc_shader_compiler_;
-
   // Guest shader path: SpirvShaderTranslator output fed to Mesa spirv_to_dxil.
   // The shared cache owns the translator and the modification derivation.
   // SPIR-V translation (EnsureGuestMesaSpirv) is done on the main/draw thread,
@@ -497,9 +504,11 @@ class PipelineCache : public GuestSpirvShaderCache::Host {
   // thread (vertex/geometry/ tessellation) and the creation threads (pixel).
   std::mutex mesa_dxil_cache_mutex_;
   // Mesa DXIL for the FSI depth-only pixel shader, generated once at init for
-  // pixel-shader-less ROV draws. Empty if not ROV or generation failed (falls
+  // pixel-shader-less ROV draws - one per guest sample count, which the FSI
+  // shaders are specialized for. Empty if not ROV or generation failed (falls
   // back to the no-op placeholder_ps).
-  std::vector<uint8_t> mesa_depth_only_rov_pixel_shader_;
+  std::vector<uint8_t>
+      mesa_depth_only_rov_pixel_shaders_[size_t(xenos::MsaaSamples::k4X) + 1];
 
   // Ucode hash -> shader.
   std::unordered_map<uint64_t, SpirvShader*, xe::hash::IdentityHasher<uint64_t>>
@@ -513,9 +522,8 @@ class PipelineCache : public GuestSpirvShaderCache::Host {
     // creation thread swaps in the real one.
     std::atomic<bool> is_placeholder{false};
     // True when the placeholder rasterizes with the ucode interpreter VS (so
-    // the draw must feed it full float constants + the ucode location, and pin
-    // the concrete placeholder PSO since the real VS reads a different constant
-    // layout). Only meaningful while is_placeholder.
+    // the draw must feed it full float constants + the ucode location). Only
+    // meaningful while is_placeholder.
     std::atomic<bool> uses_interpreter{false};
     // The placeholder PSO handle (nullptr if none). A draw loads state once and
     // compares it against this to know whether it is about to bind the
@@ -528,15 +536,18 @@ class PipelineCache : public GuestSpirvShaderCache::Host {
     // pipeline. Set to nullptr after translation is done.
     Shader::Translation* pending_vertex_shader{nullptr};
     Shader::Translation* pending_pixel_shader{nullptr};
-    // Priority for async compilation (higher = compiled sooner).
-    // Pipelines that write to visible render targets get higher priority.
-    uint8_t priority{0};
-  };
+    // Built speculatively by the storage warm-up, not by a draw. Cleared on
+    // rebuild, which is what limits it to one attempt. A live pipeline that
+    // fails is a real failure and is never retried.
+    bool from_storage{false};
+    // Set by a creation thread when real creation failed. A warm-up build that
+    // ran before its shaders finished translating has no DXIL to create from,
+    // and the entry would otherwise skip its draws for the rest of the session.
+    std::atomic<bool> creation_failed{false};
 
-  // Comparator for priority queue - higher priority first.
-  struct PipelineCreationPriorityCompare {
-    bool operator()(const Pipeline* a, const Pipeline* b) const {
-      return a->priority < b->priority;  // max-heap: lower priority at bottom
+    // Whether the next draw should rebuild this entry from live state.
+    bool wants_rebuild() const {
+      return from_storage && creation_failed.load(std::memory_order_acquire);
     }
   };
 
@@ -569,37 +580,14 @@ class PipelineCache : public GuestSpirvShaderCache::Host {
   // index).
   ShaderStorageWriter<PipelineStoredDescription> storage_writer_;
 
-  // Pipeline creation threads.
-  void CreationThread(size_t thread_index);
-  void CreateQueuedPipelinesOnProcessorThread();
-  xe_mutex creation_request_lock_;
-  std::condition_variable_any creation_request_cond_;
-  // Priority queue contains pointers to map entries. Pipelines are never
-  // evicted as games have a finite set that should all remain cached for
-  // performance. Higher priority pipelines (those writing to visible RTs)
-  // are compiled first.
-  std::priority_queue<Pipeline*, std::vector<Pipeline*>,
-                      PipelineCreationPriorityCompare>
+  // Builds one queued pipeline, on a creation thread or on the processor thread
+  // draining the warm-up queue. Null if it failed.
+  ID3D12PipelineState* CreateQueuedPipeline(
+      Pipeline* pipeline, SpirvShaderTranslator* mesa_spirv_translator);
+  // Swaps a created pipeline (or a failure, |state| null) into its entry.
+  void StoreCreatedPipeline(Pipeline* pipeline, ID3D12PipelineState* state);
+  PipelineCreationQueue<Pipeline*, ID3D12PipelineState*, SpirvShaderTranslator>
       creation_queue_;
-  // Number of threads that are currently creating a pipeline - incremented when
-  // a pipeline is dequeued (the completion event can't be triggered before this
-  // is zero). Protected with creation_request_lock_.
-  size_t creation_threads_busy_ = 0;
-  // Manual-reset event set when the last queued pipeline is created and there
-  // are no more pipelines to create. This is triggered by the thread creating
-  // the last pipeline.
-  std::unique_ptr<xe::threading::Event> creation_completion_event_;
-  // Whether setting the event on completion is queued. Protected with
-  // creation_request_lock_, notify_one creation_request_cond_ when set.
-  bool creation_completion_set_event_ = false;
-  // Callback to invoke when all queued pipelines are created (for non-blocking
-  // initialization). Protected with creation_request_lock_.
-  std::function<void()> creation_completion_callback_;
-  // Creation threads with this index or above need to be shut down as soon as
-  // possible. Protected with creation_request_lock_, notify_all
-  // creation_request_cond_ when set.
-  size_t creation_threads_shutdown_from_ = SIZE_MAX;
-  std::vector<std::unique_ptr<xe::threading::Thread>> creation_threads_;
 
   // Placeholder pipelines replaced by their real counterpart on a creation
   // thread, paired with the submission they may still be referenced by. Real

@@ -60,6 +60,8 @@ class WxWindow : public Window {
 
   uint32_t GetMediumDpi() const override { return 96; }
 
+  bool GetMousePosition(int32_t& x, int32_t& y) const override;
+
  protected:
   bool OpenImpl() override;
   void RequestCloseImpl() override;
@@ -78,6 +80,7 @@ class WxWindow : public Window {
   std::unique_ptr<Surface> CreateSurfaceImpl(
       Surface::TypeFlags allowed_types) override;
   void RequestPaintImpl() override;
+  void RequestPaintAfterImpl(uint32_t milliseconds) override;
 
  private:
 #if XE_PLATFORM_WIN32
@@ -109,6 +112,7 @@ class WxWindow : public Window {
 
   void OnCursorAutoHideTimer(wxTimerEvent& event);
   void OnResizeDebounceTimer(wxTimerEvent& event);
+  void OnPaintDelayTimer(wxTimerEvent& event);
   void OnMenuOpen(wxMenuEvent& event);
   void OnMenuClose(wxMenuEvent& event);
 
@@ -132,6 +136,7 @@ class WxWindow : public Window {
   wxWindow* startup_cover_ = nullptr;
   wxTimer cursor_auto_hide_timer_;
   wxTimer resize_debounce_timer_;
+  wxTimer paint_delay_timer_;
   wxSize pending_resize_size_;
   bool cursor_currently_auto_hidden_ = false;
   bool menu_open_ = false;

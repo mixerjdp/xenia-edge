@@ -11,6 +11,7 @@
 #define XENIA_CPU_BACKEND_A64_A64_BACKEND_H_
 
 #include <atomic>
+#include <cstddef>
 #include <memory>
 
 #include "xenia/base/bit_map.h"
@@ -61,8 +62,21 @@ struct ReserveHelper {
 struct A64BackendStackpoint {
   uint64_t host_stack_;
   unsigned guest_stack_;
+  // Guest lr at the prolog, which a dynamic code return matches against.
   unsigned guest_return_address_;
 };
+
+// A resolved guest address that has no indirection slot.
+struct A64DynamicCallCacheEntry {
+  uint32_t guest_address;
+  uint32_t unused;
+  uint64_t host_address;
+};
+constexpr uint32_t kA64DynamicCallCacheSize = 4096;
+// EmitDynamicCallLookup indexes and loads these itself.
+static_assert(sizeof(A64DynamicCallCacheEntry) == 16);
+static_assert(offsetof(A64DynamicCallCacheEntry, host_address) == 8);
+static_assert((kA64DynamicCallCacheSize & (kA64DynamicCallCacheSize - 1)) == 0);
 
 uint32_t FindStackpointSyncDepth(const A64BackendStackpoint* stackpoints,
                                  uint32_t current_depth, uint32_t guest_sp);
@@ -109,6 +123,8 @@ struct A64BackendContext {
   uint64_t cached_reserve_value_;
   uint64_t* guest_tick_count;
   A64BackendStackpoint* stackpoints;
+  // allocated by the first dynamic call resolve on this thread
+  A64DynamicCallCacheEntry* dynamic_call_cache;
   // address of the live reservation, and its granule generation when taken
   uint32_t reserve_address;
   uint32_t reserve_generation;
@@ -171,6 +187,10 @@ class A64Backend : public Backend {
   void InitializeBackendContext(void* ctx) override;
   void DeinitializeBackendContext(void* ctx) override;
   void PrepareForReentry(void* ctx) override;
+  static A64BackendStackpoint* AllocStackpoints();
+  void* CreateStackpointState() override;
+  void DestroyStackpointState(void* state) override;
+  void SwapStackpointState(void* ctx, void* state) override;
 
   A64BackendContext* BackendContextForGuestContext(void* ctx) {
     return reinterpret_cast<A64BackendContext*>(

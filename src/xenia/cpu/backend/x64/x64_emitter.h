@@ -223,6 +223,7 @@ class X64Emitter : public Xbyak::CodeGenerator {
 
   Processor* processor() const { return processor_; }
   X64Backend* backend() const { return backend_; }
+  uint32_t current_guest_function() const { return current_guest_function_; }
 
   static uintptr_t PlaceConstData();
   static void FreeConstData(uintptr_t data);
@@ -237,7 +238,7 @@ class X64Emitter : public Xbyak::CodeGenerator {
   // Scratch:   rax/rcx/rdx, r8/r9
   //            rdx doubles as the call-site carrier for the resolve-thunk
   //            guest address (see Call/CallIndirect emission).
-  //            xmm0-2
+  //            xmm0-3 - the allocator hands out none of these
   // Available: rbx, r10-r15
   //            xmm4-xmm15 (save to get xmm3)
   static constexpr int GPR_COUNT = 7;

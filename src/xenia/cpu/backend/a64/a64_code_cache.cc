@@ -22,13 +22,13 @@ namespace backend {
 namespace a64 {
 
 void A64CodeCache::FillCode(void* write_address, size_t size) {
-  // Fill with BRK #0 (0xD4200000), 4-byte aligned.
-  constexpr uint32_t kBrk0 = 0xD4200000;
+  // 4-byte aligned. Not brk #0: A64Backend claims that as a breakpoint.
+  constexpr uint32_t kBrkFill = 0xD43E0020;  // brk #0xF001
   auto* p = reinterpret_cast<uint32_t*>(write_address);
   auto* end =
       reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(write_address) + size);
   for (; p < end; ++p) {
-    *p = kBrk0;
+    *p = kBrkFill;
   }
 }
 

@@ -50,8 +50,8 @@
 
 DEFINE_bool(
     d3d12_install_missing_runtime, true,
-    "When a required Direct3D 12 runtime DLL (the DXIL shader compiler, the "
-    "Agility SDK, or the debug layer) is missing, offer to download it from "
+    "When a required Direct3D 12 runtime DLL (the DXIL validator, the Agility "
+    "SDK, or the debug layer) is missing, offer to download it from "
     "Microsoft. Disable to manage the DLLs manually.",
     "D3D12");
 
@@ -76,8 +76,9 @@ namespace ui {
 
 namespace {
 
-// Pinned DirectX Shader Compiler redistributable. Update all of these together
-// when bumping: the SHA-256 is the GitHub release asset's "digest" field.
+// Pinned DirectX Shader Compiler redistributable. Only dxil.dll is taken from
+// it, the signer for the DXIL Mesa emits. Update all of these together when
+// bumping: the SHA-256 is the GitHub release asset's "digest" field.
 constexpr wchar_t kDxcUrl[] =
     L"https://github.com/microsoft/DirectXShaderCompiler/releases/download/"
     L"v1.9.2602.24/dxc_2026_05_27.zip";
@@ -117,7 +118,6 @@ struct RedistEntry {
   const wchar_t* dest_name;
 };
 constexpr RedistEntry kDxcEntries[] = {
-    {"bin/" XE_D3D12_REDIST_ARCH "/dxcompiler.dll", L"dxcompiler.dll"},
     {"bin/" XE_D3D12_REDIST_ARCH "/dxil.dll", L"dxil.dll"},
 };
 constexpr RedistEntry kAgilityEntries[] = {
@@ -171,25 +171,19 @@ constexpr DWORD kVCRuntimeMinMinor =
     kVCRuntimeBuiltMinor < kVCRuntimeLatestMinor ? kVCRuntimeBuiltMinor
                                                  : kVCRuntimeLatestMinor;
 
-// True if both dxcompiler.dll and dxil.dll resolve, either from the D3D12
-// folder or anywhere on the default DLL search path (system-wide or next to the
-// exe).
+// True if dxil.dll resolves, either from the D3D12 folder or anywhere on the
+// default DLL search path (system-wide or next to the exe).
 bool ShaderCompilerPresent(const std::filesystem::path& d3d12_dir) {
   std::error_code ec;
-  if (std::filesystem::exists(d3d12_dir / "dxcompiler.dll", ec) &&
-      std::filesystem::exists(d3d12_dir / "dxil.dll", ec)) {
+  if (std::filesystem::exists(d3d12_dir / "dxil.dll", ec)) {
     return true;
   }
-  HMODULE dxcompiler = LoadLibraryW(L"dxcompiler.dll");
   HMODULE dxil = LoadLibraryW(L"dxil.dll");
-  bool present = dxcompiler != nullptr && dxil != nullptr;
-  if (dxcompiler) {
-    FreeLibrary(dxcompiler);
+  if (!dxil) {
+    return false;
   }
-  if (dxil) {
-    FreeLibrary(dxil);
-  }
-  return present;
+  FreeLibrary(dxil);
+  return true;
 }
 
 #if !XE_ARCH_ARM64
@@ -597,8 +591,8 @@ bool EnsureShaderCompilerRuntime(const std::filesystem::path& d3d12_dir) {
   }
   if (!cvars::d3d12_install_missing_runtime) {
     XELOGW(
-        "DXIL shader compiler runtime (dxcompiler.dll + dxil.dll) is missing "
-        "and auto-install is disabled (d3d12_install_missing_runtime=false)");
+        "The DXIL validator (dxil.dll) is missing and auto-install is disabled "
+        "(d3d12_install_missing_runtime=false)");
     return false;
   }
 
@@ -609,22 +603,20 @@ bool EnsureShaderCompilerRuntime(const std::filesystem::path& d3d12_dir) {
   }
   prompted = true;
 
-  if (!AskYesNo(
-          _("dxcompiler.dll and dxil.dll not found, required for Direct3D 12 "
-            "shaders. Download now (~26 MB)?"))) {
-    XELOGW("User declined the DXIL shader compiler runtime download");
+  if (!AskYesNo(_("dxil.dll not found, required for Direct3D 12 shaders. "
+                  "Download now (~26 MB)?"))) {
+    XELOGW("User declined the DXIL validator download");
     RememberDecline();
     return false;
   }
 
-  XELOGI("Downloading the DXIL shader compiler runtime from Microsoft...");
+  XELOGI("Downloading the DXIL validator from Microsoft...");
   if (!DownloadAndExtract(kDxcUrl, kDxcSha256, kDxcEntries,
                           xe::countof(kDxcEntries), d3d12_dir)) {
     return false;
   }
 
-  XELOGI("DXIL shader compiler runtime installed to {}",
-         xe::path_to_utf8(d3d12_dir));
+  XELOGI("DXIL validator installed to {}", xe::path_to_utf8(d3d12_dir));
   return true;
 }
 

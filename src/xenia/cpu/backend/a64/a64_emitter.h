@@ -135,6 +135,8 @@ class A64Emitter : public Xbyak_aarch64::CodeGenerator {
                                     const GuestFunction* function);
   void CallNative(void* fn);
   void CallNativeSafe(void* fn);
+  // Loads the host address for the guest address in w16 into x9.
+  void EmitDynamicCallLookup(bool tail);
   void SetReturnAddress(uint64_t value);
 
   // Backend context register = x19.

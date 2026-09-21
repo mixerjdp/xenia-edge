@@ -28,6 +28,7 @@ bool signal_handlers_installed_ = false;
 struct sigaction original_sigill_handler_;
 struct sigaction original_sigsegv_handler_;
 struct sigaction original_sigbus_handler_;
+struct sigaction original_sigtrap_handler_;
 
 // This can be as large as needed, but isn't often needed.
 // As we will be sometimes firing many exceptions we want to avoid having to
@@ -40,6 +41,13 @@ std::pair<ExceptionHandler::Handler, void*> handlers_[kMaxHandlerCount];
 
 static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
                                      void* signal_context) {
+  if (signal_number == SIGTRAP && signal_info->si_code <= 0) {
+    // raise()/kill(), not a trap instruction - xenia_assert uses this. Nothing
+    // here can claim it, and the handlers below would swallow it.
+    sigaction(SIGTRAP, &original_sigtrap_handler_, nullptr);
+    raise(SIGTRAP);
+    return;
+  }
   if (signal_number == SIGSEGV &&
       xe::threading::Fiber::IsStackOverflowFault(signal_info->si_addr)) {
     // Crash-safe diagnostic, the process is going down on the default action.
@@ -169,6 +177,7 @@ static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
 
   Exception ex;
   switch (signal_number) {
+    case SIGTRAP:
     case SIGILL:
       ex.InitializeIllegalInstruction(&thread_context);
       break;
@@ -396,14 +405,19 @@ static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
           std::memcpy(&mcontext_fpsimd->vregs[modified_register_index],
                       &thread_context.v[modified_register_index],
                       sizeof(vec128_t));
-          mcontext.regs[modified_register_index] =
-              thread_context.x[modified_register_index];
         }
       }
 #endif  // XE_PLATFORM_MAC
 #endif  // XE_ARCH
       return;
     }
+  }
+
+  if (signal_number == SIGTRAP) {
+    // Returning would resume past the trap; hand it to the original handler.
+    sigaction(SIGTRAP, &original_sigtrap_handler_, nullptr);
+    raise(SIGTRAP);
+    return;
   }
 
   // Unhandled: restore the original disposition so the kernel re-delivers
@@ -449,6 +463,9 @@ void ExceptionHandler::Install(Handler fn, void* data) {
     if (sigaction(SIGBUS, &signal_handler, &original_sigbus_handler_) != 0) {
       assert_always("Failed to install new SIGBUS handler");
     }
+    if (sigaction(SIGTRAP, &signal_handler, &original_sigtrap_handler_) != 0) {
+      assert_always("Failed to install new SIGTRAP handler");
+    }
     signal_handlers_installed_ = true;
   }
 
@@ -491,6 +508,9 @@ void ExceptionHandler::Uninstall(Handler fn, void* data) {
       }
       if (sigaction(SIGBUS, &original_sigbus_handler_, NULL) != 0) {
         assert_always("Failed to restore original SIGBUS handler");
+      }
+      if (sigaction(SIGTRAP, &original_sigtrap_handler_, NULL) != 0) {
+        assert_always("Failed to restore original SIGTRAP handler");
       }
       signal_handlers_installed_ = false;
     }

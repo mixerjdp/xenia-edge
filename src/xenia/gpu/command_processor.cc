@@ -9,6 +9,7 @@
 
 #include "xenia/gpu/command_processor.h"
 
+#include <algorithm>
 #include <fstream>
 
 #include "third_party/fmt/include/fmt/format.h"
@@ -97,11 +98,11 @@ DEFINE_string(
 
 DEFINE_bool(
     memexport_enable, true,
-    "Make memory export output visible to the CPU by routing the draws that "
-    "write it to a buffer aliasing guest RAM. Needed by games that read "
+    "Make memory export output visible to the CPU. Needed by games that read "
     "exported data on the CPU. Disabling it keeps the output in device-local "
-    "memory, which is faster for the draws that consume it on the GPU. Applies "
-    "at title launch.",
+    "memory, which is faster for the draws that consume it on the GPU. The "
+    "output reaches guest RAM in place where the host buffer is available "
+    "(see enable_host_buffer), and through a staging copy otherwise.",
     "GPU");
 
 DEFINE_bool(
@@ -134,6 +135,9 @@ void SaveGPUSetting(GPUSetting setting, uint64_t value) {
     case GPUSetting::ClearMemoryPageState:
       OVERRIDE_bool(clear_memory_page_state, static_cast<bool>(value));
       break;
+    case GPUSetting::MemexportEnable:
+      OVERRIDE_bool(memexport_enable, static_cast<bool>(value));
+      break;
     case GPUSetting::MemexportAwaitFences:
       OVERRIDE_bool(memexport_await_fences, static_cast<bool>(value));
       break;
@@ -144,6 +148,8 @@ bool GetGPUSetting(GPUSetting setting) {
   switch (setting) {
     case GPUSetting::ClearMemoryPageState:
       return cvars::clear_memory_page_state;
+    case GPUSetting::MemexportEnable:
+      return cvars::memexport_enable;
     case GPUSetting::MemexportAwaitFences:
       return cvars::memexport_await_fences;
     default:
@@ -547,8 +553,8 @@ void CommandProcessor::WorkerThreadMain() {
     // Execute. Note that we handle wraparound transparently.
     read_ptr_index_ = ExecutePrimaryBuffer(read_ptr_index_, write_ptr_index);
 
-    // TODO(benvanik): use reader->Read_update_freq_ and only issue after moving
-    //     that many indices.
+    // ExecutePrimaryBuffer republishes this every read_ptr_update_freq_ dwords
+    // as it drains, this is the final position for the burst.
     // Keep in mind that the gpu also updates the cpu-side copy if the write
     // pointer and read pointer would be equal
     if (read_ptr_writeback_ptr_) {
@@ -641,9 +647,10 @@ void CommandProcessor::EnableReadPointerWriteBack(uint32_t ptr,
   // ptr = RB_RPTR_ADDR, pointer to write back the address to.
   read_ptr_writeback_ptr_ = ptr;
   // CP_RB_CNTL Ring Buffer Control 0x704
-  // block_size = RB_BLKSZ, log2 of number of quadwords read between updates of
-  //              the read pointer.
-  read_ptr_update_freq_ = uint32_t(1) << block_size_log2 >> 2;
+  // block_size = RB_BLKSZ, log2 of the number of quadwords read between
+  // updates of the read pointer. Kept in dwords, the unit read_ptr_index_ and
+  // the write-back use. Usually 6, so 128 dwords.
+  read_ptr_update_freq_ = (uint32_t(1) << std::min(block_size_log2, 19u)) * 2;
 }
 
 XE_NOINLINE XE_COLD void CommandProcessor::LogKickoffInitator(uint32_t value) {

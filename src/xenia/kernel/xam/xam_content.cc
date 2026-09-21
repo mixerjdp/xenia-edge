@@ -123,21 +123,26 @@ dword_result_t xeXamContentResolve(
         root_device_path = "\\Device\\Harddisk0\\Partition1\\Content\\";
       } else if (content_data.device_id ==
                  static_cast<uint32_t>(DummyDeviceId::ODD)) {
-        // Or GAME, but D: usually means DVD drive meanwhile GAME always
-        // pinpoints to game, even if it is running from HDD
-        root_device_path = "D:\\content\\";
+        root_device_path = kernel_state()->title_mount_path_ + "\\content\\";
       } else {
         return X_ERROR_INVALID_PARAMETER;
       }
     }
 
-    const std::string relative_path = fmt::format(
-        "{:016X}\\{:08X}\\{:08X}\\{}", xuid, kernel_state()->title_id(),
-        static_cast<uint32_t>(content_data.content_type.get()),
-        content_data.file_name());
+    const std::string relative_dir =
+        fmt::format("{:016X}\\{:08X}\\{:08X}", xuid, kernel_state()->title_id(),
+                    static_cast<uint32_t>(content_data.content_type.get()));
+    const std::string content_dir = root_device_path + relative_dir;
 
-    string_util::copy_truncating(path_ptr, root_device_path + relative_path,
-                                 path_size);
+    // The caller creates the package file itself, so the directory must exist.
+    if (create_directory && !kernel_state()->file_system()->CreatePath(
+                                content_dir, vfs::kFileAttributeDirectory)) {
+      XELOGW("XamContentResolve: Cannot create content directory {}",
+             content_dir);
+    }
+
+    string_util::copy_truncating(
+        path_ptr, content_dir + "\\" + content_data.file_name(), path_size);
 
     // Check if it exists and try to mount that package
     // Result of buffer_ptr is sent to RtlInitAnsiString.
@@ -718,7 +723,7 @@ dword_result_t XamSwapDisc_entry(
     }
   };
 
-  if (info->disc_number == disc_number) {
+  if (kernel_state()->emulator()->current_disc_number() == disc_number) {
     completion_event();
     return X_ERROR_SUCCESS;
   }
@@ -743,7 +748,7 @@ dword_result_t XamSwapDisc_entry(
         kernel_state()->emulator()->GetNewDiscPath(
             xe::to_utf8(text_message) + "\n\n" + error_dialog_message);
     XELOGI("XamSwapDisc: GetNewDiscPath returned path {}.",
-           new_disc_path.string().c_str());
+           xe::path_to_utf8(new_disc_path));
 
     // Clear the error message for next iteration
     error_dialog_message.clear();
@@ -764,7 +769,7 @@ dword_result_t XamSwapDisc_entry(
         kernel_state()->emulator()->MountPath(new_disc_path, mount_path);
     if (mount_result != X_ERROR_SUCCESS) {
       XELOGE("XamSwapDisc: Failed to mount disc at path: {}",
-             new_disc_path.string());
+             xe::path_to_utf8(new_disc_path));
       error_dialog_message =
           "ERROR: Failed to mount the selected disc image.\n"
           "Please select a valid disc image file.";
@@ -837,12 +842,10 @@ dword_result_t XamSwapDisc_entry(
             uint8_t(exec_info.disc_number), uint8_t(exec_info.disc_count),
             uint32_t(exec_info.title_id), uint32_t(exec_info.media_id));
 
-        std::string disc_label;
-        if (exec_info.disc_count > 1 && exec_info.disc_number > 0) {
-          disc_label = fmt::format("Disc {}", uint8_t(exec_info.disc_number));
-        }
-        kernel_state()->emulator()->RecordDisc(info->title_id, disc_label,
-                                               new_disc_path);
+        kernel_state()->emulator()->set_current_disc_number(
+            exec_info.disc_number);
+
+        kernel_state()->emulator()->RecordDisc(info->title_id, new_disc_path);
 
         // Update the host_path in loader_data so title restarts use the new
         // disc
@@ -870,6 +873,9 @@ dword_result_t XamSwapDisc_entry(
       if (xam) {
         xam->loader_data().host_path = xe::path_to_utf8(new_disc_path);
       }
+
+      kernel_state()->emulator()->set_current_disc_number(
+          static_cast<uint8_t>(disc_number));
 
       // For non-container devices, accept them (backward compatibility)
       break;
@@ -965,7 +971,8 @@ dword_result_t XamContentLaunchImageInternal_entry(lpvoid_t content_data_ptr,
   // This should be done via content_manager, however as it isn't capable of
   // such action we need to improvise.
   const std::string package_path =
-      fmt::format("GAME:/Content/0000000000000000/{:08X}/{:08X}/{}", title_id,
+      fmt::format("{}/Content/0000000000000000/{:08X}/{:08X}/{}",
+                  kernel_state()->title_mount_path_, title_id,
                   static_cast<uint32_t>(content_data.content_type.get()),
                   content_data.file_name());
 

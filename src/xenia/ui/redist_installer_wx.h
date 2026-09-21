@@ -19,8 +19,8 @@ namespace ui {
 // Windows-only Direct3D 12 DLLs; on other platforms the entry points are
 // no-ops.
 
-// If dxcompiler.dll + dxil.dll aren't loadable from d3d12_dir or the system,
-// prompts once and downloads them into d3d12_dir (loaded in-process, no
+// If dxil.dll (the DXIL signer) isn't loadable from d3d12_dir or the system,
+// prompts once and downloads it into d3d12_dir (loaded in-process, no
 // restart). Returns true if present already or after a successful install.
 bool EnsureShaderCompilerRuntime(const std::filesystem::path& d3d12_dir);
 

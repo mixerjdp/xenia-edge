@@ -10,8 +10,10 @@
 #include "xenia/cpu/processor.h"
 
 #include <algorithm>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <unordered_set>
 #include <vector>
 
 #include "xenia/base/assert.h"
@@ -90,6 +92,54 @@ class BuiltinModule : public Module {
   std::string name_;
 };
 
+class DynamicCodeModule : public Module {
+ public:
+  explicit DynamicCodeModule(Processor* processor)
+      : Module(processor), name_("dynamic") {}
+
+  const std::string& name() const override { return name_; }
+  bool is_executable() const override { return false; }
+
+  // User mode addresses alias physical memory, so ask about the kernel address.
+  bool ContainsAddress(uint32_t address) override {
+    const uint32_t kernel_address = memory_->UserModeKernelAddress(address);
+    auto heap = memory_->LookupHeap(kernel_address);
+    if (!heap) {
+      return false;
+    }
+    uint32_t protect = 0;
+    if (heap->QueryProtect(kernel_address, &protect) &&
+        (protect & kMemoryProtectRead)) {
+      return true;
+    }
+    // The physical windows alias each other, the parent heap records them all.
+    if (heap->heap_type() != HeapType::kGuestPhysical) {
+      return false;
+    }
+    auto parent = static_cast<PhysicalHeap*>(heap)->parent_heap();
+    const uint32_t physical_address =
+        memory_->GetPhysicalAddress(kernel_address);
+    protect = 0;
+    return parent && physical_address != UINT32_MAX &&
+           parent->QueryProtect(physical_address, &protect) &&
+           (protect & kMemoryProtectRead);
+  }
+
+  const uint8_t* TranslateCode(uint32_t address) const override {
+    return memory_->TranslateVirtual<const uint8_t*>(
+        memory_->UserModeKernelAddress(address));
+  }
+
+ protected:
+  std::unique_ptr<Function> CreateFunction(uint32_t address) override {
+    return std::unique_ptr<Function>(
+        processor_->backend()->CreateGuestFunction(this, address));
+  }
+
+ private:
+  std::string name_;
+};
+
 Processor::Processor(xe::Memory* memory, ExportResolver* export_resolver)
     : memory_(memory), export_resolver_(export_resolver) {}
 
@@ -97,6 +147,7 @@ Processor::~Processor() {
   {
     auto global_lock = global_critical_region_.Acquire();
     modules_.clear();
+    dynamic_code_module_.reset();
   }
 
   frontend_.reset();
@@ -394,7 +445,8 @@ Module* Processor::GetModule(const std::string_view name) {
 
 std::vector<Module*> Processor::GetModules() {
   auto global_lock = global_critical_region_.Acquire();
-  std::vector<Module*> clone(modules_.size());
+  std::vector<Module*> clone;
+  clone.reserve(modules_.size());
   for (const auto& module : modules_) {
     clone.push_back(module.get());
   }
@@ -433,6 +485,22 @@ std::vector<Function*> Processor::FindFunctionsWithAddress(uint32_t address) {
 
 void Processor::RemoveFunctionByAddress(uint32_t address) {
   entry_table_.Delete(address);
+}
+
+void Processor::InvalidateCodeRange(uint32_t address, uint32_t length) {
+  if (!length) {
+    return;
+  }
+  const uint32_t end = address + length - 1;
+  auto global_lock = global_critical_region_.Acquire();
+  for (Function* function : entry_table_.DeleteRange(address, end)) {
+    // The entry is what a call looks up, but the module would hand back the
+    // same already defined symbol and never compile the new code.
+    if (function && function->module()) {
+      function->module()->ForgetSymbol(function->address());
+    }
+  }
+  backend_->InvalidateDynamicCalls(address, end);
 }
 
 Function* Processor::ResolveFunction(uint32_t address) {
@@ -477,6 +545,73 @@ Function* Processor::ResolveFunction(uint32_t address) {
     return nullptr;
   }
 }
+
+size_t Processor::ResolveFunctionsInParallel(
+    std::vector<uint32_t> addresses,
+    const std::function<void(Function*, std::vector<uint32_t>&)>& expand) {
+  if (addresses.empty()) {
+    return 0;
+  }
+  std::mutex lock;
+  std::condition_variable cv;
+  std::unordered_set<uint32_t> queued(addresses.begin(), addresses.end());
+  size_t active = 0;
+  size_t resolved = 0;
+  auto work = [&]() {
+    std::vector<uint32_t> found;
+    std::unique_lock<std::mutex> guard(lock);
+    while (true) {
+      cv.wait(guard, [&]() { return !addresses.empty() || !active; });
+      if (addresses.empty()) {
+        return;
+      }
+      uint32_t address = addresses.back();
+      addresses.pop_back();
+      ++active;
+      guard.unlock();
+      Function* function = ResolveFunction(address);
+      found.clear();
+      if (function && expand) {
+        expand(function, found);
+      }
+      guard.lock();
+      resolved += function ? 1 : 0;
+      for (uint32_t next : found) {
+        if (queued.insert(next).second) {
+          addresses.push_back(next);
+        }
+      }
+      --active;
+      cv.notify_all();
+    }
+  };
+  size_t count = std::clamp<size_t>(xe::threading::logical_processor_count(), 1,
+                                    addresses.size());
+  std::vector<std::unique_ptr<xe::threading::Thread>> threads;
+  xe::threading::Thread::CreationParameters params;
+  // Optimizer passes recurse, so match a guest fiber's stack.
+  params.stack_size = 16_MiB;
+  for (size_t i = 0; i < count; ++i) {
+    auto thread = xe::threading::Thread::Create(params, [&work, i]() {
+      std::string name = "Precompile " + std::to_string(i);
+      xe::threading::set_name(name);
+      Profiler::ThreadEnter(name.c_str());
+      work();
+      Profiler::ThreadExit();
+    });
+    if (thread) {
+      threads.push_back(std::move(thread));
+    }
+  }
+  if (threads.empty()) {
+    work();
+  }
+  for (auto& thread : threads) {
+    xe::threading::Wait(thread.get(), false);
+  }
+  return resolved;
+}
+
 Module* Processor::LookupModule(uint32_t address) {
   auto global_lock = global_critical_region_.Acquire();
   // TODO(benvanik): sort by code address (if contiguous) so can bsearch.
@@ -486,8 +621,20 @@ Module* Processor::LookupModule(uint32_t address) {
       return module.get();
     }
   }
+  if (dynamic_code_module_ && dynamic_code_module_->ContainsAddress(address)) {
+    return dynamic_code_module_.get();
+  }
   return nullptr;
 }
+
+void Processor::EnableDynamicCode() {
+  auto global_lock = global_critical_region_.Acquire();
+  if (!dynamic_code_module_) {
+    dynamic_code_module_ = std::make_unique<DynamicCodeModule>(this);
+  }
+  dynamic_code_enabled_.store(true, std::memory_order_relaxed);
+}
+
 Function* Processor::LookupFunction(uint32_t address) {
   // TODO(benvanik): fast reject invalid addresses/log errors.
 

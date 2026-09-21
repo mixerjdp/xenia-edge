@@ -7,22 +7,50 @@
  ******************************************************************************
  */
 
-#include <cstdlib>
+#include <crt_externs.h>
+#include <spawn.h>
+#include <sys/wait.h>
 
+#include <cerrno>
+#include <cstdlib>
+#include <cstring>
+#include <string>
+#include <vector>
+
+#include "xenia/base/logging.h"
 #include "xenia/base/system.h"
 
 namespace xe {
+namespace {
+
+void SpawnAndWait(const std::vector<std::string>& args) {
+  std::vector<char*> argv;
+  argv.reserve(args.size() + 1);
+  for (const auto& arg : args) {
+    argv.push_back(const_cast<char*>(arg.c_str()));
+  }
+  argv.push_back(nullptr);
+  pid_t pid = 0;
+  // posix_spawnp returns the error number; it does not set errno.
+  int error = posix_spawnp(&pid, argv[0], nullptr, nullptr, argv.data(),
+                           *_NSGetEnviron());
+  if (error) {
+    XELOGE("posix_spawnp({}) failed: {} ({})", argv[0], strerror(error), error);
+    return;
+  }
+  int status = 0;
+  while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+  }
+}
+
+}  // namespace
 
 void LaunchWebBrowser(const std::string_view url) {
-  auto cmd = std::string("open ");
-  cmd.append(url);
-  system(cmd.c_str());
+  SpawnAndWait({"open", std::string(url)});
 }
 
 void LaunchFileExplorer(const std::filesystem::path& path) {
-  auto cmd = std::string("open ");
-  cmd.append(path.string());
-  system(cmd.c_str());
+  SpawnAndWait({"open", path.string()});
 }
 
 void ShowSimpleMessageBox(SimpleMessageBoxType type, std::string_view message) {
@@ -39,26 +67,35 @@ void ShowSimpleMessageBox(SimpleMessageBoxType type, std::string_view message) {
       icon = "stop";
       break;
   }
-  // Use osascript to display a native macOS dialog.
-  auto cmd = std::string("osascript -e 'display dialog \"");
-  // Escape double quotes in the message.
+  std::string script = "display dialog \"";
+  // A raw newline is a syntax error inside an AppleScript string.
   for (char c : message) {
-    if (c == '"') {
-      cmd += "\\\"";
-    } else if (c == '\\') {
-      cmd += "\\\\";
-    } else {
-      cmd += c;
+    switch (c) {
+      case '"':
+      case '\\':
+        script += '\\';
+        script += c;
+        break;
+      case '\n':
+        script += "\\n";
+        break;
+      case '\r':
+        script += "\\r";
+        break;
+      case '\t':
+        script += "\\t";
+        break;
+      default:
+        script += c;
+        break;
     }
   }
-  cmd += "\" with icon ";
-  cmd += icon;
-  cmd += " buttons {\"OK\"} default button \"OK\" with title \"Xenia\"'";
-  system(cmd.c_str());
+  script += "\" with icon ";
+  script += icon;
+  script += " buttons {\"OK\"} default button \"OK\" with title \"Xenia\"";
+  SpawnAndWait({"osascript", "-e", script});
 }
 
 bool SetProcessPriorityClass(const uint32_t priority_class) { return true; }
-
-bool IsUseNexusForGameBarEnabled() { return false; }
 
 }  // namespace xe

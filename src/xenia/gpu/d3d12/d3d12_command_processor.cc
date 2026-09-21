@@ -41,6 +41,7 @@ DEFINE_bool(d3d12_bindless, true,
 DECLARE_bool(clear_memory_page_state);
 DECLARE_bool(d3d12_debug);
 DECLARE_bool(gpu_debug_markers);
+DECLARE_bool(memexport_enable);
 DECLARE_bool(submit_on_primary_buffer_end);
 
 namespace xe {
@@ -107,6 +108,15 @@ void D3D12CommandProcessor::ClearCaches() {
 
 void D3D12CommandProcessor::InvalidateGpuMemory() {
   shared_memory_->InvalidateAllPages();
+}
+
+void D3D12CommandProcessor::ClearReadbackBuffers() {
+  if (AwaitAllQueueOperationsCompletion()) {
+    ClearReadbackStagingBuffers();
+    // Their staging buffers are gone, so there is nothing left to copy out.
+    memexport_staged_.clear();
+    pending_resolve_staging_ = PendingResolveStaging();
+  }
 }
 
 void D3D12CommandProcessor::InitializeShaderStorage(
@@ -649,11 +659,9 @@ bool D3D12CommandProcessor::SetupContext() {
   resolve_read_callback_ = memory_->RegisterPhysicalMemoryReadCallback(
       ResolveReadCallbackThunk, this);
 
-  // Initialize the render target cache before configuring binding - need to
-  // know if using rasterizer-ordered views for the bindless root signature.
   render_target_cache_ = std::make_unique<D3D12RenderTargetCache>(
       *register_file_, *memory_, trace_writer_, draw_resolution_scale_x,
-      draw_resolution_scale_y, *this, bindless_resources_used_);
+      draw_resolution_scale_y, *this);
   if (!render_target_cache_->Initialize()) {
     XELOGE("Failed to initialize the render target cache");
     return false;
@@ -706,246 +714,6 @@ bool D3D12CommandProcessor::SetupContext() {
     sampler_bindful_heap_pool_ =
         std::make_unique<ui::d3d12::D3D12DescriptorHeapPool>(
             device, D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, kSamplerHeapSize);
-  }
-
-  if (bindless_resources_used_) {
-    // Global bindless resource root signatures.
-    // No CBV or UAV descriptor ranges with any descriptors to be allocated
-    // dynamically (via RequestPersistentViewBindlessDescriptor or
-    // RequestOneUseSingleViewDescriptors) should be here, because they would
-    // overlap the unbounded SRV range, which is not allowed on Nvidia Fermi!
-    D3D12_ROOT_SIGNATURE_DESC root_signature_bindless_desc;
-    D3D12_ROOT_PARAMETER
-    root_parameters_bindless[kRootParameter_Bindless_Count];
-    root_signature_bindless_desc.NumParameters = kRootParameter_Bindless_Count;
-    root_signature_bindless_desc.pParameters = root_parameters_bindless;
-    root_signature_bindless_desc.NumStaticSamplers = 0;
-    root_signature_bindless_desc.pStaticSamplers = nullptr;
-    // For SM 6.6 DXIL with ResourceDescriptorHeap/SamplerDescriptorHeap.
-    root_signature_bindless_desc.Flags =
-        D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED |
-        D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED;
-    // Fetch constants.
-    {
-      auto& parameter =
-          root_parameters_bindless[kRootParameter_Bindless_FetchConstants];
-      parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
-      parameter.Descriptor.ShaderRegister =
-          uint32_t(DxbcShaderTranslator::CbufferRegister::kFetchConstants);
-      parameter.Descriptor.RegisterSpace = 0;
-      parameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-    }
-    // Vertex float constants.
-    {
-      auto& parameter = root_parameters_bindless
-          [kRootParameter_Bindless_FloatConstantsVertex];
-      parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
-      parameter.Descriptor.ShaderRegister =
-          uint32_t(DxbcShaderTranslator::CbufferRegister::kFloatConstants);
-      parameter.Descriptor.RegisterSpace = 0;
-      parameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
-    }
-    // Pixel float constants.
-    {
-      auto& parameter =
-          root_parameters_bindless[kRootParameter_Bindless_FloatConstantsPixel];
-      parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
-      parameter.Descriptor.ShaderRegister =
-          uint32_t(DxbcShaderTranslator::CbufferRegister::kFloatConstants);
-      parameter.Descriptor.RegisterSpace = 0;
-      parameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-    }
-    // Pixel shader descriptor indices.
-    {
-      auto& parameter = root_parameters_bindless
-          [kRootParameter_Bindless_DescriptorIndicesPixel];
-      parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
-      parameter.Descriptor.ShaderRegister =
-          uint32_t(DxbcShaderTranslator::CbufferRegister::kDescriptorIndices);
-      parameter.Descriptor.RegisterSpace = 0;
-      parameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-    }
-    // Vertex shader descriptor indices.
-    {
-      auto& parameter = root_parameters_bindless
-          [kRootParameter_Bindless_DescriptorIndicesVertex];
-      parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
-      parameter.Descriptor.ShaderRegister =
-          uint32_t(DxbcShaderTranslator::CbufferRegister::kDescriptorIndices);
-      parameter.Descriptor.RegisterSpace = 0;
-      parameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
-    }
-    // System constants.
-    {
-      auto& parameter =
-          root_parameters_bindless[kRootParameter_Bindless_SystemConstants];
-      parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
-      parameter.Descriptor.ShaderRegister =
-          uint32_t(DxbcShaderTranslator::CbufferRegister::kSystemConstants);
-      parameter.Descriptor.RegisterSpace = 0;
-      parameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-    }
-    // Bool and loop constants.
-    {
-      auto& parameter =
-          root_parameters_bindless[kRootParameter_Bindless_BoolLoopConstants];
-      parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
-      parameter.Descriptor.ShaderRegister =
-          uint32_t(DxbcShaderTranslator::CbufferRegister::kBoolLoopConstants);
-      parameter.Descriptor.RegisterSpace = 0;
-      parameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-    }
-    // Shared memory SRV and UAV.
-    D3D12_DESCRIPTOR_RANGE root_shared_memory_view_ranges[2];
-    {
-      auto& parameter =
-          root_parameters_bindless[kRootParameter_Bindless_SharedMemory];
-      parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-      parameter.DescriptorTable.NumDescriptorRanges =
-          uint32_t(xe::countof(root_shared_memory_view_ranges));
-      parameter.DescriptorTable.pDescriptorRanges =
-          root_shared_memory_view_ranges;
-      parameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-      {
-        auto& range = root_shared_memory_view_ranges[0];
-        range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-        range.NumDescriptors = 1;
-        range.BaseShaderRegister =
-            UINT(DxbcShaderTranslator::SRVMainRegister::kSharedMemory);
-        range.RegisterSpace = UINT(DxbcShaderTranslator::SRVSpace::kMain);
-        range.OffsetInDescriptorsFromTableStart = 0;
-      }
-      {
-        auto& range = root_shared_memory_view_ranges[1];
-        range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
-        range.NumDescriptors = 1;
-        range.BaseShaderRegister =
-            UINT(DxbcShaderTranslator::UAVRegister::kSharedMemory);
-        range.RegisterSpace = 0;
-        range.OffsetInDescriptorsFromTableStart = 1;
-      }
-    }
-    // Sampler heap.
-    D3D12_DESCRIPTOR_RANGE root_bindless_sampler_range;
-    {
-      auto& parameter =
-          root_parameters_bindless[kRootParameter_Bindless_SamplerHeap];
-      parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-      // Will be appending.
-      parameter.DescriptorTable.NumDescriptorRanges = 1;
-      parameter.DescriptorTable.pDescriptorRanges =
-          &root_bindless_sampler_range;
-      parameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-      root_bindless_sampler_range.RangeType =
-          D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER;
-      root_bindless_sampler_range.NumDescriptors = UINT_MAX;
-      root_bindless_sampler_range.BaseShaderRegister = 0;
-      root_bindless_sampler_range.RegisterSpace = 0;
-      root_bindless_sampler_range.OffsetInDescriptorsFromTableStart = 0;
-    }
-    // View heap.
-    D3D12_DESCRIPTOR_RANGE root_bindless_view_ranges[5];
-    {
-      auto& parameter =
-          root_parameters_bindless[kRootParameter_Bindless_ViewHeap];
-      parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-      // Will be appending.
-      parameter.DescriptorTable.NumDescriptorRanges = 0;
-      parameter.DescriptorTable.pDescriptorRanges = root_bindless_view_ranges;
-      parameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-      // EDRAM.
-      if (render_target_cache_->GetPath() ==
-          RenderTargetCache::Path::kPixelShaderInterlock) {
-        assert_true(parameter.DescriptorTable.NumDescriptorRanges <
-                    xe::countof(root_bindless_view_ranges));
-        auto& range = root_bindless_view_ranges[parameter.DescriptorTable
-                                                    .NumDescriptorRanges++];
-        range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
-        range.NumDescriptors = 1;
-        range.BaseShaderRegister =
-            UINT(DxbcShaderTranslator::UAVRegister::kEdram);
-        range.RegisterSpace = 0;
-        range.OffsetInDescriptorsFromTableStart =
-            UINT(SystemBindlessView::kEdramR32UintUAV);
-        assert_true(parameter.DescriptorTable.NumDescriptorRanges <
-                    xe::countof(root_bindless_view_ranges));
-        auto& counter_range =
-            root_bindless_view_ranges[parameter.DescriptorTable
-                                          .NumDescriptorRanges++];
-        counter_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
-        counter_range.NumDescriptors = 1;
-        counter_range.BaseShaderRegister =
-            UINT(DxbcShaderTranslator::UAVRegister::kZpdRovCounter);
-        counter_range.RegisterSpace = 0;
-        counter_range.OffsetInDescriptorsFromTableStart =
-            UINT(SystemBindlessView::kZpdROVCounterRawUAV);
-      }
-      // Used UAV and SRV ranges must not overlap on Nvidia Fermi, so textures
-      // have OffsetInDescriptorsFromTableStart after all static descriptors of
-      // other types.
-      // 2D array textures.
-      {
-        assert_true(parameter.DescriptorTable.NumDescriptorRanges <
-                    xe::countof(root_bindless_view_ranges));
-        auto& range = root_bindless_view_ranges[parameter.DescriptorTable
-                                                    .NumDescriptorRanges++];
-        range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-        range.NumDescriptors = UINT_MAX;
-        range.BaseShaderRegister = 0;
-        range.RegisterSpace =
-            UINT(DxbcShaderTranslator::SRVSpace::kBindlessTextures2DArray);
-        range.OffsetInDescriptorsFromTableStart =
-            UINT(SystemBindlessView::kUnboundedSRVsStart);
-      }
-      // 3D textures.
-      {
-        assert_true(parameter.DescriptorTable.NumDescriptorRanges <
-                    xe::countof(root_bindless_view_ranges));
-        auto& range = root_bindless_view_ranges[parameter.DescriptorTable
-                                                    .NumDescriptorRanges++];
-        range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-        range.NumDescriptors = UINT_MAX;
-        range.BaseShaderRegister = 0;
-        range.RegisterSpace =
-            UINT(DxbcShaderTranslator::SRVSpace::kBindlessTextures3D);
-        range.OffsetInDescriptorsFromTableStart =
-            UINT(SystemBindlessView::kUnboundedSRVsStart);
-      }
-      // Cube textures.
-      {
-        assert_true(parameter.DescriptorTable.NumDescriptorRanges <
-                    xe::countof(root_bindless_view_ranges));
-        auto& range = root_bindless_view_ranges[parameter.DescriptorTable
-                                                    .NumDescriptorRanges++];
-        range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-        range.NumDescriptors = UINT_MAX;
-        range.BaseShaderRegister = 0;
-        range.RegisterSpace =
-            UINT(DxbcShaderTranslator::SRVSpace::kBindlessTexturesCube);
-        range.OffsetInDescriptorsFromTableStart =
-            UINT(SystemBindlessView::kUnboundedSRVsStart);
-      }
-    }
-    root_signature_bindless_vs_ = ui::d3d12::util::CreateRootSignature(
-        provider, root_signature_bindless_desc);
-    if (!root_signature_bindless_vs_) {
-      XELOGE(
-          "Failed to create the global root signature for bindless resources, "
-          "the version for use without tessellation");
-      return false;
-    }
-    root_parameters_bindless[kRootParameter_Bindless_FloatConstantsVertex]
-        .ShaderVisibility = D3D12_SHADER_VISIBILITY_DOMAIN;
-    root_parameters_bindless[kRootParameter_Bindless_DescriptorIndicesVertex]
-        .ShaderVisibility = D3D12_SHADER_VISIBILITY_DOMAIN;
-    root_signature_bindless_ds_ = ui::d3d12::util::CreateRootSignature(
-        provider, root_signature_bindless_desc);
-    if (!root_signature_bindless_ds_) {
-      XELOGE(
-          "Failed to create the global root signature for bindless resources, "
-          "the version for use with tessellation");
-      return false;
-    }
   }
 
   {
@@ -1019,17 +787,15 @@ bool D3D12CommandProcessor::SetupContext() {
         auto& range = mesa_shared_memory_ranges[0];
         range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
         range.NumDescriptors = 1;
-        range.BaseShaderRegister =
-            UINT(DxbcShaderTranslator::SRVMainRegister::kSharedMemory);
-        range.RegisterSpace = UINT(DxbcShaderTranslator::SRVSpace::kMain);
+        range.BaseShaderRegister = kMesaRegister_SharedMemory;
+        range.RegisterSpace = 0;
         range.OffsetInDescriptorsFromTableStart = 0;
       }
       {
         auto& range = mesa_shared_memory_ranges[1];
         range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
         range.NumDescriptors = 1;
-        range.BaseShaderRegister =
-            UINT(DxbcShaderTranslator::UAVRegister::kSharedMemory);
+        range.BaseShaderRegister = kMesaRegister_SharedMemory;
         range.RegisterSpace = 0;
         range.OffsetInDescriptorsFromTableStart = 1;
       }
@@ -1037,14 +803,12 @@ bool D3D12CommandProcessor::SetupContext() {
     // EDRAM (u1) and ZPD FSI counter (u2) raw UAVs for the ROV path. Single
     // descriptor tables pointed into the bindless system view heap at draw time
     // (UpdateBindingsMesa), mirroring the shared memory table. The Mesa DXIL
-    // places the SPIR-V set 0 bindings 1 and 2 at u1/u2 space0, matching
-    // DxbcShaderTranslator::UAVRegister::kEdram / kZpdRovCounter.
+    // places the SPIR-V set 0 bindings 1 and 2 at u1/u2 space0.
     D3D12_DESCRIPTOR_RANGE mesa_edram_range = {};
     {
       mesa_edram_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
       mesa_edram_range.NumDescriptors = 1;
-      mesa_edram_range.BaseShaderRegister =
-          UINT(DxbcShaderTranslator::UAVRegister::kEdram);
+      mesa_edram_range.BaseShaderRegister = kMesaRegister_Edram;
       mesa_edram_range.RegisterSpace = 0;
       mesa_edram_range.OffsetInDescriptorsFromTableStart = 0;
       auto& parameter = root_parameters_mesa[kRootParameter_Mesa_Edram];
@@ -1057,8 +821,7 @@ bool D3D12CommandProcessor::SetupContext() {
     {
       mesa_zpd_counter_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
       mesa_zpd_counter_range.NumDescriptors = 1;
-      mesa_zpd_counter_range.BaseShaderRegister =
-          UINT(DxbcShaderTranslator::UAVRegister::kZpdRovCounter);
+      mesa_zpd_counter_range.BaseShaderRegister = kMesaRegister_ZpdRovCounter;
       mesa_zpd_counter_range.RegisterSpace = 0;
       mesa_zpd_counter_range.OffsetInDescriptorsFromTableStart = 0;
       auto& parameter = root_parameters_mesa[kRootParameter_Mesa_ZpdRovCounter];
@@ -1652,6 +1415,8 @@ void D3D12CommandProcessor::ShutdownContext() {
   AwaitAllQueueOperationsCompletion();
 
   ResetMemexportPages();
+  memexport_staged_.clear();
+  pending_resolve_staging_ = PendingResolveStaging();
   ResetResolveReadWatch();
 
   ShutdownZPDQueryResources();
@@ -1660,8 +1425,10 @@ void D3D12CommandProcessor::ShutdownContext() {
   ui::d3d12::util::ReleaseAndNull(scratch_buffer_);
   scratch_buffer_size_ = 0;
 
-  // Before the deletion list is drained, hold snapshots are freed through it.
+  // Before the deletion list is drained, hold snapshots and staging buffers are
+  // freed through it.
   ClearResolveHoldSnapshots();
+  ClearReadbackStagingBuffers();
 
   for (const std::pair<uint64_t, ID3D12Resource*>& resource_for_deletion :
        resources_for_deletion_) {
@@ -1703,8 +1470,6 @@ void D3D12CommandProcessor::ShutdownContext() {
 
   // Root signatures are used by pipelines, thus freed after the pipelines.
   ui::d3d12::util::ReleaseAndNull(root_signature_mesa_);
-  ui::d3d12::util::ReleaseAndNull(root_signature_bindless_ds_);
-  ui::d3d12::util::ReleaseAndNull(root_signature_bindless_vs_);
   for (auto it : root_signatures_bindful_) {
     it.second->Release();
   }
@@ -2587,8 +2352,8 @@ Shader* D3D12CommandProcessor::LoadShader(xenos::ShaderType shader_type,
 
 bool D3D12CommandProcessor::EnsureMemexportRangeInDeviceBuffer(
     uint32_t base_bytes, uint32_t size_bytes) {
-  if (shared_memory_->GetHostBuffer() == nullptr || !size_bytes ||
-      base_bytes >= SharedMemory::kBufferSize) {
+  if (!cvars::memexport_enable || shared_memory_->GetHostBuffer() == nullptr ||
+      !size_bytes || base_bytes >= SharedMemory::kBufferSize) {
     return false;
   }
   size_bytes = std::min(size_bytes, SharedMemory::kBufferSize - base_bytes);
@@ -2641,6 +2406,82 @@ void D3D12CommandProcessor::DestroyResolveHoldSnapshotBuffer(
                                        buffer.resource.Detach());
 }
 
+bool D3D12CommandProcessor::CreateReadbackStagingBuffer(
+    ReadbackStagingBuffer& buffer, uint32_t size) {
+  const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
+  D3D12_RESOURCE_DESC buffer_desc;
+  ui::d3d12::util::FillBufferResourceDesc(buffer_desc, size,
+                                          D3D12_RESOURCE_FLAG_NONE);
+  ID3D12Resource* resource;
+  if (FAILED(provider.GetDevice()->CreateCommittedResource(
+          &ui::d3d12::util::kHeapPropertiesReadback,
+          provider.GetHeapFlagCreateNotZeroed(), &buffer_desc,
+          D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&resource)))) {
+    XELOGE("Failed to create a {} KB readback staging buffer", size >> 10);
+    return false;
+  }
+  // Persistently mapped, and the whole thing may be read.
+  if (FAILED(resource->Map(0, nullptr, &buffer.mapped))) {
+    XELOGE("Failed to map a {} KB readback staging buffer", size >> 10);
+    buffer.mapped = nullptr;
+    resource->Release();
+    return false;
+  }
+  resource->SetName(L"Readback Staging Buffer");
+  buffer.resource.Attach(resource);
+  return true;
+}
+
+void D3D12CommandProcessor::DestroyReadbackStagingBuffer(
+    ReadbackStagingBuffer& buffer) {
+  if (!buffer.resource) {
+    return;
+  }
+  if (buffer.mapped != nullptr) {
+    buffer.resource->Unmap(0, nullptr);
+    buffer.mapped = nullptr;
+  }
+  // Deferred, a submitted copy may still be writing it.
+  resources_for_deletion_.emplace_back(GetCurrentSubmission(),
+                                       buffer.resource.Detach());
+}
+
+// Records a copy into this range's staging buffer, for the caller to copy out
+// with FinishReadbackStagingToGuestRam once its marker scope is closed.
+D3D12CommandProcessor::ReadbackStagingSlot*
+D3D12CommandProcessor::StageReadbackFromBuffer(ID3D12Resource* source_buffer,
+                                               uint32_t source_offset,
+                                               uint32_t address,
+                                               uint32_t length) {
+  ReadbackStagingSlot* slot = AcquireReadbackStagingSlot(
+      MakeReadbackResolveKey(address, length), length);
+  if (slot == nullptr) {
+    return nullptr;
+  }
+  SubmitBarriers();
+  InsertDebugMarker("Readback (staging): 0x%08X, %u bytes", address, length);
+  deferred_command_list_.D3DCopyBufferRegion(
+      ReadbackStagingWriteBuffer(*slot).resource.Get(), 0, source_buffer,
+      source_offset, length);
+  return slot;
+}
+
+// Waits for one submission, or for everything including what is being recorded.
+bool D3D12CommandProcessor::AwaitReadbackStagingSubmission(
+    uint64_t submission) {
+  if (submission == UINT64_MAX) {
+    if (!AwaitAllQueueOperationsCompletion()) {
+      XELOGE(
+          "D3D12CommandProcessor: Failed to complete queue operations for "
+          "staging readback");
+      return false;
+    }
+    return true;
+  }
+  CheckSubmissionCompletion(submission);
+  return GetCompletedSubmission() >= submission;
+}
+
 void D3D12CommandProcessor::FlushResolveRangeToGuestRam(uint32_t address,
                                                         uint32_t length,
                                                         bool from_snapshot) {
@@ -2653,8 +2494,7 @@ void D3D12CommandProcessor::FlushResolveRangeToGuestRam(uint32_t address,
   // itself in zero-copy mode, since it already aliases guest RAM.
   ID3D12Resource* guest_ram_buffer =
       zero_copy ? shared_memory_->GetBuffer() : shared_memory_->GetHostBuffer();
-  if (guest_ram_buffer == nullptr || !length ||
-      !IsResolveDestinationResident(address, length)) {
+  if (!length || !IsResolveDestinationResident(address, length)) {
     return;
   }
   ID3D12Resource* source_buffer;
@@ -2678,6 +2518,17 @@ void D3D12CommandProcessor::FlushResolveRangeToGuestRam(uint32_t address,
   }
   if (!from_snapshot) {
     shared_memory_->UseAsCopySource();
+  }
+  if (guest_ram_buffer == nullptr) {
+    // No guest RAM host buffer, so the release goes out through staging. The
+    // guest is blocked on the coherency poll that got us here, so it takes the
+    // copy just recorded rather than the previous one.
+    ReadbackStagingSlot* slot =
+        StageReadbackFromBuffer(source_buffer, source_offset, address, length);
+    if (slot != nullptr) {
+      FinishReadbackStagingToGuestRam(*slot, address, length, false);
+    }
+    return;
   }
   if (zero_copy) {
     shared_memory_->UseAsCopyDestination();
@@ -2776,10 +2627,11 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
   // Two-buffer memexport routing: producer draws (memexport_used) and geometry
   // draws consuming memexport output use the host buffer (aliasing guest RAM)
   // so the output stays CPU coherent and consumers read it directly. Only
-  // texture-sampled ranges are copied into the device buffer on demand. Inert
-  // without the host buffer.
+  // texture-sampled ranges are copied into the device buffer on demand. Off
+  // without the host buffer, where the staging readback carries the output
+  // instead, and when memexport_enable asks for device-local output.
   bool route_to_host = false;
-  if (shared_memory_->GetHostBuffer() != nullptr) {
+  if (cvars::memexport_enable && shared_memory_->GetHostBuffer() != nullptr) {
     route_to_host =
         memexport_used ||
         (any_memexport_pages_written_ &&
@@ -2932,8 +2784,9 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
   // (IM_LOAD_IMMEDIATE, address 0) shader can't be fed, so skip until the real
   // pipeline is ready rather than interpret from address 0.
   if (active_vertex_shader_ucode_address() == 0) {
+    bool is_placeholder = false;
     bool is_interpreter_placeholder = false;
-    pipeline_cache_->GetD3D12PipelineForDraw(pipeline_handle,
+    pipeline_cache_->GetD3D12PipelineForDraw(pipeline_handle, &is_placeholder,
                                              &is_interpreter_placeholder);
     if (is_interpreter_placeholder) {
       return true;
@@ -2942,7 +2795,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
 
   // Push debug marker with Xbox 360 draw context for PIX/RenderDoc annotation.
   // Done early so texture loads appear nested under the draw that uses them.
-  if (debug_markers_enabled_) {
+  if (debug_markers_enabled_ || cvars::log_draws) {
     char label[draw_util::kDebugMarkerLabelMaxLength];
     draw_util::FormatDrawDebugMarker(
         label, sizeof(label), primitive_type, primitive_processing_result,
@@ -2960,15 +2813,19 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
   texture_cache_->RequestTextures(used_texture_mask);
 
   // Bind the pipeline after configuring it and doing everything that may bind
-  // other pipelines. For an interpreter placeholder, pin the concrete PSO
-  // instead of the swappable handle: the real VS reads a different (packed)
-  // float layout, so it must not run against the full-256 interpreter constants
-  // uploaded below if the real pipeline hot-swaps in before this is submitted.
+  // other pipelines. For a placeholder, pin the concrete PSO instead of the
+  // swappable handle: the handle is resolved again when the deferred command
+  // list is replayed, so a real pipeline hot-swapped in before the submission
+  // would run against the bindings uploaded below for the placeholder - an
+  // empty bindless index buffer for the still-translating pixel shader, and
+  // (interpreter) full-256 float constants in place of the packed layout the
+  // real vertex shader reads.
+  bool placeholder_pipeline = false;
   bool interpreter_placeholder = false;
   ID3D12PipelineState* draw_pipeline_state =
-      pipeline_cache_->GetD3D12PipelineForDraw(pipeline_handle,
-                                               &interpreter_placeholder);
-  if (interpreter_placeholder) {
+      pipeline_cache_->GetD3D12PipelineForDraw(
+          pipeline_handle, &placeholder_pipeline, &interpreter_placeholder);
+  if (placeholder_pipeline) {
     if (current_external_pipeline_ != draw_pipeline_state) {
       deferred_command_list_.D3DSetPipelineState(draw_pipeline_state);
       current_external_pipeline_ = draw_pipeline_state;
@@ -3322,10 +3179,91 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
         MarkMemexportPagesWritten(memexport_range.base_address_dwords << 2,
                                   memexport_range.size_bytes);
       }
+    } else if (cvars::memexport_enable && !shared_memory_->is_zero_copy()) {
+      // No host buffer to route to, and buffer_ is device-local, so the CPU
+      // only sees the output if it is read back. Under zero-copy buffer_ is
+      // guest RAM already, and a readback there would clobber it.
+      StageMemexportReadback();
     }
   }
 
   return true;
+}
+
+// Records copies of this draw's export output into staging buffers. The copy
+// out waits, so it is deferred to FlushMemexportStagingReadback, where one wait
+// covers every producer since the last one.
+void D3D12CommandProcessor::StageMemexportReadback() {
+  if (memexport_ranges_.empty()) {
+    return;
+  }
+  shared_memory_->UseAsCopySource();
+  SubmitBarriers();
+  ID3D12Resource* device_buffer = shared_memory_->GetBuffer();
+  for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
+    uint32_t base_bytes = memexport_range.base_address_dwords << 2;
+    if (base_bytes >= SharedMemory::kBufferSize) {
+      continue;
+    }
+    uint32_t size_bytes = std::min(memexport_range.size_bytes,
+                                   SharedMemory::kBufferSize - base_bytes);
+    // The declared capacity can run past what the guest committed, and the
+    // copy out would write guest memory that isn't there.
+    size_bytes = WritableGuestRangeLength(base_bytes, size_bytes);
+    if (!size_bytes) {
+      continue;
+    }
+    uint64_t key = MakeReadbackResolveKey(base_bytes, size_bytes) |
+                   kReadbackStagingMemexportTag;
+    ReadbackStagingSlot* slot = AcquireReadbackStagingSlot(key, size_bytes);
+    if (slot == nullptr) {
+      continue;
+    }
+    InsertDebugMarker("Memexport Readback (staging): 0x%08X, %u bytes",
+                      base_bytes, size_bytes);
+    deferred_command_list_.D3DCopyBufferRegion(
+        ReadbackStagingWriteBuffer(*slot).resource.Get(), 0, device_buffer,
+        base_bytes, size_bytes);
+    // Its buffer now holds the newer output, so keep one entry, at the back -
+    // copy out order is what decides overlapping ranges.
+    std::erase_if(memexport_staged_, [key](const MemexportStagedRange& staged) {
+      return staged.key == key;
+    });
+    memexport_staged_.push_back({key, base_bytes, size_bytes});
+    // The fence and coherency waits are driven by the page marks.
+    MarkMemexportPagesWritten(base_bytes, size_bytes);
+  }
+}
+
+void D3D12CommandProcessor::FlushMemexportStagingReadback() {
+  if (memexport_staged_.empty()) {
+    return;
+  }
+  // Staged output is about to reach guest RAM, so no fence need await it.
+  memexport_await_pending_ = false;
+  if (!AwaitAllQueueOperationsCompletion()) {
+    XELOGE(
+        "D3D12CommandProcessor: Failed to complete queue operations for "
+        "memexport staging readback");
+    memexport_staged_.clear();
+    return;
+  }
+  for (const MemexportStagedRange& staged : memexport_staged_) {
+    ReadbackStagingSlot* slot = FindReadbackStagingSlot(staged.key);
+    if (slot == nullptr) {
+      continue;
+    }
+    // The guest may have decommitted the range since the draw that staged it.
+    uint32_t length = WritableGuestRangeLength(staged.address, staged.length);
+    if (!length) {
+      continue;
+    }
+    // Export staging never rotates the slot, and its tagged key keeps a resolve
+    // from rotating it either.
+    ReadbackStagingToGuestRam(ReadbackStagingWriteBuffer(*slot), staged.address,
+                              length);
+  }
+  memexport_staged_.clear();
 }
 
 void D3D12CommandProcessor::InitializeTrace() {
@@ -3348,6 +3286,18 @@ void D3D12CommandProcessor::InitializeTrace() {
   if (shared_memory_submitted) {
     shared_memory_->InitializeTraceCompleteDownloads();
   }
+}
+
+bool D3D12CommandProcessor::DumpEdramSnapshotToFile(
+    const std::filesystem::path& path) {
+  if (!BeginSubmission(false)) {
+    return false;
+  }
+  if (!render_target_cache_->InitializeTraceSubmitDownloads()) {
+    return false;
+  }
+  AwaitAllQueueOperationsCompletion();
+  return render_target_cache_->WriteEdramSnapshotToFile(path);
 }
 
 void D3D12CommandProcessor::ResolveReadCallbackThunk(void* context,
@@ -3391,7 +3341,26 @@ bool D3D12CommandProcessor::IssueCopy() {
     PopDebugMarker();
   }
 
+  // Outside the marker scope - the copy out waits, and a label left open would
+  // be ended in the next submission.
+  FinishPendingResolveStaging();
+
   return result;
+}
+
+// Copies out whatever the resolve staged for readback, if anything.
+void D3D12CommandProcessor::FinishPendingResolveStaging() {
+  PendingResolveStaging pending = pending_resolve_staging_;
+  pending_resolve_staging_ = PendingResolveStaging();
+  if (!pending.length) {
+    return;
+  }
+  ReadbackStagingSlot* slot = FindReadbackStagingSlot(pending.key);
+  if (slot == nullptr) {
+    return;
+  }
+  FinishReadbackStagingToGuestRam(*slot, pending.address, pending.length,
+                                  pending.deferred);
 }
 XE_NOINLINE
 bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
@@ -3416,8 +3385,11 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
   // itself in zero-copy mode, since it already aliases guest RAM.
   ID3D12Resource* guest_ram_buffer =
       zero_copy ? shared_memory_->GetBuffer() : shared_memory_->GetHostBuffer();
-  if (guest_ram_buffer == nullptr ||
-      !IsResolveDestinationResident(written_address, written_length)) {
+  // Without it the output goes through a staging buffer. Which resolves are
+  // copied is decided the same way either path, but a copy that would have been
+  // asynchronous takes the previous one rather than waiting for this one.
+  const bool staging_fallback = guest_ram_buffer == nullptr;
+  if (!IsResolveDestinationResident(written_address, written_length)) {
     return true;
   }
 
@@ -3441,6 +3413,11 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
   }
   ID3D12Resource* dest_buffer = guest_ram_buffer;
   uint32_t dest_offset = written_address;
+  // Set instead of dest_buffer when the copy out happens on the CPU. A scaled
+  // resolve copies out the downscaled length, not the written one.
+  ReadbackStagingSlot* dest_staging = nullptr;
+  uint64_t dest_staging_key = 0;
+  uint32_t dest_staging_length = written_length;
   // A snapshot hold never stalls, nothing is reaching guest RAM yet.
   if (to_hold_snapshot) {
     stall_after_copy = false;
@@ -3478,6 +3455,17 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
       }
       dest_buffer = snapshot->resource.Get();
       dest_offset = 0;
+    } else if (staging_fallback) {
+      uint64_t staging_key =
+          MakeReadbackResolveKey(written_address, readback_length);
+      dest_staging = AcquireReadbackStagingSlot(staging_key, readback_length);
+      if (dest_staging == nullptr) {
+        return true;
+      }
+      dest_buffer = ReadbackStagingWriteBuffer(*dest_staging).resource.Get();
+      dest_offset = 0;
+      dest_staging_key = staging_key;
+      dest_staging_length = readback_length;
     }
 
     // Ensure intermediate buffer for GPU downscaling is large enough
@@ -3610,6 +3598,8 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
     if (to_hold_snapshot) {
       PushTransitionBarrier(dest_buffer, D3D12_RESOURCE_STATE_COPY_SOURCE,
                             D3D12_RESOURCE_STATE_COPY_DEST);
+    } else if (dest_staging != nullptr) {
+      // Readback heaps stay in COPY_DEST, so there is nothing to transition.
     } else if (zero_copy) {
       shared_memory_->UseAsCopyDestination();
     } else {
@@ -3641,8 +3631,18 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
 
     PopDebugMarker();
   } else {
-    // Non-scaled: copy straight from the device buffer into host_buffer_.
     shared_memory_->UseAsCopySource();
+    if (staging_fallback) {
+      if (StageReadbackFromBuffer(shared_memory_->GetBuffer(), written_address,
+                                  written_address, written_length) != nullptr) {
+        // IssueCopy copies it out once the marker scope is closed.
+        pending_resolve_staging_ = {
+            MakeReadbackResolveKey(written_address, written_length),
+            written_address, written_length, !stall_after_copy};
+      }
+      return true;
+    }
+    // Non-scaled: copy straight from the device buffer into host_buffer_.
     shared_memory_->UseHostAsCopyDestination();
     SubmitBarriers();
     InsertDebugMarker("Resolve Readback: 0x%08X, %u bytes", written_address,
@@ -3650,6 +3650,14 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
     deferred_command_list_.D3DCopyBufferRegion(dest_buffer, dest_offset,
                                                shared_memory_->GetBuffer(),
                                                written_address, written_length);
+  }
+
+  if (dest_staging != nullptr) {
+    // Only now that the copy is recorded, so an early return above leaves
+    // nothing to copy out.
+    pending_resolve_staging_ = {dest_staging_key, written_address,
+                                dest_staging_length, !stall_after_copy};
+    return true;
   }
 
   if (stall_after_copy) {
@@ -4026,6 +4034,10 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
     // Submission already closed now, so minus 1.
     closed_frame_submissions_[(frame_current_++) % kQueueFrames] =
         GetCurrentSubmission() - 1;
+    // Backstop for export output no fence or coherency request has asked for,
+    // so it can't sit staged indefinitely.
+    FlushMemexportStagingReadback();
+    EvictOldReadbackStaging();
 
     if (cache_clear_requested_ && AwaitAllQueueOperationsCompletion()) {
       cache_clear_requested_ = false;
@@ -4209,6 +4221,9 @@ bool D3D12CommandProcessor::UpdateBindingsMesa(
     uint32_t normalized_color_mask,
     const draw_util::HostDepthPolygonOffset* host_depth_polygon_offset,
     bool interpreter_placeholder) {
+#if XE_GPU_FINE_GRAINED_DRAW_SCOPES
+  SCOPE_profile_cpu_f("gpu");
+#endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
   const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
   const RegisterFile& regs = *register_file_;
 
@@ -4745,25 +4760,14 @@ bool D3D12CommandProcessor::UpdateBindingsMesa(
     }
     std::memset(mapping, 0, buffer_size);
     for (size_t i = 0; i < texture_count; ++i) {
-      const SpirvShader::TextureBinding& sb = (*spirv_textures)[i];
-      DxbcShader::TextureBinding tb = {};
-      tb.fetch_constant = sb.fetch_constant;
-      tb.dimension = sb.dimension;
-      tb.is_signed = sb.is_signed != 0;
       // ResourceDescriptorHeap is the bound view heap, so the absolute index is
       // used (no SystemBindlessView::kUnboundedSRVsStart subtraction).
-      mapping[i * 2] = texture_cache_->GetActiveTextureBindlessSRVIndex(tb);
+      mapping[i * 2] = texture_cache_->GetActiveTextureBindlessSRVIndex(
+          (*spirv_textures)[i]);
     }
     for (size_t j = 0; j < sampler_count; ++j) {
-      const SpirvShader::SamplerBinding& ss = (*spirv_samplers)[j];
-      DxbcShader::SamplerBinding sbnd = {};
-      sbnd.fetch_constant = ss.fetch_constant;
-      sbnd.mag_filter = ss.mag_filter;
-      sbnd.min_filter = ss.min_filter;
-      sbnd.mip_filter = ss.mip_filter;
-      sbnd.aniso_filter = ss.aniso_filter;
       uint32_t sampler_index = GetOrCreateMesaBindlessSamplerIndex(
-          texture_cache_->GetSamplerParameters(sbnd));
+          texture_cache_->GetSamplerParameters((*spirv_samplers)[j]));
       if (sampler_index == UINT32_MAX) {
         // Heap full. Stop and let the caller switch heaps and rebuild.
         sampler_overflow = true;

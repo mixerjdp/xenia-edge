@@ -359,6 +359,9 @@ bool WxWindow::OpenImpl() {
   resize_debounce_timer_.SetOwner(frame_);
   frame_->Bind(wxEVT_TIMER, &WxWindow::OnResizeDebounceTimer, this,
                resize_debounce_timer_.GetId());
+  paint_delay_timer_.SetOwner(frame_);
+  frame_->Bind(wxEVT_TIMER, &WxWindow::OnPaintDelayTimer, this,
+               paint_delay_timer_.GetId());
 
   frame_->SetDropTarget(new FileDropTargetImpl(this));
 
@@ -500,6 +503,22 @@ void WxWindow::CompleteMainMenuItemsUpdateImpl() {
   // wxWidgets refreshes the menu bar automatically; nothing to do.
 }
 
+bool WxWindow::GetMousePosition(int32_t& x, int32_t& y) const {
+  wxWindow* target = render_target();
+  if (!target) {
+    return false;
+  }
+  wxPoint position = target->ScreenToClient(::wxGetMousePosition());
+  wxSize size = target->GetClientSize();
+  if (position.x < 0 || position.y < 0 || position.x >= size.GetWidth() ||
+      position.y >= size.GetHeight()) {
+    return false;
+  }
+  x = position.x;
+  y = position.y;
+  return true;
+}
+
 void WxWindow::ApplyNewMouseCapture() {
   if (!render_target()->HasCapture()) {
     render_target()->CaptureMouse();
@@ -597,6 +616,12 @@ void WxWindow::RequestPaintImpl() {
   });
 #endif
 }
+
+void WxWindow::RequestPaintAfterImpl(uint32_t milliseconds) {
+  paint_delay_timer_.StartOnce(int(milliseconds));
+}
+
+void WxWindow::OnPaintDelayTimer(wxTimerEvent& event) { RequestPaint(); }
 
 void WxWindow::OnFrameClose(wxCloseEvent& event) {
   if (frame_ && !frame_->IsFullScreen()) {
@@ -848,6 +873,8 @@ void WxWindow::UnbindFrameAndPanelEvents() {
                    cursor_auto_hide_timer_.GetId());
     frame_->Unbind(wxEVT_TIMER, &WxWindow::OnResizeDebounceTimer, this,
                    resize_debounce_timer_.GetId());
+    frame_->Unbind(wxEVT_TIMER, &WxWindow::OnPaintDelayTimer, this,
+                   paint_delay_timer_.GetId());
   }
   if (render_panel_) {
     render_panel_->Unbind(wxEVT_SIZE, &WxWindow::OnFrameSize, this);

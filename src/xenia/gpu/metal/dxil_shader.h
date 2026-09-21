@@ -45,7 +45,6 @@ class DxilShader : public SpirvShader {
     MTL::Library* metal_library() const { return metal_library_; }
     MTL::Function* metal_function() const { return metal_function_; }
     const std::string& entry_point_name() const { return entry_point_name_; }
-    bool is_valid() const { return metal_function_ != nullptr; }
 
    private:
     MTL::Library* metal_library_ = nullptr;

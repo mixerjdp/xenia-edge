@@ -72,7 +72,6 @@ DECLARE_string(gpu);
 DECLARE_path(log_file);
 DECLARE_int32(log_level);
 DECLARE_bool(d3d12_install_missing_runtime);
-DECLARE_bool(headless);
 DECLARE_string(readback_resolve);
 DECLARE_bool(disable_context_promotion);
 DECLARE_string(render_target_path);
@@ -891,9 +890,9 @@ void ApplyBackendCvars() {
   // keyboard, storage device pickers - and xenia draws those with ImGui into
   // its own window. There is no window here, so the guest would wait forever
   // for an answer nobody can give: Dead or Alive 4 freezes on Start exactly
-  // that way. Headless mode makes each of those take its default instead.
-  cvars::headless = true;
-
+  // that way. This used to set the headless cvar, which 19b223dea removed as
+  // unused; the null-window check in xam_ui's dispatch is what answers them
+  // now, and it covers more paths than the cvar did.
 }
 
 // Gamertag for the profile the core creates on first run. Titles show it, and

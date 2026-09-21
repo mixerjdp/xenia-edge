@@ -11,6 +11,7 @@
 
 #include <cstddef>
 #include <cstring>
+#include <utility>
 
 #include "xenia/base/assert.h"
 #include "xenia/base/atomic.h"
@@ -52,6 +53,8 @@ DEFINE_bool(a64_enable_host_guest_stack_synchronization, true,
             "and checks for reentry at return sites. Has slight performance "
             "impact, but fixes crashes in games that use setjmp/longjmp.",
             "a64");
+
+DECLARE_bool(record_mmio_access_exceptions);
 
 namespace xe {
 namespace cpu {
@@ -205,6 +208,7 @@ HostToGuestThunk A64HelperEmitter::EmitHostToGuestThunk() {
   func_info.prolog_stack_alloc_offset =
       code_offsets.prolog_stack_alloc - code_offsets.prolog;
   func_info.stack_size = thunk_stack;
+  func_info.is_host_to_guest_thunk = true;
   func_info.lr_save_offset = 0x058;  // stp x29, x30, [sp, #0x50]
 
   void* fn = Emplace(func_info);
@@ -887,13 +891,47 @@ bool A64Backend::ReservedStore64(ppc::PPCContext* context, uint32_t address,
 // ==========================================================================
 // ResolveFunction — runtime function resolution.
 // ==========================================================================
+
+// Where a return site in an already translated function continues, when the
+// guest is unwinding to it past more than one frame, or 0. The caller decides
+// that |target_address| is a return site. |pending_pops| is how many
+// stackpoints the branch still pops after resolving, which the stack
+// synchronization helper will not see.
+static uint64_t ResolveLongjmp(ppc::PPCContext* guest_context,
+                               uint32_t target_address, uint32_t pending_pops) {
+  auto* processor = guest_context->processor;
+  auto* backend = static_cast<A64Backend*>(processor->backend());
+  auto* backend_context = backend->BackendContextForGuestContext(guest_context);
+  if (backend_context->current_stackpoint_depth <= pending_pops) {
+    return 0;
+  }
+  const uint32_t live_frames =
+      backend_context->current_stackpoint_depth - pending_pops;
+  for (auto* entry : processor->FindFunctionsWithAddress(target_address)) {
+    auto* afunc = static_cast<A64Function*>(entry);
+    const uintptr_t host_address =
+        afunc->MapGuestAddressToMachineCode(target_address);
+    if (!host_address || afunc->machine_code() ==
+                             reinterpret_cast<const uint8_t*>(host_address)) {
+      continue;
+    }
+    const uint32_t sync_depth =
+        FindStackpointSyncDepth(backend_context->stackpoints, live_frames,
+                                static_cast<uint32_t>(guest_context->r[1]));
+    if (sync_depth != 0) {
+      backend_context->pending_stackpoint_sync_depth = sync_depth;
+      return host_address;
+    }
+    break;
+  }
+  return 0;
+}
+
 uint64_t ResolveFunction(void* raw_context, uint64_t target_address) {
   auto guest_context = reinterpret_cast<ppc::PPCContext*>(raw_context);
   auto thread_state = guest_context->thread_state;
   assert_not_zero(target_address);
 
-  // Longjmp re-entry: resume inside an existing function frame instead of
-  // re-running its prolog. Mirrors x64_emitter.cc::ResolveFunction.
   auto* processor = thread_state->processor();
   if (cvars::a64_enable_host_guest_stack_synchronization &&
       target_address <= 0xFFFFFFFFu) {
@@ -904,35 +942,15 @@ uint64_t ResolveFunction(void* raw_context, uint64_t target_address) {
       InfoCacheFlags* flags = xexmod->GetInstructionAddressFlags(
           static_cast<uint32_t>(target_address));
       if (flags && flags->is_return_site) {
-        uintptr_t host_address = 0;
-        for (auto* entry : processor->FindFunctionsWithAddress(
-                 static_cast<uint32_t>(target_address))) {
-          auto* afunc = static_cast<A64Function*>(entry);
-          host_address = afunc->MapGuestAddressToMachineCode(
-              static_cast<uint32_t>(target_address));
-          if (host_address &&
-              afunc->machine_code() !=
-                  reinterpret_cast<const uint8_t*>(host_address)) {
-            auto* backend = static_cast<A64Backend*>(processor->backend());
-            auto* backend_context =
-                backend->BackendContextForGuestContext(guest_context);
-            const uint32_t sync_depth = FindStackpointSyncDepth(
-                backend_context->stackpoints,
-                backend_context->current_stackpoint_depth,
-                static_cast<uint32_t>(guest_context->r[1]));
-            if (sync_depth != 0) {
-              backend_context->pending_stackpoint_sync_depth = sync_depth;
-              return host_address;
-            }
-            break;
-          }
+        if (uint64_t host_address = ResolveLongjmp(
+                guest_context, static_cast<uint32_t>(target_address), 0)) {
+          return host_address;
         }
       }
     }
   }
 
-  auto fn = thread_state->processor()->ResolveFunction(
-      static_cast<uint32_t>(target_address));
+  auto fn = processor->ResolveFunction(static_cast<uint32_t>(target_address));
   if (!fn) {
     // Unresolvable — return 0 which will fault.
     return 0;
@@ -944,6 +962,144 @@ uint64_t ResolveFunction(void* raw_context, uint64_t target_address) {
     return 0;
   }
   return reinterpret_cast<uint64_t>(code);
+}
+
+// Where a dynamic code branch to the instruction after a call continues in
+// translated code, or 0. While the frame of that call is live, the branch
+// returns into it however many frames it skips or bytes the callee popped, and
+// the stack synchronization helper at the target restores the calling frame
+// recorded here. Once the call has returned, as for setjmp, the guest stack
+// decides how far to unwind. |pending_pops| is how many stackpoints the branch
+// still pops after resolving. |out_is_return_site| tells the caller whether the
+// target follows a call, which is never worth caching.
+static uint64_t ResolveDynamicReturn(ppc::PPCContext* guest_context,
+                                     uint32_t target_address,
+                                     uint32_t pending_pops,
+                                     bool* out_is_return_site) {
+  *out_is_return_site = false;
+  if (!cvars::a64_enable_host_guest_stack_synchronization) {
+    return 0;
+  }
+  auto* processor = guest_context->processor;
+  auto* backend = static_cast<A64Backend*>(processor->backend());
+  auto* backend_context = backend->BackendContextForGuestContext(guest_context);
+  const uint32_t depth = backend_context->current_stackpoint_depth;
+  const uint32_t live_frames = depth > pending_pops ? depth - pending_pops : 0;
+  const uint32_t stack_pointer = static_cast<uint32_t>(guest_context->r[1]);
+  // A live frame matches only once the guest stack is back at or above its call
+  // point, which a nested call never reaches. The difference is what the callee
+  // popped from the caller's own frame, so the smallest one is the frame
+  // returned to, which a recursive caller can have several of.
+  uint32_t found_index = 0;
+  uint32_t found_popped = UINT32_MAX;
+  uint64_t found_host_address = 0;
+  // Index 0 was entered from host code, which has no frame to return into.
+  for (uint32_t i = live_frames; i-- > 1;) {
+    const A64BackendStackpoint& stackpoint = backend_context->stackpoints[i];
+    if (stackpoint.guest_return_address_ != target_address ||
+        stackpoint.guest_stack_ > stack_pointer ||
+        stack_pointer - stackpoint.guest_stack_ >= found_popped) {
+      continue;
+    }
+    // The host call that entered the frame returns to the translated target.
+    const uint64_t host_return = *reinterpret_cast<const uint64_t*>(
+        stackpoint.host_stack_ + StackLayout::HOST_RET_ADDR);
+    auto function = backend->code_cache()->LookupFunction(host_return);
+    if (!function ||
+        function->MapGuestAddressToMachineCode(target_address) != host_return) {
+      continue;
+    }
+    found_index = i;
+    found_popped = stack_pointer - stackpoint.guest_stack_;
+    found_host_address = host_return;
+    if (!found_popped) {
+      break;
+    }
+  }
+  if (found_host_address) {
+    // Matching a recorded return address proves the target follows a call.
+    *out_is_return_site = true;
+    // The helper restores stackpoints[depth - 1], so this names the calling
+    // frame, whose record is the host stack it called with because a64 records
+    // one after the prolog allocation.
+    backend_context->pending_stackpoint_sync_depth = found_index;
+    return found_host_address;
+  }
+
+  // Dynamic code has no instruction flags, so recognize the call before it.
+  if (target_address < 4) {
+    return 0;
+  }
+  auto module = processor->LookupModule(target_address - 4);
+  if (!module) {
+    return 0;
+  }
+  const uint32_t previous =
+      xe::load_and_swap<uint32_t>(module->TranslateCode(target_address - 4));
+  const bool is_return_site = ((previous & 0xFC000001) == 0x48000001) ||
+                              ((previous & 0xFC000001) == 0x40000001) ||
+                              ((previous & 0xFC0007FF) == 0x4C000421) ||
+                              ((previous & 0xFC0007FF) == 0x4C000021);
+  *out_is_return_site = is_return_site;
+  if (!is_return_site) {
+    return 0;
+  }
+  return ResolveLongjmp(guest_context, target_address, pending_pops);
+}
+
+static uint32_t DynamicCallCacheIndex(uint32_t guest_address) {
+  return ((guest_address >> 2) ^ (guest_address >> 14)) &
+         (kA64DynamicCallCacheSize - 1);
+}
+
+// Resolves a target without an indirection slot and caches it per thread.
+static uint64_t ResolveDynamicFunction(void* raw_context,
+                                       uint64_t target_address,
+                                       uint32_t pending_pops) {
+  auto guest_context = reinterpret_cast<ppc::PPCContext*>(raw_context);
+  bool is_return_site = false;
+  if (uint64_t return_address = ResolveDynamicReturn(
+          guest_context, static_cast<uint32_t>(target_address), pending_pops,
+          &is_return_site)) {
+    return return_address;
+  }
+  auto function = guest_context->processor->ResolveFunction(
+      static_cast<uint32_t>(target_address));
+  if (!function || !function->is_guest()) {
+    XELOGE("No guest code at {:08X} for a dynamic call",
+           static_cast<uint32_t>(target_address));
+    return 0;
+  }
+  const uint64_t host_address = reinterpret_cast<uint64_t>(
+      static_cast<A64Function*>(function)->machine_code());
+  auto backend = static_cast<A64Backend*>(guest_context->processor->backend());
+  auto bctx = backend->BackendContextForGuestContext(raw_context);
+  if (!bctx->dynamic_call_cache) {
+    bctx->dynamic_call_cache =
+        new A64DynamicCallCacheEntry[kA64DynamicCallCacheSize];
+    for (uint32_t i = 0; i < kA64DynamicCallCacheSize; ++i) {
+      bctx->dynamic_call_cache[i] = {UINT32_MAX, 0, 0};
+    }
+  }
+  // A return resolves to an address that is only valid for the unwind that
+  // reached it, and caching the site would skip that unwind on every later
+  // return, so only targets a call can reach are cached.
+  if (!is_return_site) {
+    auto& entry = bctx->dynamic_call_cache[DynamicCallCacheIndex(
+        static_cast<uint32_t>(target_address))];
+    entry.host_address = host_address;
+    entry.guest_address = static_cast<uint32_t>(target_address);
+  }
+  return host_address;
+}
+
+uint64_t ResolveDynamicCall(void* raw_context, uint64_t target_address) {
+  return ResolveDynamicFunction(raw_context, target_address, 0);
+}
+
+// A tail branch pops the current function's stackpoint after resolving.
+uint64_t ResolveDynamicTailCall(void* raw_context, uint64_t target_address) {
+  return ResolveDynamicFunction(raw_context, target_address, 1);
 }
 
 // ==========================================================================
@@ -1039,6 +1195,11 @@ A64Backend::~A64Backend() {
   }
 }
 
+static void ForwardMMIOAccessForRecording(void* context, void* hostaddr) {
+  reinterpret_cast<A64Backend*>(context)
+      ->RecordMMIOExceptionForGuestInstruction(hostaddr);
+}
+
 bool A64Backend::Initialize(Processor* processor) {
   if (!Backend::Initialize(processor)) {
     return false;
@@ -1112,6 +1273,14 @@ bool A64Backend::Initialize(Processor* processor) {
   // Register exception handler for MMIO access from JIT code.
   ExceptionHandler::Install(ExceptionCallbackThunk, this);
 
+  // Lets the memory system tell us which guest instructions faulted on MMIO,
+  // so they get recompiled into a direct call instead of taking the signal
+  // handler on every access.
+  if (cvars::record_mmio_access_exceptions) {
+    processor->memory()->SetMMIOExceptionRecordingCallback(
+        ForwardMMIOAccessForRecording, this);
+  }
+
   return true;
 }
 
@@ -1129,21 +1298,118 @@ std::unique_ptr<GuestFunction> A64Backend::CreateGuestFunction(
   return std::make_unique<A64Function>(module, address);
 }
 
+namespace {
+
+// Encoding 31 reads as XZR in every branch form below.
+uint64_t ReadXReg(const HostThreadContext& ctx, uint32_t n) {
+  return n == 31 ? 0 : ctx.x[n];
+}
+
+bool TestCondition(uint64_t pstate, uint32_t cond) {
+  const bool n = (pstate >> 31) & 1;
+  const bool z = (pstate >> 30) & 1;
+  const bool c = (pstate >> 29) & 1;
+  const bool v = (pstate >> 28) & 1;
+  bool result;
+  switch (cond >> 1) {
+    case 0b000:
+      result = z;
+      break;
+    case 0b001:
+      result = c;
+      break;
+    case 0b010:
+      result = n;
+      break;
+    case 0b011:
+      result = v;
+      break;
+    case 0b100:
+      result = c && !z;
+      break;
+    case 0b101:
+      result = n == v;
+      break;
+    case 0b110:
+      result = (n == v) && !z;
+      break;
+    default:
+      result = true;
+      break;
+  }
+  if ((cond & 1) && cond != 0b1111) {
+    result = !result;
+  }
+  return result;
+}
+
+int64_t SignExtend(uint64_t value, uint32_t bits) {
+  const uint32_t shift = 64 - bits;
+  return int64_t(value << shift) >> shift;
+}
+
+}  // namespace
+
 uint64_t A64Backend::CalculateNextHostInstruction(ThreadDebugInfo* thread_info,
                                                   uint64_t current_pc) {
-  // ARM64 instructions are fixed 4 bytes.
-  return current_pc + 4;
+  const auto& ctx = thread_info->host_context;
+  const uint32_t insn = xe::load<uint32_t>(reinterpret_cast<void*>(current_pc));
+  const uint64_t next_pc = current_pc + 4;
+
+  // B  imm26  0b000101...    BL imm26  0b100101...
+  if ((insn & 0x7C000000) == 0x14000000) {
+    return current_pc + SignExtend(insn & 0x03FFFFFF, 26) * 4;
+  }
+  // B.cond / BC.cond imm19   0b01010100 imm19 x cond
+  if ((insn & 0xFF000000) == 0x54000000) {
+    if (!TestCondition(ctx.pstate, insn & 0xF)) {
+      return next_pc;
+    }
+    return current_pc + SignExtend((insn >> 5) & 0x7FFFF, 19) * 4;
+  }
+  // CBZ / CBNZ  sf 011010 op imm19 Rt
+  if ((insn & 0x7E000000) == 0x34000000) {
+    uint64_t value = ReadXReg(ctx, insn & 0x1F);
+    if (!(insn & 0x80000000)) {
+      value = uint32_t(value);
+    }
+    const bool nonzero = value != 0;
+    const bool is_cbnz = (insn >> 24) & 1;
+    if (nonzero != is_cbnz) {
+      return next_pc;
+    }
+    return current_pc + SignExtend((insn >> 5) & 0x7FFFF, 19) * 4;
+  }
+  // TBZ / TBNZ  b5 011011 op b40 imm14 Rt
+  if ((insn & 0x7E000000) == 0x36000000) {
+    const uint32_t bit = ((insn >> 26) & 0x20) | ((insn >> 19) & 0x1F);
+    const bool set = (ReadXReg(ctx, insn & 0x1F) >> bit) & 1;
+    const bool is_tbnz = (insn >> 24) & 1;
+    if (set != is_tbnz) {
+      return next_pc;
+    }
+    return current_pc + SignExtend((insn >> 5) & 0x3FFF, 14) * 4;
+  }
+  // BR / BLR / RET  Rn
+  if ((insn & 0xFFFFFC1F) == 0xD61F0000 || (insn & 0xFFFFFC1F) == 0xD63F0000 ||
+      (insn & 0xFFFFFC1F) == 0xD65F0000) {
+    return ReadXReg(ctx, (insn >> 5) & 0x1F);
+  }
+  return next_pc;
 }
 
 // ARM64 BRK #0 encoding (4 bytes, fixed-width instruction).
 static constexpr uint32_t kArm64Brk0 = 0xD4200000;
 
 void A64Backend::InstallBreakpoint(Breakpoint* breakpoint) {
-  breakpoint->ForEachHostAddress([breakpoint](uint64_t host_address) {
+  breakpoint->ForEachHostAddress([this, breakpoint](uint64_t host_address) {
     auto ptr = reinterpret_cast<void*>(host_address);
     auto original_bytes = xe::load<uint32_t>(ptr);
     assert_true(original_bytes != kArm64Brk0);
-    xe::store<uint32_t>(ptr, kArm64Brk0);
+    if (!code_cache()->PatchCode(ptr, &kArm64Brk0, sizeof(kArm64Brk0))) {
+      assert_always();
+      return;
+    }
     breakpoint->backend_data().emplace_back(host_address, original_bytes);
   });
 }
@@ -1162,7 +1428,10 @@ void A64Backend::InstallBreakpoint(Breakpoint* breakpoint, Function* fn) {
   auto ptr = reinterpret_cast<void*>(host_address);
   auto original_bytes = xe::load<uint32_t>(ptr);
   assert_true(original_bytes != kArm64Brk0);
-  xe::store<uint32_t>(ptr, kArm64Brk0);
+  if (!code_cache()->PatchCode(ptr, &kArm64Brk0, sizeof(kArm64Brk0))) {
+    assert_always();
+    return;
+  }
   breakpoint->backend_data().emplace_back(host_address, original_bytes);
 }
 
@@ -1171,7 +1440,8 @@ void A64Backend::UninstallBreakpoint(Breakpoint* breakpoint) {
     auto ptr = reinterpret_cast<uint8_t*>(pair.first);
     auto instruction_bytes = xe::load<uint32_t>(ptr);
     assert_true(instruction_bytes == kArm64Brk0);
-    xe::store<uint32_t>(ptr, static_cast<uint32_t>(pair.second));
+    const uint32_t original_bytes = static_cast<uint32_t>(pair.second);
+    code_cache()->PatchCode(ptr, &original_bytes, sizeof(original_bytes));
   }
   breakpoint->backend_data().clear();
 }
@@ -1231,13 +1501,8 @@ void A64Backend::InitializeBackendContext(void* ctx) {
   set_est_bits(kEstMantissaMask, 0x007FFFFFu);
   set_est_bits(kEstQuietBit, 0x00400000u);
 
-  // Allocate stackpoints for longjmp detection.
-  if (cvars::a64_enable_host_guest_stack_synchronization) {
-    uint64_t max_stackpoints = cvars::a64_max_stackpoints;
-    if (max_stackpoints > 0) {
-      a64_ctx->stackpoints = new A64BackendStackpoint[max_stackpoints]();
-    }
-  }
+  a64_ctx->stackpoints = AllocStackpoints();
+  a64_ctx->dynamic_call_cache = nullptr;
 
   // Reset the live host FPCR for a fresh PPC context so one test's rounding
   // state does not leak into the next on the shared PPC test runner thread.
@@ -1250,12 +1515,56 @@ void A64Backend::DeinitializeBackendContext(void* ctx) {
     delete[] a64_ctx->stackpoints;
     a64_ctx->stackpoints = nullptr;
   }
+  delete[] a64_ctx->dynamic_call_cache;
+  a64_ctx->dynamic_call_cache = nullptr;
 }
 
 void A64Backend::PrepareForReentry(void* ctx) {
   auto* a64_ctx = BackendContextForGuestContext(ctx);
   a64_ctx->current_stackpoint_depth = 0;
   a64_ctx->pending_stackpoint_sync_depth = 0;
+}
+
+A64BackendStackpoint* A64Backend::AllocStackpoints() {
+  if (!cvars::a64_enable_host_guest_stack_synchronization ||
+      cvars::a64_max_stackpoints <= 0) {
+    return nullptr;
+  }
+  return new A64BackendStackpoint[cvars::a64_max_stackpoints]();
+}
+
+namespace {
+struct A64StackpointState {
+  A64BackendStackpoint* stackpoints = nullptr;
+  unsigned int depth = 0;
+};
+}  // namespace
+
+void* A64Backend::CreateStackpointState() {
+  auto state = new A64StackpointState();
+  state->stackpoints = AllocStackpoints();
+  return state;
+}
+
+void A64Backend::DestroyStackpointState(void* state) {
+  if (!state) {
+    return;
+  }
+  auto stackpoint_state = static_cast<A64StackpointState*>(state);
+  delete[] stackpoint_state->stackpoints;
+  delete stackpoint_state;
+}
+
+void A64Backend::SwapStackpointState(void* ctx, void* state) {
+  if (!state) {
+    return;
+  }
+  A64BackendContext* bctx = BackendContextForGuestContext(ctx);
+  auto stackpoint_state = static_cast<A64StackpointState*>(state);
+  std::swap(bctx->stackpoints, stackpoint_state->stackpoints);
+  std::swap(bctx->current_stackpoint_depth, stackpoint_state->depth);
+  // A pending sync names the host stack being swapped out.
+  bctx->pending_stackpoint_sync_depth = 0;
 }
 
 uint32_t A64Backend::CreateGuestTrampoline(GuestTrampolineProc proc,

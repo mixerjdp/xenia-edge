@@ -407,10 +407,6 @@ std::unique_ptr<gpu::GraphicsSystem> EmulatorApp::CreateGraphicsSystem() {
   //   runtime, and only version 12 can be granted expanded resource access.
   //   Qualcomm, as of June 2022, also doesn't provide a Vulkan implementation
   //   for their Arm-based Windows devices, while Direct3D 12 is available.
-  //   - Both older Intel GPUs and the Xbox One apparently, as well as earlier
-  //     Windows 10 versions, also require Shader Model 5.1 DXBC shaders rather
-  //     than Shader Model 6 DXIL ones, so a DXBC shader translator should be
-  //     available in Xenia too, a DXIL one doesn't fully replace it.
   // - As of June 2022, AMD also refuses to implement the
   //   VK_EXT_fragment_shader_interlock Vulkan extension in their drivers, as
   //   well as its OpenGL counterpart, which is heavily utilized for accurate
@@ -716,6 +712,10 @@ void EmulatorApp::EmulatorThread() {
       });
 
   emulator_->on_patch_apply.AddListener([this]() {
+    app_context().CallInUIThread([this]() { emulator_window_->UpdateTitle(); });
+  });
+
+  emulator_->on_title_name_change.AddListener([this]() {
     app_context().CallInUIThread([this]() { emulator_window_->UpdateTitle(); });
   });
 

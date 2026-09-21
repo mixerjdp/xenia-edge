@@ -23,7 +23,7 @@ namespace gpu {
 namespace metal {
 
 // Metal shader translated via SPIR-V -> SPIRV-Cross -> MSL path.
-// Inherits from SpirvShader (not DxbcShader), removing the MSC dependency.
+// Inherits from SpirvShader, so it carries no MSC dependency.
 class MslShader : public SpirvShader {
  public:
   MslShader(xenos::ShaderType shader_type, uint64_t ucode_data_hash,
@@ -45,7 +45,6 @@ class MslShader : public SpirvShader {
     MTL::Function* metal_function() const { return metal_function_; }
     const std::string& msl_source() const { return msl_source_; }
     const std::string& entry_point_name() const { return entry_point_name_; }
-    bool is_valid() const { return metal_function_ != nullptr; }
     bool uses_argument_buffers() const { return uses_argument_buffers_; }
     MTL::ArgumentEncoder* argument_encoder() const { return argument_encoder_; }
     uint32_t argument_encoder_alignment() const {

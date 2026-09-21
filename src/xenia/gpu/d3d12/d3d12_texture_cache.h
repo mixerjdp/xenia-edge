@@ -19,8 +19,8 @@
 
 #include "xenia/base/assert.h"
 #include "xenia/gpu/d3d12/d3d12_shared_memory.h"
-#include "xenia/gpu/dxbc_shader.h"
 #include "xenia/gpu/register_file.h"
+#include "xenia/gpu/spirv_shader.h"
 #include "xenia/gpu/texture_cache.h"
 #include "xenia/gpu/texture_util.h"
 #include "xenia/gpu/xenos.h"
@@ -63,7 +63,7 @@ class D3D12TextureCache final : public TextureCache {
       // clamp mode).
       uint32_t force_bc_w_to_max : 1;  // 23
       // Maximum mip level is in the texture resource itself, but mip_base_map
-      // can be used to limit fetching to mip_min_level.
+      // limits fetching to mip_min_level (level 0 when the base is available).
     };
 
     SamplerParameters() : value(0) { static_assert_size(*this, sizeof(value)); }
@@ -108,24 +108,24 @@ class D3D12TextureCache final : public TextureCache {
   // (otherwise they are incompatible - like if this function returned false).
   bool AreActiveTextureSRVKeysUpToDate(
       const TextureSRVKey* keys,
-      const DxbcShader::TextureBinding* host_shader_bindings,
+      const SpirvShader::TextureBinding* host_shader_bindings,
       size_t host_shader_binding_count) const;
   // Exports the current binding data to texture SRV keys so they can be stored
   // for checking whether subsequent draw calls can keep using the same
   // bindings. Write host_shader_binding_count keys.
   void WriteActiveTextureSRVKeys(
       TextureSRVKey* keys,
-      const DxbcShader::TextureBinding* host_shader_bindings,
+      const SpirvShader::TextureBinding* host_shader_bindings,
       size_t host_shader_binding_count) const;
   void WriteActiveTextureBindfulSRV(
-      const DxbcShader::TextureBinding& host_shader_binding,
+      const SpirvShader::TextureBinding& host_shader_binding,
       D3D12_CPU_DESCRIPTOR_HANDLE handle);
   uint32_t GetActiveTextureBindlessSRVIndex(
-      const DxbcShader::TextureBinding& host_shader_binding);
+      const SpirvShader::TextureBinding& host_shader_binding);
   void PrefetchSamplerParameters(
-      const DxbcShader::SamplerBinding& binding) const;
+      const SpirvShader::SamplerBinding& binding) const;
   SamplerParameters GetSamplerParameters(
-      const DxbcShader::SamplerBinding& binding) const;
+      const SpirvShader::SamplerBinding& binding) const;
   void WriteSampler(SamplerParameters parameters,
                     D3D12_CPU_DESCRIPTOR_HANDLE handle) const;
 

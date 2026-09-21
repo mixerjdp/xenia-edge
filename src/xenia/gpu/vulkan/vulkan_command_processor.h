@@ -15,6 +15,7 @@
 #include <atomic>
 #include <climits>
 #include <cstdint>
+#include <cstring>
 #include <deque>
 #include <functional>
 #include <memory>
@@ -27,6 +28,7 @@
 #include "xenia/base/assert.h"
 #include "xenia/base/hash.h"
 #include "xenia/base/logging.h"
+#include "xenia/base/memory.h"
 #include "xenia/gpu/command_processor.h"
 #include "xenia/gpu/draw_util.h"
 #include "xenia/gpu/gpu_flags.h"
@@ -62,7 +64,10 @@ class VulkanCommandProcessor final : public CommandProcessor {
  public:
   // Single-descriptor layouts for use within a single frame.
   enum class SingleTransientDescriptorLayout {
-    kStorageBufferCompute,
+    kStorageBuffer,
+    // Scratch buffer plus the destination image of a texture load, for the
+    // compute blit that replaces vkCmdCopyBufferToImage.
+    kStorageBufferAndStorageImage,
     kCount,
   };
 
@@ -150,6 +155,7 @@ class VulkanCommandProcessor final : public CommandProcessor {
 
   void ClearCaches() override;
   void InvalidateGpuMemory() override;
+  void ClearReadbackBuffers() override;
 
   void TracePlaybackWroteMemory(uint32_t base_ptr, uint32_t length) override;
 
@@ -249,6 +255,11 @@ class VulkanCommandProcessor final : public CommandProcessor {
     return descriptor_set_layouts_single_transient_[size_t(
         transient_descriptor_layout)];
   }
+  // Queues an image, its view and its memory for destruction once the
+  // submission using them now has completed. Any of them may be null.
+  void DestroyScratchImageWhenIdle(VkImage image, VkImageView image_view,
+                                   VkDeviceMemory memory);
+
   // A frame must be open.
   VkDescriptorSet AllocateSingleTransientDescriptor(
       SingleTransientDescriptorLayout transient_descriptor_layout);
@@ -320,6 +331,41 @@ class VulkanCommandProcessor final : public CommandProcessor {
   void DestroyResolveHoldSnapshotBuffer(ResolveHoldSnapshotBuffer& buffer);
   void PrepareResolveHoldSnapshotEviction();
 
+  // Staging storage for command_processor_readback_staging.inc, which owns the
+  // pool itself. Used only without the guest RAM host buffer.
+  struct ReadbackStagingBuffer {
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    void* mapped = nullptr;
+    uint32_t memory_type = 0;
+    VkDeviceSize memory_size = 0;
+  };
+  bool CreateReadbackStagingBuffer(ReadbackStagingBuffer& buffer,
+                                   uint32_t size);
+  void DestroyReadbackStagingBuffer(ReadbackStagingBuffer& buffer);
+  void PrepareReadbackStagingEviction();
+  void InvalidateReadbackStaging(const ReadbackStagingBuffer& buffer);
+  bool AwaitReadbackStagingSubmission(uint64_t submission);
+  // The staging pool, shared with the D3D12 backend. Included here rather than
+  // with the other fragments because the declarations below name its
+  // ReadbackStagingSlot.
+#include "../command_processor_readback_staging.inc"
+  void OrderReadbackStagingWrite(VkBuffer staging_buffer);
+  ReadbackStagingSlot* StageReadbackFromBuffer(VkBuffer source_buffer,
+                                               VkDeviceSize source_offset,
+                                               uint32_t address,
+                                               uint32_t length);
+  void StageMemexportReadback();
+  void FlushMemexportStagingReadback();
+  // Export ranges staged but not yet copied out, in record order - a later
+  // copy of an overlapping range has to win.
+  struct MemexportStagedRange {
+    uint64_t key;
+    uint32_t address;
+    uint32_t length;
+  };
+  std::vector<MemexportStagedRange> memexport_staged_;
+
   void IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                  uint32_t frontbuffer_height) override;
 
@@ -335,6 +381,7 @@ class VulkanCommandProcessor final : public CommandProcessor {
   bool IssueCopy() override;
 
   void InitializeTrace() override;
+  bool DumpEdramSnapshotToFile(const std::filesystem::path& path) override;
 
  private:
   struct CommandBuffer {
@@ -694,13 +741,16 @@ class VulkanCommandProcessor final : public CommandProcessor {
   // No specific reason for 32768, just the "too much" descriptor count from
   // Direct3D 12 PIX warnings.
   static constexpr uint32_t kLinkedTypeDescriptorPoolSetCount = 32768;
-  static const VkDescriptorPoolSize kDescriptorPoolSizeUniformBuffer;
+  static const VkDescriptorPoolSize kDescriptorPoolSizeUniformBufferDynamic;
   static const VkDescriptorPoolSize kDescriptorPoolSizeStorageBuffer;
+  static const VkDescriptorPoolSize kDescriptorPoolSizeStorageBufferAndImage[2];
   static const VkDescriptorPoolSize kDescriptorPoolSizeTextures[2];
   ui::vulkan::LinkedTypeDescriptorSetAllocator
       transient_descriptor_allocator_uniform_buffer_;
   ui::vulkan::LinkedTypeDescriptorSetAllocator
       transient_descriptor_allocator_storage_buffer_;
+  ui::vulkan::LinkedTypeDescriptorSetAllocator
+      transient_descriptor_allocator_storage_buffer_and_image_;
   std::deque<UsedSingleTransientDescriptor> single_transient_descriptors_used_;
   std::array<std::vector<VkDescriptorSet>,
              size_t(SingleTransientDescriptorLayout::kCount)>
@@ -933,8 +983,13 @@ class VulkanCommandProcessor final : public CommandProcessor {
 
   // Pipeline layout of the current guest graphics pipeline.
   const PipelineLayout* current_guest_graphics_pipeline_layout_;
+  // The bindings are VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, so the infos
+  // describe only the pool page and the size - the offset within the page is
+  // passed when binding and the info offset stays 0.
   VkDescriptorBufferInfo current_constant_buffer_infos_
-      [SpirvShaderTranslator::kConstantBufferCount];
+      [SpirvShaderTranslator::kConstantBufferCount]{};
+  uint32_t current_constant_buffer_dynamic_offsets_
+      [SpirvShaderTranslator::kConstantBufferCount]{};
   // Whether up-to-date data has been written to constant (uniform) buffers, and
   // the buffer infos in current_constant_buffer_infos_ point to them.
   uint32_t current_constant_buffers_up_to_date_;
@@ -981,6 +1036,11 @@ class VulkanCommandProcessor final : public CommandProcessor {
   // System shader constants, including user clip planes and tessellation
   // constants.
   SpirvShaderTranslator::SystemConstants system_constants_;
+
+  // Host viewport of the previous draw, reused while the inputs it was derived
+  // from stay the same.
+  draw_util::GetViewportInfoArgs previous_viewport_info_args_{};
+  draw_util::ViewportInfo previous_viewport_info_{};
 
   // Temporary storage for memexport stream constants used in the draw.
   std::vector<draw_util::MemExportRange> memexport_ranges_;

@@ -32,6 +32,17 @@ DEFINE_bool(
     "GPU");
 #undef XE_GPU_ZERO_COPY_DEFAULT
 
+DEFINE_bool(
+    enable_host_buffer, true,
+    "Import guest RAM as a second GPU buffer, so memexport output and resolve "
+    "readback reach the CPU in place rather than through a staging copy. With "
+    "it off, or where the driver can't import guest RAM, both fall back to "
+    "copying through a staging buffer, where a resolve readback_resolve_sync "
+    "would have run asynchronously is instead a frame behind. Ignored under "
+    "shared_memory_zero_copy, where the only buffer already aliases guest RAM. "
+    "Applies at title launch.",
+    "GPU");
+
 DEFINE_bool(use_50Hz_mode, false, "Enables usage of PAL-50 mode.", "Console");
 
 DEFINE_path(trace_gpu_prefix, "scratch/gpu/",
@@ -73,10 +84,12 @@ DEFINE_bool(
     "may be used to bypass fetch constant type errors in certain games until "
     "the real reason why they're invalid is found.",
     "GPU");
+// TODO(has207): allocs invalidate stale pages, drop this if nothing regresses.
 DEFINE_bool(
-    gpu_allow_invalid_upload_range, false,
+    gpu_allow_invalid_upload_range, true,
     "Allows games to read data from pages that are marked as no access.",
     "GPU");
+UPDATE_from_bool(gpu_allow_invalid_upload_range, 2026, 9, 12, 12, false);
 
 DEFINE_bool(
     non_seamless_cube_map, true,

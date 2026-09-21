@@ -212,6 +212,16 @@ void ProfileManager::SyncProfilesWithConfig() {
                                        GetUsedUserSlots().to_ulong());
 }
 
+UserProfile* ProfileManager::GetProfileLive(const uint64_t xuid) const {
+  uint8_t user_index = GetUserIndexAssignedToLiveProfile(xuid);
+
+  if (user_index >= XUserMaxUserCount) {
+    return nullptr;
+  }
+
+  return GetProfile(user_index);
+}
+
 UserProfile* ProfileManager::GetProfile(const uint64_t xuid) const {
   const uint8_t user_index = GetUserIndexAssignedToProfile(xuid);
   if (user_index >= XUserMaxUserCount) {
@@ -487,6 +497,27 @@ uint8_t ProfileManager::GetUserIndexAssignedToProfile(
   return XUserIndexAny;
 }
 
+uint8_t ProfileManager::GetUserIndexAssignedToLiveProfile(
+    const uint64_t xuid_online) const {
+  // GetOnlineXUID() is 0 for a profile without Live, so INVALID_XUID must not
+  // match it.
+  if (!xuid_online) {
+    return XUserIndexAny;
+  }
+  for (const auto& [index, entry] : logged_profiles_) {
+    if (!entry) {
+      continue;
+    }
+
+    if (entry->GetOnlineXUID() != xuid_online) {
+      continue;
+    }
+
+    return index;
+  }
+  return XUserIndexAny;
+}
+
 std::filesystem::path ProfileManager::GetProfileContentPath(
     const uint64_t xuid, const uint32_t title_id,
     const XContentType content_type) const {
@@ -731,11 +762,10 @@ std::vector<ScannedTitleInfo> ProfileManager::ScanAllProfilesForTitles() const {
 
       auto all_discs = dashboard_gpd.GetTitleDiscs(title_id);
       if (all_discs.size() > 1) {
-        std::sort(all_discs.begin(), all_discs.end(),
-                  [](const GpdInfoProfile::DiscInfo& a,
-                     const GpdInfoProfile::DiscInfo& b) {
-                    return a.label < b.label;
-                  });
+        std::sort(
+            all_discs.begin(), all_discs.end(),
+            [](const GpdInfoProfile::DiscInfo& a,
+               const GpdInfoProfile::DiscInfo& b) { return a.path < b.path; });
       }
 
       titles_by_id[title_id] = {title_id, title_name, path_to_file, all_discs,
@@ -754,39 +784,6 @@ std::vector<ScannedTitleInfo> ProfileManager::ScanAllProfilesForTitles() const {
             });
 
   return result;
-}
-
-std::vector<uint8_t> ProfileManager::ReadTitleIcon(uint32_t title_id) const {
-  auto content_root = kernel_state_->emulator()->content_root();
-  auto profiles_directory = xe::filesystem::FilterByName(
-      xe::filesystem::ListDirectories(content_root),
-      std::regex("[0-9A-F]{16}"));
-
-  for (const auto& profile_dir : profiles_directory) {
-    if (xe::path_to_utf8(profile_dir.name) == fmt::format("{:016X}", 0)) {
-      continue;  // Skip shared content directory
-    }
-
-    std::filesystem::path gpd_path =
-        profile_dir.path / profile_dir.name / kDashboardStringID /
-        fmt::format("{:08X}", static_cast<uint32_t>(XContentType::kProfile)) /
-        profile_dir.name / fmt::format("{:08X}.gpd", title_id);
-
-    auto gpd_data = xe::filesystem::ReadAllBytes(gpd_path);
-    if (gpd_data.empty()) {
-      continue;
-    }
-
-    GpdInfoTitle title_gpd(title_id, gpd_data);
-    if (!title_gpd.IsValid()) {
-      continue;
-    }
-    auto image = title_gpd.GetImage(kXdbfIdTitle);
-    if (!image.empty()) {
-      return std::vector<uint8_t>(image.begin(), image.end());
-    }
-  }
-  return {};
 }
 
 bool ProfileManager::IsGamertagValid(const std::string gamertag) {
