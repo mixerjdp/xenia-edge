@@ -12,6 +12,10 @@
 #include "xenia/base/byte_order.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/profiling.h"
+#include "xenia/cpu/cpu_flags.h"
+#include "xenia/cpu/ppc/ppc_context.h"
+
+#include <vector>
 namespace xe {
 namespace cpu {
 namespace compiler {
@@ -28,9 +32,195 @@ SimplificationPass::SimplificationPass() : ConditionalGroupSubpass() {}
 
 SimplificationPass::~SimplificationPass() {}
 
+static bool IsNeverF64Denormal(hir::Value* v, int depth);
+
+// IsNeverF64Denormal stops at a load_context, so carry the proof for the 32
+// FPR context slots across blocks: a forward must-analysis where a slot is
+// clean if every path to it stored a clean value. Loads of clean slots are
+// tagged VALUE_NEVER_F64_DENORMAL.
+namespace {
+
+constexpr size_t kGuestFPRCount = 32;
+constexpr uint32_t kGuestFPRBase =
+    static_cast<uint32_t>(offsetof(ppc::PPCContext, f));
+constexpr uint32_t kGuestFPRSize =
+    static_cast<uint32_t>(sizeof(double) * kGuestFPRCount);
+
+// Exactly one whole FPR, which is the only shape the proof describes.
+bool GuestFPRSlot(uint32_t offset, TypeName type, size_t* out_index) {
+  if (type != FLOAT64_TYPE || offset < kGuestFPRBase ||
+      offset >= kGuestFPRBase + kGuestFPRSize) {
+    return false;
+  }
+  const uint32_t byte = offset - kGuestFPRBase;
+  if (byte % sizeof(double)) {
+    return false;
+  }
+  *out_index = byte / sizeof(double);
+  return true;
+}
+
+// Anything that can write guest context without a visible store. Not
+// OPCODE_FLAG_VOLATILE, which conditional branches carry too.
+bool ClobbersGuestContext(const Instr* i) {
+  switch (i->GetOpcodeNum()) {
+    case OPCODE_CALL:
+    case OPCODE_CALL_TRUE:
+    case OPCODE_CALL_INDIRECT:
+    case OPCODE_CALL_INDIRECT_TRUE:
+    case OPCODE_CALL_EXTERN:
+    case OPCODE_CHECK_PREEMPT:
+    case OPCODE_TRAP:
+    case OPCODE_TRAP_TRUE:
+    case OPCODE_DEBUG_BREAK:
+    case OPCODE_DEBUG_BREAK_TRUE:
+      return true;
+    default:
+      return false;
+  }
+}
+
+}  // namespace
+
+bool SimplificationPass::PropagateGuestFPRDenormalProof(HIRBuilder* builder) {
+  // Block::ordinal is 16 bits.
+  size_t block_count = 0;
+  for (Block* b = builder->first_block(); b; b = b->next) {
+    if (block_count > UINT16_MAX) {
+      return false;
+    }
+    b->ordinal = static_cast<uint16_t>(block_count++);
+  }
+  if (!block_count) {
+    return false;
+  }
+
+  constexpr uint32_t kAllClean = ~uint32_t(0);
+  // Walks a block from the clean set at its entry, handing the set at each
+  // branch to on_branch. With `tag`, also marks the FPR loads that the set
+  // proves clean.
+  bool tagged = false;
+  const auto transfer = [&tagged](Block* block, uint32_t clean, bool tag,
+                                  auto&& on_branch) {
+    for (Instr* i = block->instr_head; i; i = i->next) {
+      if (const Label* target = i->BranchLabel()) {
+        on_branch(target->block, clean);
+        continue;
+      }
+      if (ClobbersGuestContext(i)) {
+        clean = 0;
+        continue;
+      }
+      const Opcode op = i->GetOpcodeNum();
+      const uint32_t offset = static_cast<uint32_t>(i->src1.offset);
+      size_t slot;
+      if (op == OPCODE_LOAD_CONTEXT) {
+        if (tag && i->dest && GuestFPRSlot(offset, i->dest->type, &slot) &&
+            (clean & (uint32_t(1) << slot)) &&
+            !(i->dest->flags & VALUE_NEVER_F64_DENORMAL)) {
+          i->dest->flags |= VALUE_NEVER_F64_DENORMAL;
+          tagged = true;
+        }
+        continue;
+      }
+      if (op != OPCODE_STORE_CONTEXT) {
+        continue;
+      }
+      Value* stored = i->src2.value;
+      if (GuestFPRSlot(offset, stored->type, &slot)) {
+        if (IsNeverF64Denormal(stored, 4)) {
+          clean |= uint32_t(1) << slot;
+        } else {
+          clean &= ~(uint32_t(1) << slot);
+        }
+        continue;
+      }
+      // A store of another shape that lands anywhere in the register file
+      // leaves those registers holding bytes this proof never described.
+      const uint32_t size = static_cast<uint32_t>(GetTypeSize(stored->type));
+      const uint32_t end = offset + size;
+      if (end > kGuestFPRBase && offset < kGuestFPRBase + kGuestFPRSize) {
+        const uint32_t lo = offset < kGuestFPRBase ? 0 : offset - kGuestFPRBase;
+        const uint32_t hi = std::min(end - kGuestFPRBase, kGuestFPRSize);
+        for (uint32_t byte = lo; byte < hi; ++byte) {
+          clean &= ~(uint32_t(1) << (byte / sizeof(double)));
+        }
+      }
+    }
+    return clean;
+  };
+
+  // The edges in walk order, each a branch or a fall-through. Each carries the
+  // clean set at its own instruction, which a mid-block branch needs.
+  const auto falls_through = [](const Block* block) {
+    const Instr* last = block->instr_tail;
+    return block->next && !(last && (last->GetOpcodeNum() == OPCODE_BRANCH ||
+                                     last->GetOpcodeNum() == OPCODE_RETURN));
+  };
+  std::vector<size_t> first_edge(block_count);
+  std::vector<std::vector<size_t>> incoming(block_count);
+  size_t edge_count = 0;
+  for (Block* block = builder->first_block(); block; block = block->next) {
+    first_edge[block->ordinal] = edge_count;
+    for (Instr* i = block->instr_head; i; i = i->next) {
+      if (const Label* target = i->BranchLabel()) {
+        incoming[target->block->ordinal].push_back(edge_count++);
+      }
+    }
+    if (falls_through(block)) {
+      incoming[block->next->ordinal].push_back(edge_count++);
+    }
+  }
+  std::vector<uint32_t> edge_clean(edge_count, kAllClean);
+  // The entry block inherits the caller's registers, which say nothing, and a
+  // block no edge reaches is entered from somewhere the proof cannot see.
+  const auto entry_of = [&](const Block* block) {
+    if (block->ordinal == 0 || incoming[block->ordinal].empty()) {
+      return uint32_t(0);
+    }
+    uint32_t clean = kAllClean;
+    for (size_t e : incoming[block->ordinal]) {
+      clean &= edge_clean[e];
+    }
+    return clean;
+  };
+
+  // Descend to the greatest fixed point, so a value that stays clean around a
+  // loop keeps its proof. The optimistic start is only sound at the fixed
+  // point, so tag nothing if it is not reached.
+  bool converged = false;
+  for (size_t sweep = 0; sweep < 64 && !converged; ++sweep) {
+    bool changed = false;
+    for (Block* block = builder->first_block(); block; block = block->next) {
+      size_t e = first_edge[block->ordinal];
+      const auto set_edge = [&](const Block*, uint32_t clean) {
+        if (edge_clean[e] != clean) {
+          edge_clean[e] = clean;
+          changed = true;
+        }
+        ++e;
+      };
+      const uint32_t exit = transfer(block, entry_of(block), false, set_edge);
+      if (falls_through(block)) {
+        set_edge(block->next, exit);
+      }
+    }
+    converged = !changed;
+  }
+  if (!converged) {
+    return false;
+  }
+
+  for (Block* block = builder->first_block(); block; block = block->next) {
+    transfer(block, entry_of(block), true, [](const Block*, uint32_t) {});
+  }
+  return tagged;
+}
+
 bool SimplificationPass::Run(HIRBuilder* builder, bool& result) {
   result = false;
 
+  result |= PropagateGuestFPRDenormalProof(builder);
   result |= SimplifyBitArith(builder);
   result |= EliminateConversions(builder);
   result |= SimplifyAssignments(builder);
@@ -71,8 +261,22 @@ static bool SameValueOrEqualConstant(hir::Value* x, hir::Value* y) {
     return true;
   }
 
-  if (x->IsConstant() && y->IsConstant()) {
-    return x->AsUint64() == y->AsUint64();
+  if (x->IsConstant() && y->IsConstant() && x->type == y->type) {
+    // Compare raw bits: AsUint64 only handles integer constants.
+    switch (x->type) {
+      case hir::INT8_TYPE:
+        return x->constant.u8 == y->constant.u8;
+      case hir::INT16_TYPE:
+        return x->constant.u16 == y->constant.u16;
+      case hir::INT32_TYPE:
+      case hir::FLOAT32_TYPE:
+        return x->constant.u32 == y->constant.u32;
+      case hir::INT64_TYPE:
+      case hir::FLOAT64_TYPE:
+        return x->constant.u64 == y->constant.u64;
+      default:
+        return false;
+    }
   }
 
   return false;
@@ -1349,6 +1553,44 @@ bool SimplificationPass::SimplifySHLArith(hir::Instr* i,
 
   return true;
 }
+
+// A single's smallest denormal (2^-149) is far above double's normal floor.
+static bool IsNeverF64Denormal(hir::Value* v, int depth) {
+  if (!v || v->type != FLOAT64_TYPE) {
+    return false;
+  }
+  if (v->IsConstant()) {
+    uint64_t bits;
+    std::memcpy(&bits, &v->constant.f64, sizeof(bits));
+    return (bits & 0x7FF0000000000000ull) != 0 ||
+           (bits & 0x000FFFFFFFFFFFFFull) == 0;
+  }
+  if (v->flags & VALUE_NEVER_F64_DENORMAL) {
+    return true;
+  }
+  hir::Instr* def = v->GetDefSkipAssigns();
+  if (!def || depth <= 0) {
+    return false;
+  }
+  switch (def->GetOpcodeNum()) {
+    case OPCODE_TO_SINGLE:
+      // Under --no_round_to_single the x64 TO_SINGLE is an identity.
+      return !cvars::no_round_to_single;
+    case OPCODE_UNPACK_SINGLE:
+      return true;
+    case OPCODE_CONVERT:
+      return def->src1.value && def->src1.value->type == FLOAT32_TYPE;
+    case OPCODE_SELECT:
+      return IsNeverF64Denormal(def->src2.value, depth - 1) &&
+             IsNeverF64Denormal(def->src3.value, depth - 1);
+    case OPCODE_NEG:
+    case OPCODE_ABS:
+      return IsNeverF64Denormal(def->src1.value, depth - 1);
+    default:
+      return false;
+  }
+}
+
 bool SimplificationPass::SimplifyBasicArith(hir::Instr* i,
                                             hir::HIRBuilder* builder) {
   if (!i->dest) {
@@ -1369,6 +1611,16 @@ bool SimplificationPass::SimplifyBasicArith(hir::Instr* i,
     }
     case OPCODE_SHL: {
       return SimplifySHLArith(i, builder);
+    }
+    case OPCODE_DENORMAL_QUIRK: {
+      if (IsNeverF64Denormal(i->src1.value, 4) &&
+          IsNeverF64Denormal(i->src2.value, 4) &&
+          IsNeverF64Denormal(i->src3.value, 4)) {
+        i->Replace(&OPCODE_ASSIGN_info, 0);
+        i->set_src1(builder->LoadZeroInt8());
+        return true;
+      }
+      return false;
     }
   }
   return false;

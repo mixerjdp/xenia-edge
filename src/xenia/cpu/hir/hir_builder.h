@@ -35,6 +35,8 @@ namespace hir {
 
 enum FunctionAttributes {
   FUNCTION_ATTRIB_INLINE = (1 << 1),
+  // Keeps every context store, so a fault mid-block sees current registers.
+  FUNCTION_ATTRIB_KEEP_CONTEXT_STORES = (1 << 2),
 };
 
 class HIRBuilder {
@@ -220,6 +222,7 @@ class HIRBuilder {
   void DelayExecution();
   void SetRoundingMode(Value* value);
   Value* Max(Value* value1, Value* value2);
+  Value* DenormalQuirk(Value* value1, Value* value2, Value* value3);
   Value* VectorMax(Value* value1, Value* value2, TypeName part_type,
                    uint32_t arithmetic_flags = 0);
   Value* Min(Value* value1, Value* value2);
@@ -250,6 +253,8 @@ class HIRBuilder {
   Value* VectorCompareUGE(Value* value1, Value* value2, TypeName part_type);
   Value* VectorDenormFlush(Value* value1);
   Value* ToSingle(Value* value);
+  Value* UnpackSingle(Value* single_bits);
+  Value* PackSingle(Value* value);
   Value* Add(Value* value1, Value* value2, uint32_t arithmetic_flags = 0);
   Value* AddWithCarry(Value* value1, Value* value2, Value* value3,
                       uint32_t arithmetic_flags = 0);

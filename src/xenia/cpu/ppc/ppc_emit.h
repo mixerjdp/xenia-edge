@@ -12,10 +12,6 @@
 
 namespace xe {
 namespace cpu {
-namespace hir {
-class HIRBuilder;
-class Value;
-}  // namespace hir
 namespace ppc {
 
 void RegisterEmitCategoryAltivec();
@@ -23,11 +19,6 @@ void RegisterEmitCategoryALU();
 void RegisterEmitCategoryControl();
 void RegisterEmitCategoryFPU();
 void RegisterEmitCategoryMemory();
-
-// Single<->double conversions that keep signaling NaNs intact, matching
-// PowerPC lfs/stfs. Exposed for testing; see ppc_emit_memory.cc.
-hir::Value* PackSingleKeepNaN(hir::HIRBuilder& f, hir::Value* value);
-hir::Value* UnpackSingleKeepNaN(hir::HIRBuilder& f, hir::Value* value);
 
 }  // namespace ppc
 }  // namespace cpu

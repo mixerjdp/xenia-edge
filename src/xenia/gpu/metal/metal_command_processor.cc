@@ -565,7 +565,7 @@ MetalCommandProcessor::MetalCommandProcessor(
     : CommandProcessor(graphics_system, kernel_state),
       dxil_binder_(*this, metal_shader_converter_) {}
 
-std::string MetalCommandProcessor::GetTitleStateSuffix() const {
+std::string MetalCommandProcessor::MakeTitleStateSuffix() const {
   if (!render_target_cache_) {
     return {};
   }
@@ -767,9 +767,7 @@ MetalCommandProcessor::EnsureTranslationSpirv(
                                    : ShaderCompileStatus::kFailed;
   }
   if (!translation->TryClaimTranslation()) {
-    // Don't wait on is_translated(): the shader's bindings are published by
-    // whichever modification translates first, so another one can set this
-    // while they are still half-written. The mutex orders it.
+    // Another thread is translating it.
     return ShaderCompileStatus::kPending;
   }
   if (!translator.TranslateAnalyzedShader(*translation)) {
@@ -917,19 +915,11 @@ Shader::Translation* MetalCommandProcessor::GetOrCreateHostTranslation(
       }
     }
   }
-  // Only the first translation of a shader gathers its bindings, so a sibling
-  // modification can still be filling them. The draw needs them.
-  if (status == ShaderCompileStatus::kReady && !shader.bindings_ready()) {
-    status = ShaderCompileStatus::kPending;
-  }
   if (status == ShaderCompileStatus::kPending && !allow_async) {
     // An earlier draw that could wait for this queued it. This caller can't, so
     // the only way to get it is to let the compile threads finish.
     AwaitAsyncCompiles();
     status = GetShaderCompileStatus(translation);
-    if (status == ShaderCompileStatus::kReady && !shader.bindings_ready()) {
-      status = ShaderCompileStatus::kPending;
-    }
   }
   *compile_status_out = status;
   return translation;
@@ -1583,7 +1573,8 @@ void MetalCommandProcessor::NoteMemexportRangesWritten() {
   for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
     uint32_t base_bytes = memexport_range.base_address_dwords << 2;
     shared_memory_->RangeWrittenByGpu(base_bytes, memexport_range.size_bytes);
-    MarkMemexportPagesWritten(base_bytes, memexport_range.size_bytes);
+    MarkMemexportPagesWritten(base_bytes, memexport_range.size_bytes,
+                              memexport_ranges_awaited_);
     // Written from the still-open command buffer, so a later draw sampling it
     // as a texture needs the same split a resolve gets.
     MarkResolvedMemory(base_bytes, memexport_range.size_bytes);
@@ -1740,7 +1731,7 @@ bool MetalCommandProcessor::SetupContext() {
   zpd_draw_resolution_scale_y_ = texture_cache_->draw_resolution_scale_y();
 
   zpd_visibility_pool_ = std::make_unique<MetalZPDVisibilityPool>();
-  EnsureZPDQueryResources();
+  EnsureQueryResources();
 
   // Initialize shader translation pipeline
   if (!InitializeShaderTranslation()) {
@@ -2081,7 +2072,7 @@ void MetalCommandProcessor::ShutdownContext() {
     spirv_argbuf_pool_.clear();
   }
 
-  ShutdownZPDQueryResources();
+  ShutdownQueryResources();
   zpd_visibility_pool_.reset();
 
   if (texture_cache_) {
@@ -2163,6 +2154,11 @@ void MetalCommandProcessor::TranslateShadersForStorage(
     if (it == guest_shader_cache_.end()) {
       continue;
     }
+    // Translation needs the ucode analyzed, which the storage load did only for
+    // the shaders it read this time.
+    if (!it->second->is_ucode_analyzed()) {
+      it->second->AnalyzeUcode(ucode_disasm_buffer_);
+    }
     // A domain modification's SPIR-V is a tessellation evaluation module, which
     // the DXIL path cannot build as a standalone vertex function.
     // GetDxilTessellationShaders links it with the host stages instead.
@@ -2186,13 +2182,9 @@ void MetalCommandProcessor::TranslateShadersForStorage(
   }
 }
 
-size_t MetalCommandProcessor::CreateStoredPipelines(
+void MetalCommandProcessor::CreateStoredPipelines(
     const std::vector<PipelineStoredDescription>& stored_descriptions) {
   replaying_stored_pipelines_ = true;
-  size_t created = 0;
-  size_t skipped_shader = 0;
-  size_t skipped_tessellation = 0;
-  size_t skipped_other_path = 0;
 
   // Ask for every tessellation stage set first, so the one drain below covers
   // them all rather than one per description.
@@ -2219,88 +2211,84 @@ size_t MetalCommandProcessor::CreateStoredPipelines(
     AwaitAsyncCompiles();
   }
 
-  for (const PipelineStoredDescription& stored : stored_descriptions) {
-    const PipelineDescription& description = stored.description;
-    // A tessellation pipeline belongs to the path that recorded it, and its
-    // shaders are the wrong subclass for the other one.
-    if (IsTessellationPipelineKind(PipelineKind(description.kind)) &&
-        (PipelineKind(description.kind) == PipelineKind::kDxilTessellation) !=
-            UseDxilPath()) {
-      ++skipped_other_path;
-      continue;
-    }
-    auto vertex_it = guest_shader_cache_.find(description.vertex_shader_hash);
-    if (vertex_it == guest_shader_cache_.end()) {
-      ++skipped_shader;
-      continue;
-    }
-    ShaderCompileStatus status = ShaderCompileStatus::kReady;
-    Shader::Translation* pixel_translation = nullptr;
-    if (description.pixel_shader_hash) {
-      auto pixel_it = guest_shader_cache_.find(description.pixel_shader_hash);
-      if (pixel_it == guest_shader_cache_.end()) {
-        ++skipped_shader;
-        continue;
-      }
-      pixel_translation = GetOrCreateHostTranslation(
-          *pixel_it->second, description.pixel_shader_modification,
-          /*allow_async=*/false, &status);
-      if (status != ShaderCompileStatus::kReady) {
-        ++skipped_shader;
-        continue;
-      }
-    }
-
-    // The description is the key, so a rebuilt pipeline lands exactly where the
-    // draw that stored it will look for it.
-    PipelineCompileRequest request = {};
-    request.description = description;
-    request.pipeline_key = description.GetHash();
-    request.priority = pixel_translation ? 2 : 1;
-    if (PipelineKind(description.kind) == PipelineKind::kDxilTessellation) {
-      // The domain modification never becomes a standalone vertex function, so
-      // it is asked for through the linked stages rather than translated here.
-      const DxilTessellationShaders* shaders = GetDxilTessellationShaders(
-          *static_cast<DxilShader*>(vertex_it->second.get()),
-          description.vertex_shader_modification, description.tessellation_mode,
-          description.host_vertex_shader_type, /*allow_async=*/true, &status);
-      if (!shaders) {
-        ++skipped_tessellation;
-        continue;
-      }
-      request.tessellation_shaders = shaders;
-      if (pixel_translation) {
-        auto* dxil_pixel =
-            static_cast<DxilShader::DxilTranslation*>(pixel_translation);
-        request.fragment_library = dxil_pixel->metal_library();
-        request.fragment_function_name = dxil_pixel->entry_point_name();
-      }
-    } else {
-      Shader::Translation* vertex_translation = GetOrCreateHostTranslation(
-          *vertex_it->second, description.vertex_shader_modification,
-          /*allow_async=*/false, &status);
-      if (status != ShaderCompileStatus::kReady) {
-        ++skipped_shader;
-        continue;
-      }
-      request.vertex_function = GetHostShaderFunction(vertex_translation);
-      request.fragment_function = GetHostShaderFunction(pixel_translation);
-    }
-
-    PipelineCompileStatus pipeline_status = PipelineCompileStatus::kFailed;
-    AcquirePipelineState(request, /*allow_async=*/true, &pipeline_status);
-    if (pipeline_status != PipelineCompileStatus::kFailed) {
-      ++created;
-    }
-  }
+  ReplayStoredPipelines(stored_descriptions,
+                        [this](const PipelineStoredDescription& stored,
+                               Shader*& vertex_shader_out) {
+                          return QueueStoredPipeline(stored, vertex_shader_out);
+                        });
   replaying_stored_pipelines_ = false;
-  if (skipped_shader || skipped_tessellation || skipped_other_path) {
-    XELOGI(
-        "Metal pipeline storage: skipped {} for missing or unbuildable "
-        "shaders, {} for tessellation stages, {} belonging to the other path",
-        skipped_shader, skipped_tessellation, skipped_other_path);
+}
+
+const char* MetalCommandProcessor::QueueStoredPipeline(
+    const PipelineStoredDescription& stored, Shader*& vertex_shader_out) {
+  const PipelineDescription& description = stored.description;
+  // A tessellation pipeline belongs to the path that recorded it, and its
+  // shaders are the wrong subclass for the other one.
+  if (IsTessellationPipelineKind(PipelineKind(description.kind)) &&
+      (PipelineKind(description.kind) == PipelineKind::kDxilTessellation) !=
+          UseDxilPath()) {
+    return "belonging to the other path";
   }
-  return created;
+  auto vertex_it = guest_shader_cache_.find(description.vertex_shader_hash);
+  if (vertex_it == guest_shader_cache_.end()) {
+    return "VS not found";
+  }
+  ShaderCompileStatus status = ShaderCompileStatus::kReady;
+  Shader::Translation* pixel_translation = nullptr;
+  if (description.pixel_shader_hash) {
+    auto pixel_it = guest_shader_cache_.find(description.pixel_shader_hash);
+    if (pixel_it == guest_shader_cache_.end()) {
+      return "PS not found";
+    }
+    pixel_translation = GetOrCreateHostTranslation(
+        *pixel_it->second, description.pixel_shader_modification,
+        /*allow_async=*/false, &status);
+    if (status != ShaderCompileStatus::kReady) {
+      return "PS not buildable";
+    }
+  }
+
+  // The description is the key, so a rebuilt pipeline lands exactly where the
+  // draw that stored it will look for it.
+  PipelineCompileRequest request = {};
+  request.description = description;
+  request.pipeline_key = description.GetHash();
+  request.priority = pixel_translation ? 2 : 1;
+  if (PipelineKind(description.kind) == PipelineKind::kDxilTessellation) {
+    // The domain modification never becomes a standalone vertex function, so
+    // it is asked for through the linked stages rather than translated here.
+    const DxilTessellationShaders* shaders = GetDxilTessellationShaders(
+        *static_cast<DxilShader*>(vertex_it->second.get()),
+        description.vertex_shader_modification, description.tessellation_mode,
+        description.host_vertex_shader_type, /*allow_async=*/true, &status);
+    if (!shaders) {
+      return "tessellation stages failed";
+    }
+    request.tessellation_shaders = shaders;
+    if (pixel_translation) {
+      auto* dxil_pixel =
+          static_cast<DxilShader::DxilTranslation*>(pixel_translation);
+      request.fragment_library = dxil_pixel->metal_library();
+      request.fragment_function_name = dxil_pixel->entry_point_name();
+    }
+  } else {
+    Shader::Translation* vertex_translation = GetOrCreateHostTranslation(
+        *vertex_it->second, description.vertex_shader_modification,
+        /*allow_async=*/false, &status);
+    if (status != ShaderCompileStatus::kReady) {
+      return "VS not buildable";
+    }
+    request.vertex_function = GetHostShaderFunction(vertex_translation);
+    request.fragment_function = GetHostShaderFunction(pixel_translation);
+  }
+
+  PipelineCompileStatus pipeline_status = PipelineCompileStatus::kFailed;
+  AcquirePipelineState(request, /*allow_async=*/true, &pipeline_status);
+  if (pipeline_status == PipelineCompileStatus::kFailed) {
+    return "pipeline failed";
+  }
+  vertex_shader_out = vertex_it->second.get();
+  return nullptr;
 }
 
 void MetalCommandProcessor::InitializeShaderStorage(
@@ -2334,21 +2322,13 @@ void MetalCommandProcessor::InitializeShaderStorage(
   config.version = PipelineDescription::kVersion +
                    SpirvShaderTranslator::Modification::kVersion;
 
-  uint32_t storage_index = storage_writer_.storage_index() + 1;
   std::vector<PipelineStoredDescription> stored_descriptions;
   if (!storage_writer_.InitializeShaderStorage(
           cache_root, title_id, config,
-          [&](xenos::ShaderType type, const uint32_t* ucode_dwords,
-              uint32_t ucode_dword_count, uint64_t ucode_data_hash) {
-            Shader* shader = LoadShader(type, ucode_dwords, ucode_dword_count);
-            if (!shader || shader->ucode_storage_index() == storage_index) {
-              return true;
-            }
-            shader->set_ucode_storage_index(storage_index);
-            if (!shader->is_ucode_analyzed()) {
-              shader->AnalyzeUcode(ucode_disasm_buffer_);
-            }
-            return true;
+          [this](xenos::ShaderType type, const uint32_t* ucode_dwords,
+                 uint32_t ucode_dword_count, uint64_t ucode_data_hash) {
+            return LoadShader(type, ucode_dwords, ucode_dword_count,
+                              ucode_data_hash);
           },
           [this](const std::set<std::pair<uint64_t, uint64_t>>
                      & translations_needed) {
@@ -2363,19 +2343,17 @@ void MetalCommandProcessor::InitializeShaderStorage(
   }
 
   uint64_t start_ticks = xe::Clock::QueryHostTickCount();
-  size_t accepted = CreateStoredPipelines(stored_descriptions);
+  CreateStoredPipelines(stored_descriptions);
   if (blocking) {
     // The caller is waiting on this, so finish rather than leaving the compile
     // threads to race the guest's first draws.
     AwaitAsyncCompiles();
   }
-  XELOGI(
-      "Metal pipeline storage: {} of {} stored pipelines {} in {} ms ({} path)",
-      accepted, stored_descriptions.size(),
-      blocking ? "rebuilt" : "rebuilt or queued",
-      (xe::Clock::QueryHostTickCount() - start_ticks) * 1000 /
-          xe::Clock::QueryHostTickFrequency(),
-      UseDxilPath() ? "DXIL" : "SPIRV-Cross");
+  XELOGI("Metal pipeline storage: {} path, stored pipelines {} in {} ms",
+         UseDxilPath() ? "DXIL" : "SPIRV-Cross",
+         blocking ? "rebuilt" : "rebuilt or queued",
+         (xe::Clock::QueryHostTickCount() - start_ticks) * 1000 /
+             xe::Clock::QueryHostTickFrequency());
 
   if (completion_callback) {
     completion_callback();
@@ -2386,6 +2364,7 @@ void MetalCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
                                       uint32_t frontbuffer_width,
                                       uint32_t frontbuffer_height) {
   SCOPE_profile_cpu_f("gpu");
+  EndZPDFrame();
   ProcessCompletedSubmissions();
 
   // Completion handlers land a frame or two behind, which a window this wide
@@ -2474,6 +2453,8 @@ void MetalCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
 
   if (primitive_processor_ && frame_open_) {
     primitive_processor_->EndFrame();
+    closed_frames_.push_back({frame_current_, submission_current_});
+    ++frame_current_;
     frame_open_ = false;
   }
   // Frame boundary reached - resolved memory tracking is only needed within a
@@ -2724,13 +2705,12 @@ void MetalCommandProcessor::AwaitAllQueueOperationsCompletion() {
 // ZPD (occlusion query) backend overrides.
 // ============================================================================
 
-void MetalCommandProcessor::EnsureZPDQueryResources() {
+void MetalCommandProcessor::EnsureQueryResources() {
   if (GetZPDMode() == ZPDMode::kFake || !zpd_visibility_pool_) {
     return;
   }
-  if (!zpd_visibility_pool_->EnsureInitialized(device_,
-                                               kZPDQueryPoolCapacity)) {
-    // CanOpenZPDQuery gates on the pool, so OpenQuerySegment returns before
+  if (!zpd_visibility_pool_->EnsureInitialized(device_, kQueryPoolCapacity)) {
+    // CanOpenQuery gates on the pool, so OpenQuerySegment returns before
     // reaching the base class's own pool-readiness check that arms this. Left
     // unset, every report would resolve to zero samples - fully occluded -
     // instead of falling back to fake counts.
@@ -2738,7 +2718,7 @@ void MetalCommandProcessor::EnsureZPDQueryResources() {
   }
 }
 
-void MetalCommandProcessor::ShutdownZPDQueryResources() {
+void MetalCommandProcessor::ShutdownQueryResources() {
   if (!zpd_visibility_pool_) {
     return;
   }
@@ -2747,11 +2727,11 @@ void MetalCommandProcessor::ShutdownZPDQueryResources() {
   zpd_visibility_pool_->Shutdown();
 }
 
-bool MetalCommandProcessor::IsZPDQueryPoolReady() const {
+bool MetalCommandProcessor::IsQueryPoolReady() const {
   return zpd_visibility_pool_ && zpd_visibility_pool_->is_initialized();
 }
 
-bool MetalCommandProcessor::CanOpenZPDQuery() const {
+bool MetalCommandProcessor::CanOpenQuery() const {
   // Metal visibility queries can only be enabled on a render encoder whose
   // descriptor had visibilityResultBuffer set before the encoder was created.
   return current_command_buffer_ != nullptr &&
@@ -2759,12 +2739,12 @@ bool MetalCommandProcessor::CanOpenZPDQuery() const {
          render_encoder_has_zpd_visibility_;
 }
 
-CommandProcessor::QueryOpenResult MetalCommandProcessor::OpenZPDQuery(
-    ReportHandle report_handle, bool can_close_submission) {
-  if (!IsZPDQueryPoolReady()) {
+CommandProcessor::QueryOpenResult MetalCommandProcessor::OpenQuery(
+    bool can_close_submission) {
+  if (!IsQueryPoolReady()) {
     return QueryOpenResult::kFailed;
   }
-  if (!CanOpenZPDQuery()) {
+  if (!CanOpenQuery()) {
     return QueryOpenResult::kDeferred;
   }
 
@@ -2826,8 +2806,9 @@ CommandProcessor::QueryOpenResult MetalCommandProcessor::OpenZPDQuery(
   return QueryOpenResult::kOpened;
 }
 
-bool MetalCommandProcessor::CloseZPDQuery(ReportHandle report_handle,
-                                          uint64_t& out_submission) {
+bool MetalCommandProcessor::CloseQuery(ReportHandle report_handle,
+                                       const VIZQueryHandle& viz,
+                                       uint64_t& out_submission) {
   if (!current_render_encoder_ || !render_encoder_has_zpd_visibility_ ||
       !zpd_active_query_.is_open()) {
     return false;
@@ -2845,34 +2826,10 @@ bool MetalCommandProcessor::CloseZPDQuery(ReportHandle report_handle,
   resolve.generation = zpd_active_query_.generation;
   resolve.scale_area = GetZPDScaleArea();
   resolve.report_handle = report_handle;
+  resolve.viz = viz;
   zpd_resolves_in_flight_.push_back(resolve);
 
   out_submission = resolve.submission;
-
-  zpd_active_query_.Reset();
-  return true;
-}
-
-bool MetalCommandProcessor::DiscardZPDQuery() {
-  if (!zpd_visibility_pool_ || !zpd_active_query_.is_open()) {
-    return false;
-  }
-
-  if (current_render_encoder_ && render_encoder_has_zpd_visibility_) {
-    current_render_encoder_->setVisibilityResultMode(
-        MTL::VisibilityResultModeDisabled, zpd_active_query_.offset);
-  }
-
-  // The offset was used in this render pass and Metal only allows an offset to
-  // be selected once per pass. Retire the slot after the submission completes
-  // instead of making it immediately available for reuse.
-  MetalZPDResolve resolve;
-  resolve.submission = GetCurrentSubmission();
-  resolve.index = zpd_active_query_.index;
-  resolve.generation = zpd_active_query_.generation;
-  resolve.scale_area = GetZPDScaleArea();
-  resolve.report_handle = kInvalidReportHandle;
-  zpd_resolves_in_flight_.push_back(resolve);
 
   zpd_active_query_.Reset();
   return true;
@@ -2908,8 +2865,14 @@ void MetalCommandProcessor::PumpQueryResolves() {
     uint64_t raw_samples = zpd_visibility_pool_->Read(resolve.index);
     zpd_visibility_pool_->Release(resolve.index, resolve.generation);
     if (resolve.report_handle != kInvalidReportHandle) {
-      OnZPDQueryResolved(resolve.report_handle, raw_samples,
+      // Metal has no in-shader counter path, so only ZPass is ever counted.
+      OnZPDQueryResolved(resolve.report_handle,
+                         XenosZPDReport::FromNativeQuery(raw_samples),
                          resolve.scale_area);
+    }
+    if (resolve.viz.generation != kInvalidVIZGeneration) {
+      OnVIZQueryResolved(resolve.viz.id, resolve.viz.generation,
+                         raw_samples != 0);
     }
   }
 }
@@ -2922,11 +2885,8 @@ bool MetalCommandProcessor::AwaitQueryResolve(ReportHandle report_handle,
 
   PumpQueryResolves();
 
-  auto it = logical_zpd_reports_.find(report_handle);
-  if (it == logical_zpd_reports_.end()) {
-    return true;
-  }
-  if (it->second.pending_segments == 0 && it->second.ended) {
+  const ZPDReport* report = FindZPDReport(report_handle);
+  if (!report || !report->pending_segments) {
     return true;
   }
   if (wait_for_submission == 0) {
@@ -2951,16 +2911,21 @@ bool MetalCommandProcessor::AwaitQueryResolve(ReportHandle report_handle,
 
   PumpQueryResolves();
 
-  it = logical_zpd_reports_.find(report_handle);
-  return it == logical_zpd_reports_.end() ||
-         (it->second.pending_segments == 0 && it->second.ended);
+  report = FindZPDReport(report_handle);
+  return !report || !report->pending_segments;
 }
 
 Shader* MetalCommandProcessor::LoadShader(xenos::ShaderType shader_type,
                                           const uint32_t* host_address,
                                           uint32_t dword_count) {
-  uint64_t hash = XXH3_64bits(host_address, dword_count * sizeof(uint32_t));
+  return LoadShader(shader_type, host_address, dword_count,
+                    XXH3_64bits(host_address, dword_count * sizeof(uint32_t)));
+}
 
+SpirvShader* MetalCommandProcessor::LoadShader(xenos::ShaderType shader_type,
+                                               const uint32_t* host_address,
+                                               uint32_t dword_count,
+                                               uint64_t hash) {
   auto it = guest_shader_cache_.find(hash);
   if (it != guest_shader_cache_.end()) {
     return it->second.get();
@@ -2986,9 +2951,15 @@ bool MetalCommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
   const RegisterFile& regs = *register_file_;
   uint32_t normalized_color_mask = 0;
 
+  // VIZ surveys aren't measured on Metal yet, so every ID stays visible.
+  OnVIZSurveyDraw(false);
+
   // Check for copy mode
   xenos::EdramMode edram_mode = regs.Get<reg::RB_MODECONTROL>().edram_mode;
   if (edram_mode == xenos::EdramMode::kCopy) {
+    if (draw_util::IsVIZSurveyDraw(regs)) {
+      return true;
+    }
     return IssueCopy();
   }
 
@@ -3037,11 +3008,17 @@ bool MetalCommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
   if (memexport_used_pixel) {
     draw_util::AddMemExportRanges(regs, *pixel_shader, memexport_ranges_);
   }
+  memexport_ranges_awaited_ =
+      IsMemexportAwaited(memexport_used_vertex, memexport_used_pixel);
   // Primitive/index processing (like D3D12/Vulkan).
   PrimitiveProcessor::ProcessingResult primitive_processing_result;
   if (!primitive_processor_) {
     XELOGE("IssueDraw: primitive processor is not initialized");
     return false;
+  }
+  // Converted indices are tagged with the current frame, which must be open.
+  if (!EnsureCommandBuffer()) {
+    return true;
   }
   if (!primitive_processor_->Process(primitive_processing_result)) {
     XELOGE("IssueDraw: primitive processing failed");
@@ -3087,9 +3064,10 @@ bool MetalCommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
     normalized_color_mask = pixel_shader ? draw_util::GetNormalizedColorMask(
                                                regs, ps_writes_color_targets)
                                          : 0;
-    if (!render_target_cache_->Update(is_rasterization_done,
-                                      normalized_depth_control,
-                                      normalized_color_mask, *vertex_shader)) {
+    // The window offset stays in the viewport on Metal.
+    if (!render_target_cache_->Update(
+            is_rasterization_done, normalized_depth_control,
+            normalized_color_mask, *vertex_shader, 0)) {
       XELOGE(
           "MetalCommandProcessor::IssueDraw - RenderTargetCache::Update "
           "failed");
@@ -3202,9 +3180,11 @@ void MetalCommandProcessor::ComputeDrawViewportInfo(
   bool convert_z_to_float24 = ::cvars::depth_float24_convert_in_pixel_shader;
   // ZPD segments can't mix scales. The resolved sample count is divided by one
   // scale area per segment, so a change splits the segment.
-  UpdateZPDScale(
+  // Metal has no in-shader counter path, so a segment never counts Total.
+  UpdateQuerySegment(
       (texture_cache_ ? texture_cache_->draw_resolution_scale_x() : 1) *
-      (texture_cache_ ? texture_cache_->draw_resolution_scale_y() : 1));
+          (texture_cache_ ? texture_cache_->draw_resolution_scale_y() : 1),
+      false, draw_util::IsVIZSurveyDraw(regs));
   draw_util::GetViewportInfoArgs gviargs{};
   gviargs.Setup(
       texture_cache_ ? texture_cache_->draw_resolution_scale_x() : 1,
@@ -3215,8 +3195,8 @@ void MetalCommandProcessor::ComputeDrawViewportInfo(
                      : divisors::MagicDiv(1),
       true, kViewportBoundsMax, kViewportBoundsMax, false,
       normalized_depth_control, convert_z_to_float24, true,
-      pixel_shader && pixel_shader->writes_depth());
-  gviargs.SetupRegisterValues(regs);
+      pixel_shader && pixel_shader->writes_depth(), false);
+  gviargs.SetupRegisterValues(regs, false);
   if (gviargs == previous_viewport_info_args_) {
     viewport_info_out = previous_viewport_info_;
   } else {
@@ -3625,9 +3605,9 @@ bool MetalCommandProcessor::IssueDrawMsl(
 
   // A counted draw needs the guest's own shaders. The placeholder has no pixel
   // kills or alpha test and overcounts, and a skipped draw counts nothing.
-  const bool exact_shaders_required = GetZPDMode() != ZPDMode::kFake &&
-                                      !zpd_force_fake_fallback_ &&
-                                      zpd_active_segment_.logical_active;
+  const bool exact_shaders_required =
+      GetZPDMode() != ZPDMode::kFake && !zpd_force_fake_fallback_ &&
+      zpd_current_report_.handle != kInvalidReportHandle;
 
   // Get or create shader translations. Both are asked for before either is
   // waited on, so their compiles overlap instead of taking a frame each.
@@ -4862,9 +4842,9 @@ bool MetalCommandProcessor::IssueDrawDxil(
 
   // A counted draw needs the guest's own shaders. The placeholder has no pixel
   // kills or alpha test and overcounts, and a skipped draw counts nothing.
-  const bool exact_shaders_required = GetZPDMode() != ZPDMode::kFake &&
-                                      !zpd_force_fake_fallback_ &&
-                                      zpd_active_segment_.logical_active;
+  const bool exact_shaders_required =
+      GetZPDMode() != ZPDMode::kFake && !zpd_force_fake_fallback_ &&
+      zpd_current_report_.handle != kInvalidReportHandle;
 
   ShaderCompileStatus compile_status = ShaderCompileStatus::kReady;
   ShaderCompileStatus pixel_status = ShaderCompileStatus::kReady;
@@ -4941,15 +4921,6 @@ bool MetalCommandProcessor::IssueDrawDxil(
         return true;
       }
       return false;
-    }
-    // A sibling modification translating on a compile thread may still be
-    // filling the shader's bindings, which the draw below reads.
-    if (!dxil_vertex_shader->bindings_ready() && exact_shaders_required) {
-      AwaitAsyncCompiles();
-    }
-    if (!dxil_vertex_shader->bindings_ready()) {
-      LogShaderCompilePending(domain_translation, "domain");
-      return true;
     }
   } else {
     auto* vertex_translation =
@@ -5162,52 +5133,6 @@ bool MetalCommandProcessor::IssueCopy() {
     return false;
   }
 
-  ReadbackResolveMode readback_mode = GetReadbackResolveMode();
-  bool do_readback = (readback_mode != ReadbackResolveMode::kDisabled);
-  bool readback_scaled = false;
-  bool readback_scaled_gpu = false;
-  bool use_gpu_downscale = false;
-  bool readback_scheduled = false;
-  uint32_t write_index = 0;
-  uint32_t read_index = 0;
-  bool use_delayed_sync = false;
-  bool wait_for_completion = false;
-  bool should_copy = false;
-  bool is_cache_miss = false;
-  uint32_t source_length = 0;
-  uint32_t readback_length = 0;
-  uint32_t tile_count = 0;
-  uint32_t pixel_size_log2 = 0;
-  uint32_t scale_x = 1;
-  uint32_t scale_y = 1;
-  bool half_pixel_offset = false;
-  uint32_t source_offset_bytes = 0;
-  uint64_t scaled_range_offset_bytes = 0;
-  uint64_t readback_base_offset_bytes = 0;
-  uint64_t scaled_copy_length = 0;
-  size_t source_buffer_binding_offset = 0;
-  uint64_t source_offset_bytes_log = 0;
-
-  if (do_readback) {
-    // Early check: if destination memory is not accessible, skip readback.
-    VirtualHeap* physical_heap = memory_->GetPhysicalHeap();
-    bool memory_accessible = false;
-    if (physical_heap) {
-      HeapAllocationInfo alloc_info;
-      if (physical_heap->QueryRegionInfo(written_address, &alloc_info) &&
-          (alloc_info.state & kMemoryAllocationCommit) &&
-          IsWritableProtect(alloc_info.protect)) {
-        uint32_t end_address = written_address + written_length;
-        uint32_t region_end = alloc_info.base_address + alloc_info.region_size;
-        if (end_address <= region_end) {
-          memory_accessible = true;
-        }
-      }
-    }
-    if (!memory_accessible) {
-      do_readback = false;
-    }
-  }
   if (!written_length) {
     // Keep the submission open for no-op copies and let primary-buffer end,
     // swap, or explicit sync points choose the commit boundary.
@@ -5350,6 +5275,7 @@ MTL::CommandBuffer* MetalCommandProcessor::EnsureCommandBuffer() {
     primitive_processor_->BeginFrame();
     if (render_target_cache_) {
       render_target_cache_->BeginFrame();
+      render_target_cache_->AdvanceRenderTargetUseFrame();
     }
     if (texture_cache_) {
       texture_cache_->BeginFrame();
@@ -5363,6 +5289,11 @@ MTL::CommandBuffer* MetalCommandProcessor::EnsureCommandBuffer() {
 void MetalCommandProcessor::ProcessCompletedSubmissions() {
   const uint64_t completed =
       completed_command_buffers_.load(std::memory_order_relaxed);
+  while (!closed_frames_.empty() &&
+         closed_frames_.front().last_submission <= completed) {
+    frame_completed_ = closed_frames_.front().frame;
+    closed_frames_.pop_front();
+  }
   if (completed <= submission_completed_processed_) {
     return;
   }
@@ -5542,11 +5473,12 @@ void MetalCommandProcessor::BeginCommandBuffer() {
 
   // The visibility result buffer has to be on the descriptor before the encoder
   // is created, so a segment waiting to open needs the pool allocated now.
-  const bool zpd_segment_pending = GetZPDMode() != ZPDMode::kFake &&
-                                   zpd_active_segment_.logical_active &&
-                                   zpd_active_segment_.segment_pending_begin;
+  const bool zpd_segment_pending =
+      GetZPDMode() != ZPDMode::kFake &&
+      zpd_current_report_.handle != kInvalidReportHandle &&
+      active_segment_.segment_pending_begin;
   if (zpd_segment_pending) {
-    EnsureZPDQueryResources();
+    EnsureQueryResources();
   }
 
   if (!current_render_encoder_ && !render_encoder_resource_usage_.empty()) {
@@ -5555,7 +5487,7 @@ void MetalCommandProcessor::BeginCommandBuffer() {
 
   // An encoder created before the pool existed can never host a query, so
   // restart it rather than leave the segment pending indefinitely.
-  if (current_render_encoder_ && zpd_segment_pending && IsZPDQueryPoolReady() &&
+  if (current_render_encoder_ && zpd_segment_pending && IsQueryPoolReady() &&
       !render_encoder_has_zpd_visibility_) {
     EndRenderEncoder();
   }
@@ -5597,7 +5529,7 @@ void MetalCommandProcessor::BeginCommandBuffer() {
 
   // Only passes that host a query need the buffer. A segment pending later
   // restarts the encoder above to pick it up.
-  if (zpd_segment_pending && IsZPDQueryPoolReady()) {
+  if (zpd_segment_pending && IsQueryPoolReady()) {
     pass_descriptor->setVisibilityResultBuffer(
         zpd_visibility_pool_->visibility_buffer());
   } else {
@@ -5645,8 +5577,8 @@ void MetalCommandProcessor::BeginCommandBuffer() {
     current_render_encoder_->setLabel(
         NS::String::string("XeniaRenderEncoder", NS::UTF8StringEncoding));
     render_encoder_has_zpd_visibility_ =
-        IsZPDQueryPoolReady() && (pass_descriptor->visibilityResultBuffer() ==
-                                  zpd_visibility_pool_->visibility_buffer());
+        IsQueryPoolReady() && (pass_descriptor->visibilityResultBuffer() ==
+                               zpd_visibility_pool_->visibility_buffer());
     ff_blend_factor_valid_ = false;
     current_render_pass_descriptor_ = pass_descriptor;
 
@@ -7157,6 +7089,9 @@ void MetalCommandProcessor::UpdateSpirvSystemConstantValues(
   // Color exponent bias (matching Vulkan backend).
   for (uint32_t i = 0; i < 4; ++i) {
     int32_t color_exp_bias = color_infos[i].color_exp_bias;
+    float color_exp_bias_scale;
+    *reinterpret_cast<int32_t*>(&color_exp_bias_scale) =
+        UINT32_C(0x3F800000) + (color_exp_bias << 23);
     if (render_target_cache_->GetPath() ==
             RenderTargetCache::Path::kHostRenderTargets &&
         ((color_infos[i].color_format ==
@@ -7165,11 +7100,10 @@ void MetalCommandProcessor::UpdateSpirvSystemConstantValues(
          (color_infos[i].color_format ==
               xenos::ColorRenderTargetFormat::k_16_16_16_16 &&
           !render_target_cache_->IsFixedRGBA16TruncatedToMinus1To1()))) {
-      color_exp_bias -= 5;
+      // Remap to -1...1 by scaling the output values by 1024/32767, so the
+      // SNORM bits are the EDRAM ones apart from -32.
+      color_exp_bias_scale *= 1024.0f / 32767.0f;
     }
-    float color_exp_bias_scale;
-    *reinterpret_cast<int32_t*>(&color_exp_bias_scale) =
-        UINT32_C(0x3F800000) + (color_exp_bias << 23);
     consts.color_exp_bias[i] = color_exp_bias_scale;
   }
 

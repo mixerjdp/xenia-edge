@@ -47,11 +47,11 @@ class ImGuiPerformanceDialog : public ImGuiGamepadDialog {
                         const std::string& description);
 
   // Setting change handlers
-  void OnReadbackResolveChanged(int value);
-  void OnReadbackResolveSyncChanged(bool enabled);
   void OnMemexportEnableChanged(bool enabled);
-  void OnMemexportAwaitFencesChanged(bool enabled);
+  void OnMemexportAwaitPixelExportsChanged(bool enabled);
+  void OnMemexportAwaitVertexExportsChanged(bool enabled);
   void OnOcclusionQueryChanged(int value);
+  void OnOcclusionQueryVIZChanged(bool enabled);
   void OnEmulatedDisplayUncappedChanged(bool uncapped);
   void OnFramerateLimitChanged(int value);
 
@@ -59,16 +59,15 @@ class ImGuiPerformanceDialog : public ImGuiGamepadDialog {
   std::function<void()> on_close_callback_;
 
   // Current settings state (selected values)
-  int readback_resolve_mode_ = 1;  // 0=None, 1=Fast, 2=All
-  bool readback_resolve_sync_ = true;
   bool memexport_enable_ = true;
-  bool memexport_await_fences_ = true;
+  bool memexport_await_pixel_exports_ = true;
+  bool memexport_await_vertex_exports_ = false;
   int occlusion_query_mode_ = 0;  // 0=Fake, 1=Fast, 2=Fast-Alt, 3=Strict
+  bool occlusion_query_viz_ = false;
   bool display_uncapped_ = false;
   int framerate_limit_ = 0;  // FPS, 0 = unlimited
 
   // Highlight positions for navigation
-  int resolve_highlight_ = 1;
   int occlusion_query_highlight_ = 0;
 };
 

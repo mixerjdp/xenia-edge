@@ -8,6 +8,11 @@
  */
 
 #include "xenia/kernel/xboxkrnl/xboxkrnl_threading.h"
+
+#include <algorithm>
+#include <utility>
+#include <vector>
+
 #include "xenia/base/atomic.h"
 #include "xenia/base/clock.h"
 #include "xenia/base/math.h"
@@ -59,15 +64,16 @@ namespace xboxkrnl {
 //   stw r3, 0x160(r11)
 // }
 
+// A NtCreate* call on a name in use opens the object only with OBJ_OPENIF and
+// the same type, returning X_STATUS_OBJECT_NAME_EXISTS. Otherwise it fails with
+// a collision, or a type mismatch under OBJ_OPENIF, and writes handle 0.
+// X_STATUS_SUCCESS means the name is free to create.
 template <typename T>
-object_ref<T> LookupNamedObject(KernelState* kernel_state,
-                                uint32_t obj_attributes_ptr) {
-  // If the name exists and its type matches, we can return that (ref+1)
-  // with a success of NAME_EXISTS.
-  // If the name exists and its type doesn't match, we do NAME_COLLISION.
-  // Otherwise, we add like normal.
+X_STATUS OpenNamedObject(KernelState* kernel_state, uint32_t obj_attributes_ptr,
+                         xe::be<uint32_t>* handle_ptr) {
+  constexpr uint32_t kObjOpenIf = 0x80;
   if (!obj_attributes_ptr) {
-    return nullptr;
+    return X_STATUS_SUCCESS;
   }
   auto obj_attributes =
       kernel_state->memory()->TranslateVirtual<X_OBJECT_ATTRIBUTES*>(
@@ -75,43 +81,45 @@ object_ref<T> LookupNamedObject(KernelState* kernel_state,
   assert_true(obj_attributes->name_ptr != 0);
   auto name = util::TranslateAnsiStringAddress(kernel_state->memory(),
                                                obj_attributes->name_ptr);
-  if (!name.empty()) {
-    X_HANDLE handle = X_INVALID_HANDLE_VALUE;
-    X_RESULT result =
-        kernel_state->object_table()->GetObjectByName(name, &handle);
-    if (XSUCCEEDED(result)) {
-      // Found something! It's been retained, so return.
-      auto obj = kernel_state->object_table()->LookupObject<T>(handle);
-      if (obj) {
-        // The caller will do as it likes.
-        obj->ReleaseHandle();
-        return obj;
-      }
-    }
+  if (name.empty()) {
+    return X_STATUS_SUCCESS;
   }
-  return nullptr;
+  auto object_table = kernel_state->object_table();
+  X_HANDLE handle = X_INVALID_HANDLE_VALUE;
+  if (XFAILED(object_table->GetObjectByName(name, &handle))) {
+    return X_STATUS_SUCCESS;
+  }
+  const bool open_if = obj_attributes->attributes & kObjOpenIf;
+  auto object = object_table->LookupObject<XObject>(handle);
+  if (object && open_if && object->type() == T::kObjectType) {
+    // The lookup's handle reference is the caller's.
+    if (handle_ptr) {
+      *handle_ptr = handle;
+    } else {
+      object_table->ReleaseHandle(handle);
+    }
+    return X_STATUS_OBJECT_NAME_EXISTS;
+  }
+  object_table->ReleaseHandle(handle);
+  if (!object) {
+    return X_STATUS_SUCCESS;
+  }
+  if (handle_ptr) {
+    *handle_ptr = 0;
+  }
+  return open_if ? X_STATUS_OBJECT_TYPE_MISMATCH
+                 : X_STATUS_OBJECT_NAME_COLLISION;
 }
-
-enum CreateThreadFlags : uint32_t {
-  ThreadInitiallySuspended = 0x00000001,
-  SystemThread = 0x00000002,
-  PriorityClass1 = 0x00000020,
-  PriorityClass2 = 0x00000040,
-  ReturnKThreadPtr = 0x00000080,
-  AffinityCpu0 = 0x01000000,
-  AffinityCpu1 = 0x02000000,
-  AffinityCpu2 = 0x04000000,
-  AffinityCpu3 = 0x08000000,
-  AffinityCpu4 = 0x10000000,
-  AffinityCpu5 = 0x20000000,
-};
 
 inline const std::map<uint32_t, std::string> ex_thread_flag_map = {
     {ThreadInitiallySuspended, "Thread Initially Suspended"},
     {SystemThread, "Guest Created System Thread"},
+    {TLSStatic, "TLS Static"},
     {PriorityClass1, "Thread Priority Class 1"},
     {PriorityClass2, "Thread Priority Class 2"},
     {ReturnKThreadPtr, "Return Kthread Ptr"},
+    {TitleExecutionThread, "Title Execution Thread"},
+    {Hidden, "Hide From Debug List"},
     {AffinityCpu0, "Thread Starts At Cpu 1"},
     {AffinityCpu1, "Thread Starts At Cpu 2"},
     {AffinityCpu2, "Thread Starts At Cpu 3"},
@@ -488,6 +496,8 @@ uint32_t KeDelayExecutionThread(uint32_t processor_mode, uint32_t alertable,
     }
   }
   X_STATUS result = thread->Delay(processor_mode, alertable, *interval_ptr);
+  // One queued as the delay ended runs on the way out.
+  xeProcessKernelApcs(ctx);
 
   if (result == X_STATUS_USER_APC) {
     xeProcessUserApcs(ctx);
@@ -501,9 +511,10 @@ dword_result_t KeDelayExecutionThread_entry(dword_t processor_mode,
                                             lpqword_t interval_ptr,
                                             const ppc_context_t& context) {
   SCOPE_profile_cpu_i("guestsync", "KeDelayExecutionThread");
+  // The kernel reads the interval unconditionally, so a null one faults on the
+  // console. Yield rather than crash the host.
   uint64_t interval = interval_ptr ? static_cast<uint64_t>(*interval_ptr) : 0u;
-  return KeDelayExecutionThread(processor_mode, alertable,
-                                interval_ptr ? &interval : nullptr, context);
+  return KeDelayExecutionThread(processor_mode, alertable, &interval, context);
 }
 DECLARE_XBOXKRNL_EXPORT3(KeDelayExecutionThread, kThreading, kImplemented,
                          kBlocking, kHighFrequency);
@@ -650,18 +661,10 @@ dword_result_t NtCreateEvent_entry(
     lpdword_t handle_ptr, pointer_t<X_OBJECT_ATTRIBUTES> obj_attributes_ptr,
     dword_t event_type, dword_t initial_state) {
   // Check for an existing timer with the same name.
-  auto existing_object =
-      LookupNamedObject<XEvent>(kernel_state(), obj_attributes_ptr);
-  if (existing_object) {
-    if (existing_object->type() == XObject::Type::Event) {
-      if (handle_ptr) {
-        existing_object->RetainHandle();
-        *handle_ptr = existing_object->handle();
-      }
-      return X_STATUS_OBJECT_NAME_EXISTS;
-    } else {
-      return X_STATUS_INVALID_HANDLE;
-    }
+  if (X_STATUS result = OpenNamedObject<XEvent>(kernel_state(),
+                                                obj_attributes_ptr, handle_ptr);
+      result != X_STATUS_SUCCESS) {
+    return result;
   }
 
   auto ev = object_ref<XEvent>(new XEvent(kernel_state()));
@@ -804,18 +807,10 @@ dword_result_t NtCreateSemaphore_entry(
     lpdword_t handle_ptr, pointer_t<X_OBJECT_ATTRIBUTES> obj_attributes_ptr,
     dword_t count, dword_t limit) {
   // Check for an existing semaphore with the same name.
-  auto existing_object =
-      LookupNamedObject<XSemaphore>(kernel_state(), obj_attributes_ptr);
-  if (existing_object) {
-    if (existing_object->type() == XObject::Type::Semaphore) {
-      if (handle_ptr) {
-        existing_object->RetainHandle();
-        *handle_ptr = existing_object->handle();
-      }
-      return X_STATUS_OBJECT_NAME_EXISTS;
-    } else {
-      return X_STATUS_INVALID_HANDLE;
-    }
+  if (X_STATUS result = OpenNamedObject<XSemaphore>(
+          kernel_state(), obj_attributes_ptr, handle_ptr);
+      result != X_STATUS_SUCCESS) {
+    return result;
   }
 
   auto sem = object_ref<XSemaphore>(new XSemaphore(kernel_state()));
@@ -875,18 +870,10 @@ dword_result_t NtCreateMutant_entry(
     lpdword_t handle_out, pointer_t<X_OBJECT_ATTRIBUTES> obj_attributes,
     dword_t initial_owner) {
   // Check for an existing timer with the same name.
-  auto existing_object = LookupNamedObject<XMutant>(
-      kernel_state(), obj_attributes.guest_address());
-  if (existing_object) {
-    if (existing_object->type() == XObject::Type::Mutant) {
-      if (handle_out) {
-        existing_object->RetainHandle();
-        *handle_out = existing_object->handle();
-      }
-      return X_STATUS_OBJECT_NAME_EXISTS;
-    } else {
-      return X_STATUS_INVALID_HANDLE;
-    }
+  if (X_STATUS result = OpenNamedObject<XMutant>(
+          kernel_state(), obj_attributes.guest_address(), handle_out);
+      result != X_STATUS_SUCCESS) {
+    return result;
   }
 
   auto mutant = object_ref<XMutant>(new XMutant(kernel_state()));
@@ -937,18 +924,10 @@ dword_result_t NtCreateTimer_entry(
   // timer_type = NotificationTimer (0) or SynchronizationTimer (1)
 
   // Check for an existing timer with the same name.
-  auto existing_object =
-      LookupNamedObject<XTimer>(kernel_state(), obj_attributes_ptr);
-  if (existing_object) {
-    if (existing_object->type() == XObject::Type::Timer) {
-      if (handle_ptr) {
-        existing_object->RetainHandle();
-        *handle_ptr = existing_object->handle();
-      }
-      return X_STATUS_OBJECT_NAME_EXISTS;
-    } else {
-      return X_STATUS_INVALID_HANDLE;
-    }
+  if (X_STATUS result = OpenNamedObject<XTimer>(kernel_state(),
+                                                obj_attributes_ptr, handle_ptr);
+      result != X_STATUS_SUCCESS) {
+    return result;
   }
 
   auto timer = object_ref<XTimer>(new XTimer(kernel_state()));
@@ -998,21 +977,17 @@ dword_result_t NtSetTimerEx_entry(dword_t timer_handle, lpqword_t due_time_ptr,
 DECLARE_XBOXKRNL_EXPORT1(NtSetTimerEx, kThreading, kImplemented);
 
 dword_result_t NtCancelTimer_entry(dword_t timer_handle,
-                                   lpdword_t current_state_ptr) {
-  X_STATUS result = X_STATUS_SUCCESS;
-
+                                   pointer_t<uint8_t> current_state_ptr) {
   auto timer =
       kernel_state()->object_table()->LookupObject<XTimer>(timer_handle);
-  if (timer) {
-    result = timer->Cancel();
-  } else {
-    result = X_STATUS_INVALID_HANDLE;
+  if (!timer) {
+    return X_STATUS_INVALID_HANDLE;
   }
+  // The BOOLEAN signal state, which cancelling leaves as it is.
   if (current_state_ptr) {
-    *current_state_ptr = 0;
+    *current_state_ptr = timer->IsSignaled() ? 1 : 0;
   }
-
-  return result;
+  return timer->Cancel();
 }
 DECLARE_XBOXKRNL_EXPORT1(NtCancelTimer, kThreading, kImplemented);
 
@@ -1222,8 +1197,8 @@ DECLARE_XBOXKRNL_EXPORT3(NtSignalAndWaitForSingleObjectEx, kThreading,
 
 static void PrefetchForCAS(const void* value) { swcache::PrefetchW(value); }
 
-// Brief spin budget for a spinlock held on another dispatch thread, roughly
-// the cost of the fiber reschedule it avoids.
+// Pauses between host yields while a spinlock is held on another dispatch
+// thread.
 static constexpr int kRemoteHolderSpinTries = 16;
 
 uint32_t xeKeKfAcquireSpinLock(PPCContext* ctx, X_KSPINLOCK* lock,
@@ -1243,8 +1218,9 @@ uint32_t xeKeKfAcquireSpinLock(PPCContext* ctx, X_KSPINLOCK* lock,
       !xe::atomic_cas(0, xe::byte_swap(our_pcr), &lock->prcb_of_owner.value)) {
     // Under the cooperative scheduler the holder may be a fiber queued behind
     // us on this dispatch thread, so it can only run if we yield the fiber. A
-    // holder running on another dispatch thread releases in nanoseconds, so
-    // spin briefly there before paying a reschedule.
+    // holder on another dispatch thread runs there. Like the console at
+    // DISPATCH_LEVEL, this spins until it releases and yields only the host
+    // thread.
     if (XThread::GetCurrentFiberThread()) {
       uint32_t owner_pcr_be = lock->prcb_of_owner.value;
       if (!owner_pcr_be) {
@@ -1253,17 +1229,19 @@ uint32_t xeKeKfAcquireSpinLock(PPCContext* ctx, X_KSPINLOCK* lock,
       auto* owner_kpcr =
           ctx->TranslateVirtual<X_KPCR*>(xe::byte_swap(owner_pcr_be));
       auto* scheduler = ctx->kernel_state->guest_scheduler();
+      // Teardown needs the fiber back at its dispatch loop, which a holder
+      // stopped with its own dispatch thread would never allow.
       if (scheduler->DispatchCpuOf(owner_kpcr->prcb_data.current_cpu) !=
-          scheduler->DispatchCpuOf(our_cpu)) {
+              scheduler->DispatchCpuOf(our_cpu) &&
+          !scheduler->shutting_down()) {
         volatile uint32_t* owner_raw = &lock->prcb_of_owner.value;
         for (int i = 0; i < kRemoteHolderSpinTries && *owner_raw; ++i) {
           SpinPause();
         }
-        if (!*owner_raw) {
-          continue;
+        if (*owner_raw) {
+          xe::threading::MaybeYield();
         }
-        // Still held past the budget, e.g. a holder preempted mid-hold, so
-        // stop burning the slice.
+        continue;
       }
       GuestScheduler::SpinYield();
       continue;
@@ -1363,8 +1341,10 @@ void KeEnterCriticalRegion_entry() {
 DECLARE_XBOXKRNL_EXPORT2(KeEnterCriticalRegion, kThreading, kImplemented,
                          kHighFrequency);
 
-void KeLeaveCriticalRegion_entry() {
+void KeLeaveCriticalRegion_entry(const ppc_context_t& ctx) {
   XThread::GetCurrentThread()->LeaveCriticalRegion();
+  // Kernel APCs the region held off run as it ends.
+  xeProcessKernelApcs(ctx);
 }
 DECLARE_XBOXKRNL_EXPORT2(KeLeaveCriticalRegion, kThreading, kImplemented,
                          kHighFrequency);
@@ -1424,7 +1404,8 @@ DECLARE_XBOXKRNL_EXPORT2(KfRaiseIrql, kThreading, kImplemented, kHighFrequency);
 
 uint32_t xeNtQueueApcThread(uint32_t thread_handle, uint32_t apc_routine,
                             uint32_t apc_routine_context, uint32_t arg1,
-                            uint32_t arg2, cpu::ppc::PPCContext* context) {
+                            uint32_t arg2, uint32_t apc_mode,
+                            cpu::ppc::PPCContext* context) {
   auto kernelstate = context->kernel_state;
   auto memory = kernelstate->memory();
   auto thread =
@@ -1441,7 +1422,7 @@ uint32_t xeNtQueueApcThread(uint32_t thread_handle, uint32_t apc_routine,
   }
   XAPC* apc = context->TranslateVirtual<XAPC*>(apc_ptr);
   xeKeInitializeApc(apc, thread->guest_object(), XAPC::kDummyKernelRoutine, 0,
-                    apc_routine, 1 /*user apc mode*/, apc_routine_context);
+                    apc_routine, apc_mode, apc_routine_context);
 
   if (!xeInsertQueueApcAndWake(thread.get(), apc, arg1, arg2, context)) {
     memory->SystemHeapFree(apc_ptr);
@@ -1471,7 +1452,7 @@ dword_result_t NtQueueApcThread_entry(dword_t thread_handle,
                                       lpvoid_t arg1, lpvoid_t arg2,
                                       const ppc_context_t& context) {
   return xeNtQueueApcThread(thread_handle, apc_routine, apc_routine_context,
-                            arg1, arg2, context);
+                            arg1, arg2, 1 /*user apc mode*/, context);
 }
 
 // Runs every queued APC on |list_index| (1 = user, 0 = kernel), executing the
@@ -1493,10 +1474,9 @@ static bool ProcessApcList(PPCContext* ctx, X_KTHREAD* current_thread,
   ctx->r[1] = old_stack_pointer - 32;
 
   while (!apc_queue.empty(ctx)) {
-    uint32_t apc_ptr = apc_queue.flink_ptr;
-
     XAPC* apc = apc_queue.ListEntryObject(
-        ctx->TranslateVirtual<X_LIST_ENTRY*>(apc_ptr));
+        ctx->TranslateVirtual<X_LIST_ENTRY*>(apc_queue.flink_ptr));
+    uint32_t apc_ptr = ctx->HostToGuestVirtual(apc);
 
     uint8_t* scratch_ptr = ctx->TranslateVirtual(scratch_address);
     xe::store_and_swap<uint32_t>(scratch_ptr + 0, apc->normal_routine);
@@ -1564,8 +1544,9 @@ bool xeProcessKernelApcs(PPCContext* ctx) {
   }
   auto kpcr = ctx->TranslateVirtualGPR<X_KPCR*>(ctx->r[13]);
   auto current_thread = ctx->TranslateVirtual(kpcr->prcb_data.current_thread);
-  // Masked at APC_LEVEL and above, and never nested.
-  if (kpcr->current_irql >= 1 || current_thread->executing_kernel_apc) {
+  // Masked at APC_LEVEL and above or in a critical region, and never nested.
+  if (kpcr->current_irql >= 1 || current_thread->apc_disable_count ||
+      current_thread->executing_kernel_apc) {
     return false;
   }
   if (current_thread->apc_lists[0].empty(ctx)) {
@@ -1662,6 +1643,11 @@ void KeInitializeApc_entry(pointer_t<XAPC> apc, pointer_t<X_KTHREAD> thread_ptr,
 }
 DECLARE_XBOXKRNL_EXPORT1(KeInitializeApc, kThreading, kImplemented);
 
+// A host thread, such as an I/O worker or a timer callback, queues and removes
+// APCs with the target's context (see XThread::ApcQueueContext). It must leave
+// the target's IRQL alone, as the target may change it at the same time.
+static bool CallerIsHostThread() { return !cpu::ThreadState::Get(); }
+
 uint32_t xeKeInsertQueueApc(XAPC* apc, uint32_t arg1, uint32_t arg2,
                             uint32_t priority_increment,
                             cpu::ppc::PPCContext* context) {
@@ -1670,7 +1656,9 @@ uint32_t xeKeInsertQueueApc(XAPC* apc, uint32_t arg1, uint32_t arg2,
     return 0;
   }
   auto target_thread = context->TranslateVirtual<X_KTHREAD*>(apc->thread_ptr);
-  auto old_irql = xeKeKfAcquireSpinLock(context, &target_thread->apc_lock);
+  const bool change_irql = !CallerIsHostThread();
+  auto old_irql =
+      xeKeKfAcquireSpinLock(context, &target_thread->apc_lock, change_irql);
   uint32_t result;
   if (!target_thread->may_queue_apcs || apc->enqueued) {
     result = 0;
@@ -1706,14 +1694,27 @@ uint32_t xeKeInsertQueueApc(XAPC* apc, uint32_t arg1, uint32_t arg2,
     */
     result = 1;
   }
-  xeKeKfReleaseSpinLock(context, &target_thread->apc_lock, old_irql);
+  xeKeKfReleaseSpinLock(context, &target_thread->apc_lock, old_irql,
+                        change_irql);
   return result;
 }
 
 dword_result_t KeInsertQueueApc_entry(pointer_t<XAPC> apc, lpvoid_t arg1,
                                       lpvoid_t arg2, dword_t priority_increment,
                                       const ppc_context_t& context) {
-  return xeKeInsertQueueApc(apc, arg1, arg2, priority_increment, context);
+  auto kpcr = context->TranslateVirtualGPR<X_KPCR*>(context->r[13]);
+  const bool kernel_apc_to_self =
+      apc->apc_mode == 0 &&
+      context->TranslateVirtual<X_KTHREAD*>(apc->thread_ptr) ==
+          context->TranslateVirtual(kpcr->prcb_data.current_thread);
+  uint32_t result =
+      xeKeInsertQueueApc(apc, arg1, arg2, priority_increment, context);
+  // Lowering IRQL as the APC lock is released runs a kernel APC queued to this
+  // thread.
+  if (result && kernel_apc_to_self) {
+    xeProcessKernelApcs(context);
+  }
+  return result;
 }
 DECLARE_XBOXKRNL_EXPORT1(KeInsertQueueApc, kThreading, kImplemented);
 
@@ -1725,7 +1726,9 @@ uint32_t xeKeRemoveQueueApc(XAPC* apc, cpu::ppc::PPCContext* context) {
     return 0;
   }
   auto target_thread = context->TranslateVirtual<X_KTHREAD*>(apc->thread_ptr);
-  auto old_irql = xeKeKfAcquireSpinLock(context, &target_thread->apc_lock);
+  const bool change_irql = !CallerIsHostThread();
+  auto old_irql =
+      xeKeKfAcquireSpinLock(context, &target_thread->apc_lock, change_irql);
 
   if (apc->enqueued) {
     result = true;
@@ -1733,7 +1736,8 @@ uint32_t xeKeRemoveQueueApc(XAPC* apc, cpu::ppc::PPCContext* context) {
     util::XeRemoveEntryList(&apc->list_entry, context);
     // todo: this is incomplete, there is more logic here in actual kernel
   }
-  xeKeKfReleaseSpinLock(context, &target_thread->apc_lock, old_irql);
+  xeKeKfReleaseSpinLock(context, &target_thread->apc_lock, old_irql,
+                        change_irql);
 
   return result ? 1 : 0;
 }
@@ -1756,6 +1760,56 @@ void KeInitializeDpc_entry(pointer_t<XDPC> dpc, lpvoid_t routine,
 }
 DECLARE_XBOXKRNL_EXPORT2(KeInitializeDpc, kThreading, kImplemented, kSketchy);
 
+// DPCs queued while a DPC routine runs, with the guest thread running it, as
+// {thread id, DPC}. They run after it returns, as the console drains its DPC
+// queue, instead of nesting. Guarded with the global lock.
+static std::vector<std::pair<uint32_t, uint32_t>> deferred_dpcs;
+
+static bool IsDeferredDpc(uint32_t dpc_ptr) {
+  return std::find_if(deferred_dpcs.begin(), deferred_dpcs.end(),
+                      [dpc_ptr](const auto& deferred) {
+                        return deferred.second == dpc_ptr;
+                      }) != deferred_dpcs.end();
+}
+
+// Runs a DPC on the calling thread. One targeted at another processor
+// (desired_cpu_number n + 1 runs on CPU n) sees that processor's number.
+void xeRunDpc(PPCContext* ctx, uint32_t dpc_ptr, uint32_t arg1, uint32_t arg2) {
+  auto dpc = kernel_memory()->TranslateVirtual<XDPC*>(dpc_ptr);
+  if (!dpc->routine) {
+    return;
+  }
+  auto kpcr = ctx->TranslateVirtualGPR<X_KPCR*>(ctx->r[13]);
+  const uint8_t own_cpu = kpcr->prcb_data.current_cpu;
+  uint64_t args[] = {dpc_ptr, uint32_t(dpc->context), arg1, arg2};
+  if (dpc->desired_cpu_number && dpc->desired_cpu_number <= 6) {
+    kpcr->prcb_data.current_cpu = dpc->desired_cpu_number - 1;
+  }
+  kernel_state()->processor()->Execute(ctx->thread_state, dpc->routine, args,
+                                       xe::countof(args));
+  kpcr->prcb_data.current_cpu = own_cpu;
+}
+
+void xeRunDeferredDpcs(PPCContext* ctx) {
+  while (true) {
+    uint32_t dpc_ptr;
+    {
+      auto global_lock = xe::global_critical_region::AcquireDirect();
+      auto it = std::find_if(deferred_dpcs.begin(), deferred_dpcs.end(),
+                             [ctx](const auto& deferred) {
+                               return deferred.first == ctx->thread_id;
+                             });
+      if (it == deferred_dpcs.end()) {
+        return;
+      }
+      dpc_ptr = it->second;
+      deferred_dpcs.erase(it);
+    }
+    auto dpc = kernel_memory()->TranslateVirtual<XDPC*>(dpc_ptr);
+    xeRunDpc(ctx, dpc_ptr, dpc->arg1, dpc->arg2);
+  }
+}
+
 dword_result_t KeInsertQueueDpc_entry(pointer_t<XDPC> dpc, dword_t arg1,
                                       dword_t arg2) {
   uint32_t list_entry_ptr = dpc.guest_address() + 4;
@@ -1764,43 +1818,61 @@ dword_result_t KeInsertQueueDpc_entry(pointer_t<XDPC> dpc, dword_t arg1,
   auto global_lock = xe::global_critical_region::AcquireDirect();
   auto dpc_list = kernel_state()->dpc_list();
 
+  // A DPC still waiting to run is not queued again.
+  if (IsDeferredDpc(dpc.guest_address())) {
+    return 0;
+  }
+
+  // A DPC targeted at another processor runs there, interrupting whatever runs
+  // on it below DISPATCH_LEVEL. Only a fiber pinned to that processor can
+  // stand in for it.
+  auto thread = XThread::GetCurrentThread();
+  const uint8_t desired_cpu = dpc->desired_cpu_number;
+  if (dpc->routine && thread && desired_cpu && desired_cpu <= 6 &&
+      GuestScheduler::enabled()) {
+    auto ppc_context = thread->thread_state()->context();
+    auto kpcr = ppc_context->TranslateVirtualGPR<X_KPCR*>(ppc_context->r[13]);
+    if (desired_cpu - 1 != kpcr->prcb_data.current_cpu ||
+        !XThread::GetCurrentFiberThread()) {
+      kernel_state()->StartProcessorDpcThread(desired_cpu - 1);
+      return kernel_state()->QueueProcessorDpc(desired_cpu - 1,
+                                               dpc.guest_address(), arg1, arg2)
+                 ? 1
+                 : 0;
+    }
+    if (kernel_state()->IsProcessorDpcQueued(desired_cpu - 1,
+                                             dpc.guest_address())) {
+      return 0;
+    }
+  }
+
   // Prep DPC.
   dpc->arg1 = (uint32_t)arg1;
   dpc->arg2 = (uint32_t)arg2;
 
   dpc_list->Insert(list_entry_ptr);
 
-  // Dispatch the DPC inline on the calling thread.  On real hardware DPCs
-  // are deferred to DISPATCH_IRQL on the target processor, but DPC routines
-  // access per-CPU state via r13 (KPCR) so they must run on a thread whose
-  // KPCR is valid for the target CPU.  The calling thread's KPCR satisfies
-  // this for the common case (desired_cpu_number == 0, meaning current CPU).
-  // Inline dispatch also avoids latency issues with shared work queues.
+  // Otherwise it runs inline on the calling thread: it targets the calling
+  // processor, or no scheduler can run it elsewhere.
   uint32_t routine = dpc->routine;
   if (routine) {
-    auto thread = XThread::GetCurrentThread();
     if (thread) {
       auto thread_state = thread->thread_state();
       auto ppc_context = thread_state->context();
       auto kpcr = ppc_context->TranslateVirtualGPR<X_KPCR*>(ppc_context->r[13]);
 
-      // If we're already inside a DPC (reentrant KeInsertQueueDpc from a DPC
-      // routine), skip the impersonation — we're already at DISPATCH_IRQL.
-      bool already_in_dpc = kpcr->prcb_data.dpc_active != 0;
+      // Inside a DPC routine (reentrant KeInsertQueueDpc), the DPC waits
+      // for the running one to return. A routine that queues itself again
+      // would otherwise recurse until the host stack overflows.
+      if (kpcr->prcb_data.dpc_active) {
+        deferred_dpcs.emplace_back(ppc_context->thread_id, dpc.guest_address());
+        return 1;
+      }
 
       DPCImpersonationScope dpc_scope{};
-      if (!already_in_dpc) {
-        kernel_state()->BeginDPCImpersonation(ppc_context, dpc_scope);
-      }
-
-      uint64_t args[] = {dpc.guest_address(), (uint64_t)dpc->context,
-                         (uint64_t)arg1, (uint64_t)arg2};
-      kernel_state()->processor()->Execute(thread_state, routine, args,
-                                           xe::countof(args));
-
-      if (!already_in_dpc) {
-        kernel_state()->EndDPCImpersonation(ppc_context, dpc_scope);
-      }
+      kernel_state()->BeginDPCImpersonation(ppc_context, dpc_scope);
+      xeRunDpc(ppc_context, dpc.guest_address(), arg1, arg2);
+      kernel_state()->EndDPCImpersonation(ppc_context, dpc_scope);
     }
   }
 
@@ -1818,6 +1890,19 @@ dword_result_t KeRemoveQueueDpc_entry(pointer_t<XDPC> dpc) {
   if (dpc_list->IsQueued(list_entry_ptr)) {
     dpc_list->Remove(list_entry_ptr);
     result = true;
+  }
+  if (kernel_state()->RemoveDpc(dpc.guest_address())) {
+    result = true;
+  }
+  if (kernel_state()->RemoveProcessorDpc(dpc.guest_address())) {
+    result = true;
+  }
+  for (auto it = deferred_dpcs.begin(); it != deferred_dpcs.end(); ++it) {
+    if (it->second == dpc.guest_address()) {
+      deferred_dpcs.erase(it);
+      result = true;
+      break;
+    }
   }
 
   return result ? 1 : 0;
@@ -2087,6 +2172,74 @@ void KeInitializeTimerEx_entry(pointer_t<X_KTIMER> timer, dword_t type,
   xeKeInitializeTimerEx(timer, type, proctype & 0xFF, context);
 }
 DECLARE_XBOXKRNL_EXPORT1(KeInitializeTimerEx, kThreading, kImplemented);
+
+// Returns whether the timer was already set.
+dword_result_t KeSetTimerEx_entry(pointer_t<X_KTIMER> timer, qword_t due_time,
+                                  dword_t period_ms, pointer_t<XDPC> dpc) {
+  auto native = XObject::GetNativeObject<XTimer>(kernel_state(), timer);
+  if (!native) {
+    return 0;
+  }
+  // Cancelled first, so an expiry of the previous setting can't overwrite the
+  // new one.
+  native->Cancel();
+  // Its expiry queues a DPC targeted at a processor on that processor's DPC
+  // thread, which only guest code can start.
+  if (dpc && dpc->desired_cpu_number && dpc->desired_cpu_number <= 6) {
+    kernel_state()->StartProcessorDpcThread(dpc->desired_cpu_number - 1);
+  }
+  const uint32_t was_set = timer->header.inserted;
+  timer->header.inserted = 1;
+  timer->header.signal_state = 0;
+  timer->due_time = uint64_t(due_time);
+  timer->period = uint32_t(period_ms);
+  timer->dpc = dpc.guest_address();
+  native->SetTimer(int64_t(uint64_t(due_time)), period_ms, 0, 0, false,
+                   dpc.guest_address());
+  return was_set;
+}
+DECLARE_XBOXKRNL_EXPORT1(KeSetTimerEx, kThreading, kImplemented);
+
+// Returns whether the timer was set.
+dword_result_t KeCancelTimer_entry(pointer_t<X_KTIMER> timer) {
+  const uint32_t was_set = timer->header.inserted;
+  if (was_set) {
+    if (auto native = XObject::GetNativeObject<XTimer>(kernel_state(), timer)) {
+      native->Cancel();
+    }
+  }
+  timer->header.inserted = 0;
+  return was_set;
+}
+DECLARE_XBOXKRNL_EXPORT1(KeCancelTimer, kThreading, kImplemented);
+
+dword_result_t KeSetTimer_entry(pointer_t<X_KTIMER> timer, qword_t due_time,
+                                pointer_t<XDPC> dpc) {
+  return KeSetTimerEx_entry(timer, due_time, 0, dpc);
+}
+DECLARE_XBOXKRNL_EXPORT1(KeSetTimer, kThreading, kImplemented);
+
+void KeInitializeMutant_entry(pointer_t<X_KMUTANT> mutant,
+                              dword_t initial_owner) {
+  mutant.Zero();
+  mutant->header.type = X_OBJECT_TYPES::MutantObject;
+  mutant->header.signal_state = initial_owner ? 0 : 1;
+  // Created now so an initial owner is the calling thread.
+  XObject::GetNativeObject<XMutant>(kernel_state(), mutant);
+}
+DECLARE_XBOXKRNL_EXPORT1(KeInitializeMutant, kThreading, kImplemented);
+
+// Returns the previous signal state.
+dword_result_t KeReleaseMutant_entry(pointer_t<X_KMUTANT> mutant,
+                                     dword_t priority_increment,
+                                     dword_t abandon, dword_t wait) {
+  const int32_t previous = int32_t(uint32_t(mutant->header.signal_state));
+  if (auto native = XObject::GetNativeObject<XMutant>(kernel_state(), mutant)) {
+    native->ReleaseMutant(priority_increment, !!abandon, !!wait);
+  }
+  return previous;
+}
+DECLARE_XBOXKRNL_EXPORT1(KeReleaseMutant, kThreading, kImplemented);
 
 }  // namespace xboxkrnl
 }  // namespace kernel

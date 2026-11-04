@@ -72,7 +72,7 @@ DECLARE_string(gpu);
 DECLARE_path(log_file);
 DECLARE_int32(log_level);
 DECLARE_bool(d3d12_install_missing_runtime);
-DECLARE_string(readback_resolve);
+DECLARE_bool(readback_resolve);
 DECLARE_bool(disable_context_promotion);
 DECLARE_string(render_target_path);
 DECLARE_path(d3d12_runtime_dir);
@@ -283,15 +283,14 @@ const retro_core_option_v2_definition kCoreOptionDefinitions[] = {
     {"xenia_readback_resolve",
      "Readback Resolve",
      nullptr,
-     "Copies rendered surfaces back into guest memory. Games that read their "
-     "own framebuffer need 'all' or they come out dark or missing effects. "
-     "A per-game config overrides this.",
+     "Copies rendered surfaces back into guest memory when the game reads "
+     "them. Games that read their own framebuffer come out dark or missing "
+     "effects without it. A per-game config overrides this.",
      nullptr,
      nullptr,
      {{"auto", "Auto (leave as configured)"},
-      {"fast", "Fast (only what is read)"},
-      {"all", "All (slower, most compatible)"},
-      {"none", "None (fastest)"},
+      {"enabled", "Enabled (most compatible)"},
+      {"disabled", "Disabled (fastest)"},
       {nullptr, nullptr}},
      "auto"},
     {"xenia_context_promotion",
@@ -352,7 +351,7 @@ const retro_variable kCoreOptions[] = {
      "Guest display resolution (restart); "
      "default|1280x720|1280x960|1360x768|1440x900|1680x1050|1920x1080"},
     {"xenia_readback_resolve",
-     "Readback resolve - fixes dark or missing visuals; auto|fast|all|none"},
+     "Readback resolve - fixes dark or missing visuals; auto|enabled|disabled"},
     {"xenia_context_promotion",
      "Context promotion - off fixes some sports animations; "
      "auto|enabled|disabled"},
@@ -914,8 +913,12 @@ void ApplyTunableOptions() {
 
   if (const char* mode = GetOptionValue("xenia_readback_resolve")) {
     const std::string value(mode);
-    if (value == "fast" || value == "all" || value == "none") {
-      cvars::readback_resolve = value;
+    // fast, all and none are what it took before it became a bool, and what
+    // the frontend may still have saved for it.
+    if (value == "enabled" || value == "fast" || value == "all") {
+      cvars::readback_resolve = true;
+    } else if (value == "disabled" || value == "none") {
+      cvars::readback_resolve = false;
     }
   }
   if (const char* promotion = GetOptionValue("xenia_context_promotion")) {

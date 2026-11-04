@@ -46,6 +46,11 @@ class X64CodeCache;
 typedef void* (*HostToGuestThunk)(void* target, void* arg0, void* arg1);
 typedef void* (*GuestToHostThunk)(void* target, void* arg0, void* arg1);
 typedef void (*ResolveFunctionThunk)();
+// Host entry to a stwcx. helper, returns 1 if the store landed. The value is
+// guest endian.
+typedef uint32_t (*ReservedStoreThunk)(uint32_t guest_address,
+                                       ppc::PPCContext* context, uint64_t value,
+                                       void* host_address);
 
 /*
     place guest trampolines in the memory range that the HV normally occupies.
@@ -99,17 +104,32 @@ enum : uint32_t {
   kX64BackendMXCSRDazBit =
       4,  // when the mode bit says vmx, the loaded mxcsr is mxcsr_vmx_daz
 };
+// Which lookups take a dynamic call cache entry.
+enum X64DynamicCallCacheKind : uint32_t {
+  kX64DynamicCallAny = 0,
+  // Cached by a direct call, which skips the return site checks a branch to
+  // the same address needs.
+  kX64DynamicCallDirectOnly = 1,
+  // A function at a return site. A branch takes it only when no live frame
+  // returns there and ResolveLongjmp couldn't apply.
+  kX64DynamicCallReturnSite = 2,
+};
 // A resolved guest address that has no indirection slot.
 struct X64DynamicCallCacheEntry {
   uint32_t guest_address;
-  uint32_t unused;
+  uint32_t kind;
   uint64_t host_address;
 };
-constexpr uint32_t kX64DynamicCallCacheSize = 4096;
+constexpr uint32_t kX64DynamicCallCacheSize = 16384;
 // EmitDynamicCallLookup indexes and loads these itself.
 static_assert(sizeof(X64DynamicCallCacheEntry) == 16);
 static_assert(offsetof(X64DynamicCallCacheEntry, host_address) == 8);
 static_assert((kX64DynamicCallCacheSize & (kX64DynamicCallCacheSize - 1)) == 0);
+// The cache slot of a guest address, which EmitDynamicCallLookup computes too.
+inline uint32_t X64DynamicCallCacheIndex(uint32_t guest_address) {
+  return ((guest_address >> 2) ^ (guest_address >> 14)) &
+         (kX64DynamicCallCacheSize - 1);
+}
 
 // located prior to the ctx register
 // some things it would be nice to have be per-emulator instance instead of per
@@ -121,9 +141,15 @@ struct X64BackendContext {
   // rest within 8-bit displacements.
   // allocated by the first dynamic call resolve on this thread
   X64DynamicCallCacheEntry* dynamic_call_cache;
+  // The host stack pointer a dynamic code return to host code returns with.
+  uint64_t host_return_stack;
   // stackpoint depth a dynamic code return continues at, or 0 when none is
-  // pending. The stack synchronization helper at the target takes it.
+  // pending. The stack synchronization helper at the target takes it, or the
+  // return to host helper along with host_return_stack.
   uint32_t unwind_stackpoint_depth;
+  // Set by a dynamic call resolve that continues inside a function rather than
+  // at its entry. Emitted code clears it before a lookup and reads it after.
+  uint32_t dynamic_target_in_body;
   union {
     __m128 helper_scratch_xmms[4];
     uint64_t helper_scratch_u64s[8];
@@ -180,6 +206,7 @@ class X64Backend : public Backend {
   void* synchronize_guest_and_host_stack_helper() const {
     return synchronize_guest_and_host_stack_helper_;
   }
+  void* return_to_host_helper() const { return return_to_host_helper_; }
   bool Initialize(Processor* processor) override;
 
   void CommitExecutableRange(uint32_t guest_low, uint32_t guest_high) override;
@@ -207,6 +234,8 @@ class X64Backend : public Backend {
     return reinterpret_cast<X64BackendContext*>(
         reinterpret_cast<intptr_t>(ctx) - sizeof(X64BackendContext));
   }
+  // lwarx found the granule claimed, refreshes the generation it took.
+  static uint64_t AwaitReservation(void* raw_context, uint64_t guest_address);
   virtual uint32_t CreateGuestTrampoline(GuestTrampolineProc proc,
                                          void* userdata1, void* userdata2,
                                          bool long_term) override;
@@ -247,6 +276,7 @@ class X64Backend : public Backend {
  private:
   static bool ExceptionCallbackThunk(Exception* ex, void* data);
   bool ExceptionCallback(Exception* ex);
+  static uint64_t ReleaseFaultingReservedStore(void* data, Exception* ex);
 
   uintptr_t capstone_handle_ = 0;
 
@@ -262,11 +292,15 @@ class X64Backend : public Backend {
   GuestToHostThunk guest_to_host_thunk_;
   ResolveFunctionThunk resolve_function_thunk_;
   void* synchronize_guest_and_host_stack_helper_ = nullptr;
+  void* return_to_host_helper_ = nullptr;
 
  public:
   void* try_acquire_reservation_helper_ = nullptr;
   void* reserved_store_32_helper = nullptr;
   void* reserved_store_64_helper = nullptr;
+  ReservedStoreThunk reserved_store_32_thunk_ = nullptr;
+  ReservedStoreThunk reserved_store_64_thunk_ = nullptr;
+  ReservedStoreFaultSite reserved_store_fault_sites_[2] = {};
   void* vrsqrtefp_vector_helper = nullptr;
   void* vrsqrtefp_scalar_helper = nullptr;
   void* frsqrtefp_helper = nullptr;

@@ -19,6 +19,7 @@ DECLARE_bool(accurate_vmx_denormal_flush);
 
 DECLARE_bool(disassemble_functions);
 
+DECLARE_bool(no_round_to_single);
 DECLARE_bool(trace_function_coverage);
 
 DECLARE_uint32(cpu_trace_mask);
@@ -29,6 +30,9 @@ DECLARE_uint64(pvr);
 
 // Breakpoints:
 DECLARE_uint64(break_on_instruction);
+DECLARE_string(log_lr_at_instruction);
+DECLARE_int32(log_lr_condition_gpr);
+DECLARE_uint64(log_lr_condition_value);
 DECLARE_int32(break_condition_gpr);
 DECLARE_uint64(break_condition_value);
 DECLARE_string(break_condition_op);

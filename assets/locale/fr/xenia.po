@@ -11,16 +11,6 @@ msgstr ""
 "Content-Transfer-Encoding: 8bit\n"
 "Plural-Forms: nplurals=2; plural=(n > 1);\n"
 
-#: src/xenia/ui/game_list_panel_wx.cc:596
-msgid ""
-"\n"
-"\n"
-"Browse for the file?"
-msgstr ""
-"\n"
-"\n"
-"Rechercher le fichier ?"
-
 #: src/xenia/ui/game_scan_progress_dialog_wx.cc:55
 msgid "   %zu already installed"
 msgstr "   %zu déjà installé"
@@ -1665,3 +1655,139 @@ msgstr "Xenia est distribué sous %s"
 #: src/xenia/ui/game_info_panel_wx.cc:212
 msgid "Content"
 msgstr "Contenu"
+
+#: src/xenia/app/emulator_window.cc:405
+msgid "Alternate Guitar"
+msgstr "Guitare Alternative"
+
+#: src/xenia/app/emulator_window.cc:407
+msgid "Bass Guitar"
+msgstr "Guitare Basse"
+
+#: src/xenia/app/emulator_window.cc:2027
+msgid ""
+"Original Xbox games run through XeFu, the Xbox 360's backward compatibility emulator, and %s is missing from its folder:\n"
+"\n"
+"%s\n"
+"\n"
+"Copy xbox.xex and the xefu*.xex files there from the Compatibility folder of an Xbox 360 hard drive."
+msgstr ""
+"Les jeux de la Xbox originale fonctionnent via XeFu, l'émulateur de rétrocompatibilité de la Xbox 360, mais %s est absent de son dossier :\n"
+"\n"
+"%s\n"
+"\n"
+"Copiez-y xbox.xex et les fichiers xefu*.xex depuis le dossier Compatibility d'un disque dur de Xbox 360."
+
+#: src/xenia/app/emulator_window.cc:2034
+msgid "XeFu not found"
+msgstr "XeFu introuvable"
+
+#: src/xenia/app/emulator_window.cc:3665
+msgid ""
+"Failed to launch title.\n"
+"\n"
+"Check xenia.log for technical details."
+msgstr ""
+"Impossible de lancer le titre.\n"
+"\n"
+"Consultez xenia.log pour les détails techniques."
+
+#: src/xenia/app/emulator_window.cc:3664
+msgid "Title Launch Failed!"
+msgstr "Échec du lancement du titre !"
+
+#: src/xenia/app/emulator_window.cc:2891
+msgid "Data migration"
+msgstr "Migration des données"
+
+#: src/xenia/app/emulator_window.cc:2891
+msgid ""
+"Some of your existing data couldn't be migrated to the new profile. Items that failed: %u\n"
+"\n"
+"Check xenia.log for technical details."
+msgstr ""
+"Certaines de vos données existantes n'ont pas pu être migrées vers le nouveau profil. Éléments en échec : %u\n"
+"\n"
+"Consultez xenia.log pour les détails techniques."
+
+#: src/xenia/app/emulator_window.cc:2897
+msgid "Your existing data was migrated to the new profile."
+msgstr "Vos données existantes ont été migrées vers le nouveau profil."
+
+#: src/xenia/ui/game_list_panel_wx.cc:441
+msgid ""
+"No file path is set for this title.\n"
+"\n"
+"Browse for the file?"
+msgstr ""
+"Aucun chemin de fichier n'est défini pour ce titre.\n"
+"\n"
+"Rechercher le fichier ?"
+
+#: src/xenia/ui/game_list_panel_wx.cc:442
+msgid ""
+"File not found:\n"
+"%s\n"
+"\n"
+"Browse for the file?"
+msgstr ""
+"Fichier introuvable :\n"
+"%s\n"
+"\n"
+"Rechercher le fichier ?"
+
+#: src/xenia/app/emulator_window.cc:2325
+msgid "Failed to read the system update."
+msgstr "Échec de la lecture de la mise à jour système."
+
+#: src/xenia/app/emulator_window.cc:2329
+msgid "Failed to write the system files."
+msgstr "Échec de l'écriture des fichiers système."
+
+#: src/xenia/app/emulator_window.cc:2296
+#: src/xenia/app/emulator_window.cc:2319
+#: src/xenia/app/emulator_window.cc:2324
+#: src/xenia/app/emulator_window.cc:2328
+#: src/xenia/app/emulator_window.cc:2333
+msgid "Install System Files"
+msgstr "Installer les fichiers système"
+
+#: src/xenia/app/emulator_window.cc:1127
+msgid "Install System Files..."
+msgstr "Installer les fichiers système…"
+
+#: src/xenia/app/emulator_window.cc:2297
+msgid "Installing the system files..."
+msgstr "Installation des fichiers système…"
+
+#: src/xenia/app/emulator_window.cc:2282
+msgid "Select a USB System Update"
+msgstr "Sélectionner une mise à jour système par USB"
+
+#: src/xenia/app/emulator_window.cc:2310
+msgid "System files installed"
+msgstr "Fichiers système installés"
+
+#: src/xenia/app/emulator_window.cc:2335
+msgid ""
+"The previous system files couldn't be put back in place. Move their folders back or delete them to install again. They are in:\n"
+"%s"
+msgstr ""
+"Les fichiers système précédents n'ont pas pu être restaurés. Replacez leurs dossiers à leur emplacement d'origine ou supprimez-les pour relancer l'installation. Ils se trouvent dans :\n"
+"%s"
+
+#: src/xenia/app/emulator_window.cc:2311
+msgid ""
+"The system files are installed in:\n"
+"%s"
+msgstr ""
+"Les fichiers système sont installés dans :\n"
+"%s"
+
+#: src/xenia/app/emulator_window.cc:2320
+msgid "This file isn't a USB system update."
+msgstr "Ce fichier n'est pas une mise à jour système par USB."
+
+#: src/xenia/app/emulator_window.cc:1035
+msgid "Start Dashboard"
+msgstr "Démarrer l'interface Xbox"

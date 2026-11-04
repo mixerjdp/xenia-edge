@@ -37,10 +37,9 @@ DEFINE_bool(
     "Import guest RAM as a second GPU buffer, so memexport output and resolve "
     "readback reach the CPU in place rather than through a staging copy. With "
     "it off, or where the driver can't import guest RAM, both fall back to "
-    "copying through a staging buffer, where a resolve readback_resolve_sync "
-    "would have run asynchronously is instead a frame behind. Ignored under "
-    "shared_memory_zero_copy, where the only buffer already aliases guest RAM. "
-    "Applies at title launch.",
+    "copying through a staging buffer. Ignored under shared_memory_zero_copy, "
+    "where the only buffer already aliases guest RAM. Applies at title "
+    "launch.",
     "GPU");
 
 DEFINE_bool(use_50Hz_mode, false, "Enables usage of PAL-50 mode.", "Console");
@@ -48,6 +47,12 @@ DEFINE_bool(use_50Hz_mode, false, "Enables usage of PAL-50 mode.", "Console");
 DEFINE_path(trace_gpu_prefix, "scratch/gpu/",
             "Prefix path for GPU trace files.", "GPU.Debug");
 DEFINE_bool(trace_gpu_stream, false, "Trace all GPU packets.", "GPU.Debug");
+DEFINE_string(trace_gpu_frames, "",
+              "Comma-separated frame numbers to capture as single frame GPU "
+              "traces, the same way as a manual frame trace request, for "
+              "example \"300,1200\". Frames are counted by the swaps "
+              "before them, and each trace is named after its frame number.",
+              "GPU.Debug");
 
 DEFINE_path(
     dump_shaders, "",
@@ -126,22 +131,6 @@ DEFINE_int32(occlusion_query_fake_upper_threshold, 100,
              "GPU");
 DEFINE_bool(occlusion_query_log, false,
             "Log occlusion query lifetime and summary stats.", "GPU");
-DEFINE_int32(occlusion_query_querybatch_range, 0,
-             "Range of fake sample count values to walk for titles using the\n"
-             "D3D QueryBatch standard before wrapping back to\n"
-             "occlusion_query_fake_lower_threshold. This shouldn't be changed\n"
-             "from the default value of 0 (disabled) unless necessary for a\n"
-             "specific title.",
-             "GPU");
-DEFINE_double(
-    occlusion_query_saturation, 1.0,
-    "Compress higher occlusion query sample counts before guest writeback.\n"
-    "This can be useful if effects such as lens flares appear too bright\n"
-    "or too strong.\n"
-    "1.0 = default behavior\n"
-    "0.0 = collapse all nonzero sample counts to 1\n"
-    "Values around 0.90 are a good starting point for subtle tuning.",
-    "GPU");
 
 uint32_t GetGuestVblankRateHz() { return cvars::use_50Hz_mode ? 50 : 60; }
 
@@ -231,10 +220,16 @@ DEFINE_bool(
     async_shader_skip_draws, true,
     "Skip draws whose shaders can't render immediately via a placeholder "
     "(no interpreter stand-in, e.g. tessellation or textured/memexport/loop "
-    "vertex shaders) until their real pipeline compiles in the background, "
-    "instead of translating them on the draw thread. Avoids stutter but the "
-    "geometry pops in a few frames later.",
+    "vertex shaders, or no pixel shader) until their real pipeline compiles in "
+    "the background. Avoids stutter but what they draw appears a few frames "
+    "late.",
     "GPU");
+DEFINE_string(
+    async_shader_inline_hashes, "",
+    "Comma-separated vertex or pixel shader ucode hashes (hex, as logged) "
+    "whose draws always wait for their real pipeline instead of using an "
+    "async stand-in. For bisecting which stand-in causes a rendering issue.",
+    "GPU.Debug");
 
 DEFINE_bool(
     shader_profiling, false,
@@ -250,14 +245,6 @@ DEFINE_bool(
     "improve image quality in some cases but can break games that rely on "
     "reading back specific pixel values (e.g., for gamma detection).",
     "GPU");
-
-DEFINE_bool(readback_resolve_sync, false,
-            "Stall the GPU after each readback_resolve copy so guest RAM is "
-            "coherent in the same frame, instead of copying asynchronously.\n"
-            "The copies a guest read actually waits on stall on their own, so "
-            "this only adds a stall for the rest.",
-            "GPU");
-UPDATE_from_bool(readback_resolve_sync, 2026, 8, 14, 12, true);
 
 DEFINE_bool(gpu_3d_to_2d_texture, true,
             "Handle shaders that sample 3D textures as 2D by creating a 2D "
@@ -289,3 +276,37 @@ DEFINE_bool(
     "guest clipping is enabled. X/Y/W clipping is unaffected. On Vulkan, "
     "this requires depthClamp support.",
     "GPU");
+
+DEFINE_bool(
+    alu_round_toward_zero, true,
+    "Round vertex shader ALU sums and products toward zero, with unfused "
+    "multiply-adds and overflow saturating, instead of rounding to nearest "
+    "even. This is what the Xenos does and fixes bad geometry in several "
+    "Volition Engine titles. Pixel shaders keep rounding to nearest, the "
+    "extra instructions per operation are too slow there. Unless the host "
+    "GPU supports the rounding mode, vertex shaders only round results that "
+    "may reach a vertex fetch index, the address register, a memory export "
+    "or a floor, trunc or frc this way.",
+    "GPU");
+
+DEFINE_bool(xenos_sample_positions, false,
+            "Rasterize 2x and 4x MSAA render targets at the Xenos sample "
+            "positions, like real hardware, if the GPU and driver support it.\n"
+            "Only applies to RTV/FBO - ROV/FSI render targets always use Xenos "
+            "positions since they safely map coverage and calculate depth "
+            "in-shader.",
+            "GPU");
+
+DEFINE_bool(texture_point_snap, false,
+            "Snap normalized point sampled 2D texture coordinates to texel "
+            "centers, and pick the guest texel when the resolution is scaled. "
+            "Fixes texture seams in titles that use virtual textures, e.g. "
+            "idTech 5, but may cause rendering issues in other titles.",
+            "GPU");
+
+DEFINE_bool(texture_border_color_frac, true,
+            "Compute getBCF, the share of a texture fetch's footprint that "
+            "falls on the border. The Xbox backward compatibility emulator "
+            "uses it to apply border colors. Disabling it returns 0 and "
+            "texture borders come out black in original Xbox titles.",
+            "GPU");

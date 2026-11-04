@@ -101,3 +101,34 @@ TEST_CASE("VMX_FPCR_DOES_NOT_LEAK_INTO_SCALAR_MULTIPLE_OPS", "[backend]") {
         test.processors[0]->backend()->SetGuestRoundingMode(ctx, 0);
       });
 }
+
+// A scalar compare after a VMX op must not see the VMX flush-to-zero mode,
+// including when the mode is carried into the next block.
+TEST_CASE("VMX_FPCR_DOES_NOT_LEAK_INTO_SCALAR_COMPARE", "[backend]") {
+  for (bool across_blocks : {false, true}) {
+    TestFunction test([across_blocks](HIRBuilder& b) {
+      StoreVR(b, 3, b.VectorAdd(LoadVR(b, 4), LoadVR(b, 5), FLOAT32_TYPE));
+      if (across_blocks) {
+        auto next = b.NewLabel();
+        b.Branch(next);
+        b.MarkLabel(next);
+      }
+      // A denormal compares unequal to zero unless it is flushed.
+      StoreGPR(
+          b, 3,
+          b.ZeroExtend(b.CompareEQ(LoadFPR(b, 6), LoadFPR(b, 7)), INT64_TYPE));
+      b.Return();
+    });
+    test.Run(
+        [](PPCContext* ctx) {
+          ctx->v[4] = vec128f(1.0f, 2.0f, 3.0f, 4.0f);
+          ctx->v[5] = vec128f(5.0f, 6.0f, 7.0f, 8.0f);
+          ctx->f[6] = std::ldexp(1.0, -1070);
+          ctx->f[7] = 0.0;
+        },
+        [across_blocks](PPCContext* ctx) {
+          INFO("across_blocks " << across_blocks);
+          REQUIRE(ctx->r[3] == 0);
+        });
+  }
+}

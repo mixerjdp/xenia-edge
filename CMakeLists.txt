@@ -351,8 +351,8 @@ else()
     if(XE_TARGET_X86_64)
       # macOS 64-bit binaries default to a 4GB __PAGEZERO, which makes every
       # address below 4GB unmapped. The x64 backend places its constant
-      # table (PlaceConstData) sub-2GB and its guest trampolines sub-4GB,
-      # so we shrink __PAGEZERO to one page to free up that range.
+      # table (PlaceConstData) sub-2GB, so we shrink __PAGEZERO to one page
+      # to free up that range.
       add_link_options(-Wl,-pagezero_size,0x1000)
     endif()
     link_libraries(

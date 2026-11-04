@@ -16,7 +16,6 @@
 #include <functional>
 #include <memory>
 #include <mutex>
-#include <set>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -28,6 +27,7 @@
 #include "xenia/base/platform.h"
 #include "xenia/base/string_buffer.h"
 #include "xenia/base/threading.h"
+#include "xenia/gpu/async_pipeline.h"
 #include "xenia/gpu/d3d12/d3d12_render_target_cache.h"
 #include "xenia/gpu/gpu_flags.h"
 #include "xenia/gpu/guest_spirv_shader_cache.h"
@@ -55,7 +55,8 @@ class PipelineCache : public GuestSpirvShaderCache::Host {
   PipelineCache(D3D12CommandProcessor& command_processor,
                 const RegisterFile& register_file,
                 const D3D12RenderTargetCache& render_target_cache,
-                bool bindless_resources_used);
+                bool bindless_resources_used, bool zpd_hybrid_supported,
+                bool depth_bias_dynamic);
   ~PipelineCache();
 
   bool Initialize();
@@ -71,11 +72,17 @@ class PipelineCache : public GuestSpirvShaderCache::Host {
   void ShutdownShaderStorage();
 
   void EndSubmission();
-  bool IsCreatingPipelines();
-  // Waits for any pipeline creation needed by the current draw path to finish
-  // before state is consumed. This was added so strict ZPD query paths stop
-  // racing pipeline compilation and then blocking work on incomplete state.
-  void AwaitPipelineCompletion();
+  // Whether the non-blocking storage warm-up is still creating pipelines.
+  bool IsStorageWarmUpRunning() const {
+    return creation_queue_.IsAwaitingCompletion();
+  }
+  // AsyncPipelineDraw::async_available.
+  bool IsAsyncCreationAvailable() const {
+    return cvars::async_shader_compilation && creation_queue_.has_threads();
+  }
+  // AsyncPipelineDraw::placeholder_supported. Placeholders are only made with
+  // bindless resources.
+  bool IsPlaceholderSupported() const { return bindless_resources_used_; }
 
   SpirvShader* LoadShader(xenos::ShaderType shader_type,
                           const uint32_t* host_address, uint32_t dword_count);
@@ -106,11 +113,10 @@ class PipelineCache : public GuestSpirvShaderCache::Host {
       SpirvShader& shader, uint64_t spirv_modification);
   // Translates an already-created Translation to SPIR-V using the given
   // translator (the main thread's for vertex shaders, a creation thread's for
-  // pixel shaders). use_try_claim coordinates concurrent translation of the
-  // same Translation. Returns the valid Translation or nullptr. Any thread.
+  // pixel shaders). Concurrent callers translate it once, the rest waiting for
+  // the winner. Returns the valid Translation or nullptr. Any thread.
   Shader::Translation* TranslateGuestMesaSpirv(
-      SpirvShaderTranslator& translator, Shader::Translation& translation,
-      bool use_try_claim);
+      SpirvShaderTranslator& translator, Shader::Translation& translation);
   // Main-thread convenience: ensure + translate on the shared translator.
   Shader::Translation* EnsureGuestMesaSpirv(SpirvShader& shader,
                                             uint64_t spirv_modification);
@@ -156,28 +162,31 @@ class PipelineCache : public GuestSpirvShaderCache::Host {
       Shader::HostVertexShaderType host_vertex_shader_type);
 
   // If draw_util::IsRasterizationPotentiallyDone is false, the pixel shader
-  // MUST be made nullptr BEFORE calling this!
+  // MUST be made nullptr BEFORE calling this! |async_plan| is followed for a
+  // pipeline that doesn't exist yet.
   bool ConfigurePipeline(
       Shader::Translation* vertex_shader, Shader::Translation* pixel_shader,
       const PrimitiveProcessor::ProcessingResult& primitive_processing_result,
       reg::RB_DEPTHCONTROL normalized_depth_control,
       uint32_t normalized_color_mask, bool apply_polygon_offset_in_shader,
+      bool zpd_total, bool viz_survey,
       uint32_t bound_depth_and_color_render_target_bits,
       const uint32_t* bound_depth_and_color_render_targets_formats,
-      bool use_interpreter, void** pipeline_handle_out,
+      const AsyncPipelinePlan& async_plan, void** pipeline_handle_out,
       ID3D12RootSignature** root_signature_out);
 
   // Returns a pipeline with deferred creation by its handle. May return nullptr
   // if failed to create the pipeline or still being created asynchronously.
   // While async creation is in progress this may be a placeholder pipeline
   // (real vertex shader, no-op pixel shader) that the creation thread swaps for
-  // the real one when ready - check IsPlaceholderPipeline if that matters.
+  // the real one when ready. GetD3D12PipelineForDraw tells which.
   ID3D12PipelineState* GetD3D12PipelineByHandle(void* handle) const {
     return reinterpret_cast<const Pipeline*>(handle)->state.load(
         std::memory_order_acquire);
   }
-  bool IsPlaceholderPipeline(void* handle) const {
-    return reinterpret_cast<const Pipeline*>(handle)->is_placeholder.load(
+  // Whether the real pipeline is still being created, so awaiting it can help.
+  bool IsPipelineCreationPending(void* handle) const {
+    return reinterpret_cast<const Pipeline*>(handle)->creation_pending.load(
         std::memory_order_acquire);
   }
   // Loads the current pipeline state once and reports whether it is a
@@ -203,16 +212,21 @@ class PipelineCache : public GuestSpirvShaderCache::Host {
         pipeline->uses_interpreter.load(std::memory_order_acquire);
     return state;
   }
-  ID3D12PipelineState* AwaitD3D12PipelineByHandle(void* handle);
-  // Waits until the real (non-placeholder) pipeline for the handle is ready,
-  // returning it (or nullptr if its creation failed). Needed by occlusion
-  // queries, where the no-op placeholder would skip the guest shader's pixel
-  // kills and miscount.
-  ID3D12PipelineState* AwaitRealD3D12PipelineByHandle(void* handle);
+  // The host depth bias of the current draw for dynamic depth bias, the slope
+  // scaled for the draw's resolution scale.
+  void GetHostDepthBias(bool primitive_polygonal, float& depth_bias_out,
+                        float& depth_bias_slope_scaled_out) const;
+  // Stores a pipeline still being created without waiting for anything else
+  // queued, for a draw that can't use a stand-in.
+  void ExpeditePipeline(void* handle);
 
   ID3D12RootSignature* GetRootSignatureByHandle(void* handle) const {
     return reinterpret_cast<const Pipeline*>(handle)
         ->description.root_signature;
+  }
+  xenos::MsaaSamples GetHostMsaaSamplesByHandle(void* handle) const {
+    return reinterpret_cast<const Pipeline*>(handle)
+        ->description.description.host_msaa_samples;
   }
 
  private:
@@ -250,6 +264,8 @@ class PipelineCache : public GuestSpirvShaderCache::Host {
     kPointList,
     kRectangleList,
     kQuadList,
+    // Lines expanded to 1 guest pixel wide for resolution-scaled draws.
+    kLineList,
   };
 
   enum class PipelineCullMode : uint32_t {
@@ -306,26 +322,28 @@ class PipelineCache : public GuestSpirvShaderCache::Host {
     // xenos::TessellationMode for a domain shader.
     uint32_t primitive_topology_type_or_tessellation_mode : 2;  // 4
     // Zero for non-kVertex host_vertex_shader_type.
-    PipelineGeometryShader geometry_shader : 2;       // 6
-    uint32_t fill_mode_wireframe : 1;                 // 7
-    PipelineCullMode cull_mode : 2;                   // 9
-    uint32_t front_counter_clockwise : 1;             // 10
-    uint32_t depth_clip : 1;                          // 11
-    xenos::MsaaSamples host_msaa_samples : 2;         // 13
-    xenos::DepthRenderTargetFormat depth_format : 1;  // 14
-    xenos::CompareFunction depth_func : 3;            // 17
-    uint32_t depth_write : 1;                         // 18
-    uint32_t stencil_enable : 1;                      // 19
-    uint32_t stencil_read_mask : 8;                   // 27
-    // Marks pipelines that use the spirv_to_dxil (Mesa) path so they keep
-    // their own cache entries.
-    uint32_t use_mesa_dxil : 1;  // 28
+    PipelineGeometryShader geometry_shader : 3;       // 7
+    uint32_t fill_mode_wireframe : 1;                 // 8
+    PipelineCullMode cull_mode : 2;                   // 10
+    uint32_t front_counter_clockwise : 1;             // 11
+    uint32_t depth_clip : 1;                          // 12
+    xenos::MsaaSamples host_msaa_samples : 2;         // 14
+    xenos::DepthRenderTargetFormat depth_format : 1;  // 15
+    xenos::CompareFunction depth_func : 3;            // 18
+    uint32_t depth_write : 1;                         // 19
+    uint32_t stencil_enable : 1;                      // 20
+    uint32_t stencil_read_mask : 8;                   // 28
     // Native draw (scale threshold), keeps slope-scale unscaled.
     uint32_t resolution_scale_native : 1;  // 29
     // ROV only - selects the depth-only pixel shader, which is specialized
     // for the guest count. host_msaa_samples can't, guest 2x is rasterized as
     // host 4x there.
     xenos::MsaaSamples guest_msaa_samples : 2;  // 31
+    // Selects the counting depth-only pixel shader when there's no guest PS.
+    // RTV: hybrid occlusion query draw (shader counting for Total).
+    // ROV: VIZ survey draw (occlusion_query_viz), ZPass as a flag.
+    // Hybrid queries are RTV only, so the two never meet.
+    uint32_t counting_depth_only : 1;  // 32
 
     uint32_t stencil_write_mask : 8;                   // 8
     xenos::StencilOp stencil_front_fail_op : 3;        // 11
@@ -343,8 +361,11 @@ class PipelineCache : public GuestSpirvShaderCache::Host {
     // Bumped to invalidate caches: vertex/pixel_shader_modification are now
     // the canonical SPIR-V (spirv_to_dxil) modifications, not DXBC; then
     // again for the constant-alpha blend state; then again for
-    // guest_msaa_samples changing the bitfield layout.
-    static constexpr uint32_t kVersion = 0x20260907;
+    // guest_msaa_samples changing the bitfield layout; then again for
+    // zpd_total; then again for it also covering VIZ surveys; then again for
+    // dropping use_mesa_dxil; then again for the line geometry shader
+    // widening geometry_shader.
+    static constexpr uint32_t kVersion = 0x20261002;
   });
 
   XEPACKEDSTRUCT(PipelineStoredDescription, {
@@ -365,15 +386,15 @@ class PipelineCache : public GuestSpirvShaderCache::Host {
     const std::vector<uint8_t>* mesa_pixel_dxil = nullptr;
     // Guest SPIR-V translations deferred to a creation thread: translated
     // (ucode->SPIR-V) and converted to DXIL there, off the main thread. Point
-    // into a SpirvShader's Translation in shaders_ (never erased). The
-    // live draw path defers only the pixel shader (the vertex DXIL is built
-    // synchronously for the placeholder). The storage warm-up defers both via
-    // mesa_vertex_translation, since there is no placeholder to satisfy.
+    // into a SpirvShader's Translation in shaders_ (never erased). A live
+    // draw with a real vertex shader placeholder defers only the pixel shader,
+    // its vertex DXIL built synchronously for the placeholder. The storage
+    // warm-up and the other live draws defer both via mesa_vertex_translation.
     Shader::Translation* mesa_vertex_translation = nullptr;
     Shader::Translation* mesa_pixel_translation = nullptr;
     // Mesa DXIL for the built-in geometry shader (primitive expansion). When
-    // set alongside use_mesa_dxil, the pipeline binds it as the geometry
-    // shader. Points into mesa_geometry_dxil_cache_ (never erased).
+    // set, the pipeline binds it as the geometry shader. Points into
+    // mesa_geometry_dxil_cache_ (never erased).
     const std::vector<uint8_t>* mesa_geometry_dxil = nullptr;
     // Tessellation: the host vertex and hull shaders, produced together with
     // the guest domain shader (held in mesa_vertex_dxil, bound as the DS) by
@@ -387,7 +408,7 @@ class PipelineCache : public GuestSpirvShaderCache::Host {
   union GeometryShaderKey {
     uint32_t key;
     struct {
-      PipelineGeometryShader type : 2;
+      PipelineGeometryShader type : 3;
       uint32_t interpolator_count : 5;
       uint32_t user_clip_plane_count : 3;
       uint32_t user_clip_plane_cull : 1;
@@ -415,11 +436,12 @@ class PipelineCache : public GuestSpirvShaderCache::Host {
                           const uint32_t* host_address, uint32_t dword_count,
                           uint64_t data_hash);
 
-  // Analyzes shaders in parallel for storage loading. D3D12 renders only
-  // through spirv_to_dxil, so only the ucode analysis is needed here, ahead of
-  // the translations the creation threads run.
-  void AnalyzeShadersForStorage(
-      const std::set<std::pair<uint64_t, uint64_t>>& translations_needed);
+  // Queues the creation of a pipeline loaded from storage for
+  // ReplayStoredPipelines. Returns nullptr with |vertex_shader_out| set, or why
+  // it didn't.
+  const char* QueueStoredPipeline(
+      const PipelineStoredDescription& pipeline_stored_description,
+      Shader*& vertex_shader_out);
 
   // Builds the Mesa DXIL (vertex/domain + tessellation host shaders + pixel +
   // built-in geometry) for a pipeline being rebuilt from storage and fills the
@@ -427,12 +449,12 @@ class PipelineCache : public GuestSpirvShaderCache::Host {
   // SpirvShader translation objects must already exist (created on the main
   // thread via EnsureGuestMesaSpirvTranslation). The ucode->SPIR-V translation
   // and SPIR-V->DXIL conversion run on the given translator's thread, so this
-  // is called on a creation thread for the warm-up (use_try_claim coordinates
-  // concurrent translation). Returns false on any translation failure.
+  // is called on a creation thread for the warm-up, or on the processor thread
+  // when FinishWarmUp drains it there. Returns false on any translation
+  // failure.
   bool BuildMesaPipelineDxil(Shader::Translation* vertex_translation,
                              Shader::Translation* pixel_translation,
                              SpirvShaderTranslator& translator,
-                             bool use_try_claim,
                              PipelineRuntimeDescription& runtime_description);
 
   // If draw_util::IsRasterizationPotentiallyDone is false, the pixel shader
@@ -444,9 +466,14 @@ class PipelineCache : public GuestSpirvShaderCache::Host {
       const PrimitiveProcessor::ProcessingResult& primitive_processing_result,
       reg::RB_DEPTHCONTROL normalized_depth_control,
       uint32_t normalized_color_mask, bool depth_bias_in_pixel_shader,
+      bool zpd_total, bool viz_survey,
       uint32_t bound_depth_and_color_render_target_bits,
       const uint32_t* bound_depth_and_color_render_target_formats,
       PipelineRuntimeDescription& runtime_description_out);
+  // The guest depth bias, the slope in guest pixels.
+  void GetGuestDepthBias(bool primitive_polygonal, int32_t& depth_bias_out,
+                         float& depth_bias_slope_scaled_out) const;
+  float GetDepthBiasSlopeScale(bool resolution_scale_native) const;
 
   // Modifications are raw SpirvShaderTranslator::Modification values (uint64_t
   // to keep spirv_shader_translator.h, and glslang, out of this header).
@@ -462,22 +489,31 @@ class PipelineCache : public GuestSpirvShaderCache::Host {
 
   // Hot-swap placeholder PSO variants, built with the fixed (bindless) Mesa
   // root signature so the pixel (and, for the interpreter, vertex) shader need
-  // not be translated yet.
+  // not be translated yet. The stand-in pixel shader writes no color: a no-op,
+  // the debug-color one, or on ROV a depth-only one.
   enum class PipelinePlaceholderMode {
     kNone,         // Real vertex shader + real pixel shader.
-    kRealVertex,   // Real vertex shader + no-op pixel shader.
-    kInterpreter,  // Ucode interpreter vertex shader + no-op/debug pixel
-                   // shader.
+    kRealVertex,   // Real vertex shader + stand-in pixel shader.
+    kInterpreter,  // Ucode interpreter vertex shader + stand-in pixel shader.
   };
   ID3D12PipelineState* CreateD3D12Pipeline(
       const PipelineRuntimeDescription& runtime_description,
       PipelinePlaceholderMode placeholder_mode =
           PipelinePlaceholderMode::kNone);
+  // The ROV depth-only pixel shader for a real vertex shader placeholder,
+  // declaring the inputs of a pixel shader with |input_modification| (from
+  // GetPixelShaderInputModification). nullptr if it couldn't be generated.
+  // Draw thread only.
+  const std::vector<uint8_t>* GetMesaRovPlaceholderPixelShader(
+      uint64_t input_modification, xenos::MsaaSamples msaa_samples);
 
   D3D12CommandProcessor& command_processor_;
   const RegisterFile& register_file_;
   const D3D12RenderTargetCache& render_target_cache_;
   bool bindless_resources_used_;
+  bool zpd_hybrid_supported_;
+  // Depth bias is set on the command list instead of baked into pipelines.
+  bool depth_bias_dynamic_;
 
   // Temporary storage for AnalyzeUcode calls on the processor thread.
   StringBuffer ucode_disasm_buffer_;
@@ -509,26 +545,38 @@ class PipelineCache : public GuestSpirvShaderCache::Host {
   // back to the no-op placeholder_ps).
   std::vector<uint8_t>
       mesa_depth_only_rov_pixel_shaders_[size_t(xenos::MsaaSamples::k4X) + 1];
+  // VIZ survey variants of the above, counting only ZPass as a flag.
+  std::vector<uint8_t>
+      mesa_viz_survey_rov_pixel_shaders_[size_t(xenos::MsaaSamples::k4X) + 1];
+  // See GetMesaRovPlaceholderPixelShader. Keyed by the input modification and
+  // the guest sample count, empty for a failure.
+  std::unordered_map<uint64_t, std::vector<uint8_t>>
+      mesa_rov_placeholder_pixel_shaders_;
 
   // Ucode hash -> shader.
   std::unordered_map<uint64_t, SpirvShader*, xe::hash::IdentityHasher<uint64_t>>
       shaders_;
 
+  // Host render target path - keeps RTV draws that write nothing rasterized
+  // for occlusion queries.
+  std::vector<uint8_t> mesa_depth_only_pixel_shader_;
+  // Hybrid occlusion query depth-only pixel shaders, counting pre-test
+  // coverage into the ZPD counter's Total lane.
+  std::vector<uint8_t> zpd_total_depth_only_pixel_shader_;
+  std::vector<uint8_t> zpd_total_float24_truncate_pixel_shader_;
+  std::vector<uint8_t> zpd_total_float24_round_pixel_shader_;
+
   struct Pipeline {
     // nullptr if creation has failed or still pending. May hold a placeholder
-    // pipeline (see is_placeholder) until the real one is swapped in.
+    // pipeline (see placeholder_state) until the real one is swapped in.
     std::atomic<ID3D12PipelineState*> state{nullptr};
-    // True while state holds a hot-swap placeholder pipeline, before the
-    // creation thread swaps in the real one.
-    std::atomic<bool> is_placeholder{false};
     // True when the placeholder rasterizes with the ucode interpreter VS (so
     // the draw must feed it full float constants + the ucode location). Only
-    // meaningful while is_placeholder.
+    // meaningful while state holds the placeholder.
     std::atomic<bool> uses_interpreter{false};
     // The placeholder PSO handle (nullptr if none). A draw loads state once and
     // compares it against this to know whether it is about to bind the
-    // placeholder, consistent even though is_placeholder is cleared a few
-    // instructions after the real pipeline is swapped into state.
+    // placeholder.
     std::atomic<ID3D12PipelineState*> placeholder_state{nullptr};
     PipelineRuntimeDescription description;
     // For background creation: stores the untranslated shaders.
@@ -540,10 +588,13 @@ class PipelineCache : public GuestSpirvShaderCache::Host {
     // rebuild, which is what limits it to one attempt. A live pipeline that
     // fails is a real failure and is never retried.
     bool from_storage{false};
-    // Set by a creation thread when real creation failed. A warm-up build that
-    // ran before its shaders finished translating has no DXIL to create from,
-    // and the entry would otherwise skip its draws for the rest of the session.
+    // Set when real creation failed. A warm-up build that ran before its
+    // shaders finished translating has no DXIL to create from, and the entry
+    // would otherwise skip its draws for the rest of the session.
     std::atomic<bool> creation_failed{false};
+    // Set while the entry is in the creation queue, cleared once its result,
+    // real or failed, is stored.
+    std::atomic<bool> creation_pending{false};
 
     // Whether the next draw should rebuild this entry from live state.
     bool wants_rebuild() const {
@@ -552,14 +603,13 @@ class PipelineCache : public GuestSpirvShaderCache::Host {
   };
 
   // Builds the deferred DXIL for a pipeline on the calling thread (a creation
-  // thread, or the processor thread in blocking mode). Storage warm-up
-  // pipelines defer the whole build. Live async pipelines defer only the pixel
-  // shader. The translation runs on mesa_spirv_translator (one per creation
-  // thread). use_try_claim coordinates concurrent translation of the same
-  // shader.
+  // thread, or the processor thread when expediting or when FinishWarmUp
+  // creates the storage warm-up there).
+  // Storage warm-up pipelines defer the whole build. Live async pipelines defer
+  // only the pixel shader. The translation runs on mesa_spirv_translator, the
+  // calling thread's own.
   void EnsurePipelineShadersTranslated(
-      Pipeline* pipeline, SpirvShaderTranslator* mesa_spirv_translator,
-      bool use_try_claim);
+      Pipeline* pipeline, SpirvShaderTranslator* mesa_spirv_translator);
 
   // All previously generated pipelines identified by hash and the description.
   std::unordered_multimap<uint64_t, Pipeline*,
@@ -581,13 +631,14 @@ class PipelineCache : public GuestSpirvShaderCache::Host {
   ShaderStorageWriter<PipelineStoredDescription> storage_writer_;
 
   // Builds one queued pipeline, on a creation thread or on the processor thread
-  // draining the warm-up queue. Null if it failed.
+  // draining the warm-up queue or expediting it. Null if it failed.
   ID3D12PipelineState* CreateQueuedPipeline(
       Pipeline* pipeline, SpirvShaderTranslator* mesa_spirv_translator);
   // Swaps a created pipeline (or a failure, |state| null) into its entry.
   void StoreCreatedPipeline(Pipeline* pipeline, ID3D12PipelineState* state);
-  PipelineCreationQueue<Pipeline*, ID3D12PipelineState*, SpirvShaderTranslator>
-      creation_queue_;
+  using CreationQueue = PipelineCreationQueue<Pipeline*, ID3D12PipelineState*,
+                                              SpirvShaderTranslator>;
+  CreationQueue creation_queue_;
 
   // Placeholder pipelines replaced by their real counterpart on a creation
   // thread, paired with the submission they may still be referenced by. Real

@@ -1099,6 +1099,44 @@ void MetalRenderTargetCache::ClearCache() {
   RenderTargetCache::ClearCache();
 }
 
+void MetalRenderTargetCache::RenderTargetReused(RenderTarget& render_target,
+                                                RenderTargetKey old_key) {
+  MetalRenderTarget& metal_render_target =
+      static_cast<MetalRenderTarget&>(render_target);
+  auto it = render_target_map_.find(old_key.key);
+  if (it != render_target_map_.end() && it->second == &metal_render_target) {
+    render_target_map_.erase(it);
+  }
+  render_target_map_[render_target.key().key] = &metal_render_target;
+  // Cleared on the first use like a new one.
+  metal_render_target.SetNeedsInitialClear(true);
+}
+
+bool MetalRenderTargetCache::CanReuseRenderTarget(
+    const RenderTarget& render_target) const {
+  // Transfers that failed to flush still reference their sources.
+  if (HasPendingDrawPassTransfers()) {
+    return false;
+  }
+  for (uint32_t i = 0; i < 4; ++i) {
+    if (current_color_targets_[i] == &render_target ||
+        last_real_color_targets_[i] == &render_target) {
+      return false;
+    }
+  }
+  if (current_depth_target_ == &render_target ||
+      last_real_depth_target_ == &render_target) {
+    return false;
+  }
+  for (const RenderTarget* pending_render_target :
+       pending_draw_pass_render_targets_) {
+    if (pending_render_target == &render_target) {
+      return false;
+    }
+  }
+  return true;
+}
+
 void MetalRenderTargetCache::BeginFrame() {
   SCOPE_profile_cpu_f("gpu");
   (void)FlushPendingDrawPassTransfers();
@@ -1125,7 +1163,8 @@ void MetalRenderTargetCache::BeginFrame() {
 
 bool MetalRenderTargetCache::Update(
     bool is_rasterization_done, reg::RB_DEPTHCONTROL normalized_depth_control,
-    uint32_t normalized_color_mask, const Shader& vertex_shader) {
+    uint32_t normalized_color_mask, const Shader& vertex_shader,
+    int32_t window_offset_tiles) {
   SCOPE_profile_cpu_f("gpu");
   // Reaching another update means the command processor never got to encode
   // the queued transfers into a pass. Their ownership is already transferred,
@@ -1135,9 +1174,9 @@ bool MetalRenderTargetCache::Update(
   }
 
   // Use the base class logic to update the current render target setup.
-  if (!RenderTargetCache::Update(is_rasterization_done,
-                                 normalized_depth_control,
-                                 normalized_color_mask, vertex_shader)) {
+  if (!RenderTargetCache::Update(
+          is_rasterization_done, normalized_depth_control,
+          normalized_color_mask, vertex_shader, window_offset_tiles)) {
     XELOGE("MetalRenderTargetCache::Update - Base class Update failed");
     return false;
   }
@@ -1346,8 +1385,7 @@ bool MetalRenderTargetCache::BuildTransferRectanglePlans(
     TransferRectanglePlan plan;
     plan.transfer_index = transfer_index;
     plan.rectangle_count = transfer.GetRectangles(
-        dest_key.base_tiles, dest_key.GetPitchTiles(), dest_key.msaa_samples,
-        IsKey64bpp(dest_key), plan.rectangles.data(), cutout);
+        dest_key, IsKey64bpp(dest_key), plan.rectangles.data(), cutout);
     if (!plan.rectangle_count) {
       if (require_all_rectangles) {
         transfer_rectangles_out.clear();
@@ -2867,15 +2905,17 @@ bool MetalRenderTargetCache::DirectResolveRenderTargets(
         rect.GetDispatches(dump_pitch, dump_row_length_used, dispatches);
     for (uint32_t i = 0; i < dispatch_count; ++i) {
       const ResolveCopyDumpRectangle::Dispatch& dispatch = dispatches[i];
+      uint32_t dispatch_first_tile = dump_base + dispatch.offset;
       EdramDumpShaderOffsets offsets;
-      offsets.dispatch_first_tile = dump_base + dispatch.offset;
+      offsets.dispatch_first_tile =
+          rt_key.GetNonWrappedTileIndex(dispatch_first_tile);
       offsets.source_base_tiles = rt_key.base_tiles;
       push_constants[kEdramDumpShaderPushConstantOffsets] = offsets.offsets;
 
       // Where the dispatch starts in the resolve's tile grid, which the
       // threads place themselves against.
       uint32_t dispatch_tile_relative =
-          offsets.dispatch_first_tile -
+          dispatch_first_tile -
           copy_shader_constants.dest_relative.edram_info.base_tiles;
       EdramDumpShaderResolveDispatchTile dispatch_tile;
       dispatch_tile.tile_x = dispatch_tile_relative % dump_pitch;
@@ -3146,7 +3186,8 @@ void MetalRenderTargetCache::DumpRenderTargets(
     for (uint32_t i = 0; i < dispatch_count; ++i) {
       const ResolveCopyDumpRectangle::Dispatch& dispatch = dispatches[i];
       EdramDumpShaderOffsets offsets;
-      offsets.dispatch_first_tile = dump_base + dispatch.offset;
+      offsets.dispatch_first_tile =
+          rt_key.GetNonWrappedTileIndex(dump_base + dispatch.offset);
       offsets.source_base_tiles = rt_key.base_tiles;
 
       // A dispatch gets its own push constants and argument buffer: the GPU
@@ -3541,6 +3582,13 @@ bool MetalRenderTargetCache::Resolve(Memory& memory, uint32_t& written_address,
   }
 
   bool is_depth = resolve_info.IsCopyingDepth();
+
+  if (resolve_info.copy_dest_extent_length &&
+      resolve_info.rb_copy_control.copy_command ==
+          xenos::CopyCommand::kConvertTo1111) {
+    XELOGW("MetalResolve: resolve copy command 2 is not supported");
+    resolve_info.copy_dest_extent_length = 0;
+  }
 
   if (!resolve_info.copy_dest_extent_length) {
     return true;
@@ -4031,8 +4079,7 @@ bool MetalRenderTargetCache::PerformTransfersAndResolveClears(
         }
         Transfer::Rectangle rectangles[Transfer::kMaxRectanglesWithCutout];
         uint32_t rectangle_count = transfer.GetRectangles(
-            dest_key.base_tiles, dest_key.pitch_tiles_at_32bpp,
-            dest_key.msaa_samples, false, rectangles, resolve_clear_rectangle);
+            dest_key, rectangles, resolve_clear_rectangle);
         if (!rectangle_count) {
           continue;
         }
@@ -4417,10 +4464,9 @@ bool MetalRenderTargetCache::PerformTransfersAndResolveClears(
         }
 
         Transfer::Rectangle rectangles[Transfer::kMaxRectanglesWithCutout];
-        uint32_t rectangle_count = transfer.GetRectangles(
-            dest_key.base_tiles, dest_key.pitch_tiles_at_32bpp,
-            dest_key.msaa_samples, IsKey64bpp(dest_key), rectangles,
-            resolve_clear_rectangle);
+        uint32_t rectangle_count =
+            transfer.GetRectangles(dest_key, IsKey64bpp(dest_key), rectangles,
+                                   resolve_clear_rectangle);
         if (!rectangle_count) {
           return false;
         }
@@ -4617,10 +4663,9 @@ bool MetalRenderTargetCache::PerformTransfersAndResolveClears(
       }
       for (const Transfer& transfer : transfers_for_shaders) {
         Transfer::Rectangle rectangles[Transfer::kMaxRectanglesWithCutout];
-        uint32_t rectangle_count = transfer.GetRectangles(
-            dest_key.base_tiles, dest_key.GetPitchTiles(),
-            dest_key.msaa_samples, IsKey64bpp(dest_key), rectangles,
-            resolve_clear_rectangle);
+        uint32_t rectangle_count =
+            transfer.GetRectangles(dest_key, IsKey64bpp(dest_key), rectangles,
+                                   resolve_clear_rectangle);
         if (rectangle_count != 1 || !is_full_target_rectangle(rectangles[0])) {
           return false;
         }
@@ -4903,10 +4948,9 @@ bool MetalRenderTargetCache::PerformTransfersAndResolveClears(
             for (const Transfer& transfer : transfers_for_shaders) {
               Transfer::Rectangle
                   rectangles[Transfer::kMaxRectanglesWithCutout];
-              uint32_t rectangle_count = transfer.GetRectangles(
-                  dest_key.base_tiles, dest_key.GetPitchTiles(),
-                  dest_key.msaa_samples, IsKey64bpp(dest_key), rectangles,
-                  resolve_clear_rectangle);
+              uint32_t rectangle_count =
+                  transfer.GetRectangles(dest_key, IsKey64bpp(dest_key),
+                                         rectangles, resolve_clear_rectangle);
               for (uint32_t rect_index = 0; rect_index < rectangle_count;
                    ++rect_index) {
                 if (!set_rect_viewport(encoder, rectangles[rect_index])) {
@@ -5321,8 +5365,7 @@ bool MetalRenderTargetCache::PerformTransfersAndResolveClears(
             Transfer::Rectangle rectangles[Transfer::kMaxRectanglesWithCutout];
             uint32_t rectangle_count =
                 transfer_invocations_[merged_index].transfer.GetRectangles(
-                    dest_key.base_tiles, dest_key.GetPitchTiles(),
-                    dest_key.msaa_samples, IsKey64bpp(dest_key), rectangles,
+                    dest_key, IsKey64bpp(dest_key), rectangles,
                     resolve_clear_rectangle);
             for (uint32_t rect_index = 0; rect_index < rectangle_count;
                  ++rect_index) {
@@ -5434,8 +5477,10 @@ bool MetalRenderTargetCache::PerformTransfersAndResolveClears(
           EdramTransferAddressConstant address_constant;
           address_constant.dest_pitch = dest_key.GetPitchTiles();
           address_constant.source_pitch = source_key.GetPitchTiles();
-          address_constant.source_to_dest =
-              int32_t(dest_key.base_tiles) - int32_t(source_key.base_tiles);
+          address_constant.source_to_dest = (uint32_t(dest_key.base_tiles) -
+                                             uint32_t(source_key.base_tiles)) &
+                                            (xenos::kEdramTileCount - 1);
+          address_constant.source_next_period = source_key.next_period;
           EdramTransferAddressConstant host_depth_address_constant;
           if (EdramTransferUsesHostDepth(shader_key.mode) &&
               !EdramTransferHostDepthIsCopy(shader_key.mode)) {
@@ -5447,8 +5492,9 @@ bool MetalRenderTargetCache::PerformTransfersAndResolveClears(
               host_depth_address_constant.source_pitch =
                   host_depth_key.GetPitchTiles();
               host_depth_address_constant.source_to_dest =
-                  int32_t(dest_key.base_tiles) -
-                  int32_t(host_depth_key.base_tiles);
+                  (uint32_t(dest_key.base_tiles) -
+                   uint32_t(host_depth_key.base_tiles)) &
+                  (xenos::kEdramTileCount - 1);
             }
           }
           TransferVertexConstants vertex_constants;

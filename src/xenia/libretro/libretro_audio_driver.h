@@ -90,7 +90,6 @@ class LibretroAudioSystem final : public apu::AudioSystem {
   apu::AudioDriver* CreateDriver(threading::Semaphore* semaphore,
                                  uint32_t frequency, uint32_t channels,
                                  bool need_format_conversion) override;
-  void DestroyDriver(apu::AudioDriver* driver) override;
 };
 
 // Mixes every live driver into out and returns the frame count produced.

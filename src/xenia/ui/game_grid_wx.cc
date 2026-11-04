@@ -164,7 +164,7 @@ void GameGrid::SetSelection(int index, bool notify) {
   // Reported even when the index did not move: picking the selected card
   // again is still a pick, and the caller may act on one.
   if (notify && selection_changed_cb_) {
-    selection_changed_cb_();
+    selection_changed_cb_(false);
   }
 }
 
@@ -343,7 +343,10 @@ void GameGrid::OnMouse(wxMouseEvent& event) {
   // under the cursor.
   SetFocus();
   if (index >= 0) {
-    SetSelection(index);
+    SetSelection(index, /*notify=*/false);
+    if (selection_changed_cb_) {
+      selection_changed_cb_(type == wxEVT_LEFT_DOWN);
+    }
   }
   if (type == wxEVT_RIGHT_DOWN && index >= 0 && context_menu_cb_) {
     context_menu_cb_(index, event.GetPosition());
@@ -351,6 +354,10 @@ void GameGrid::OnMouse(wxMouseEvent& event) {
 }
 
 void GameGrid::OnKeyDown(wxKeyEvent& event) {
+  // wxWANTS_CHARS keeps Tab from moving focus, so navigate explicitly.
+  if (HandleAsNavigationKey(event)) {
+    return;
+  }
   if (items_.empty()) {
     event.Skip();
     return;

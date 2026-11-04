@@ -12,17 +12,14 @@
 // this is #included into each backend's class body so each gets its own
 // inlinable copy with no inheritance or virtual dispatch.
 //
-// The fallback for hosts without the guest RAM host buffer (see the
+// The memexport fallback for hosts without the guest RAM host buffer (see the
 // enable_host_buffer cvar): output stays in the device-local buffer and reaches
-// guest RAM by a GPU copy into a host-visible buffer and a CPU copy out. Each
-// key gets two of them, so the caller's `deferred` can take the previous copy
-// and wait only on the older submission that filled it. Memexport and resolve
-// both stage here and their extents can coincide, so export keys are tagged.
+// guest RAM by a GPU copy into a host-visible buffer and a CPU copy out.
 //
 // The include site must already provide memory_ (Memory*), frame_current_,
-// GetCurrentSubmission, AlignReadbackBufferSize, xenia/base/assert.h,
-// xenia/base/logging.h, xenia/base/memory.h and <cstdint> <cstring>
-// <unordered_map>. It must also define, before including this:
+// AlignReadbackBufferSize, xenia/base/assert.h, xenia/base/logging.h,
+// xenia/base/memory.h and <cstdint> <cstring> <unordered_map>. It must also
+// define, before including this:
 //   struct ReadbackStagingBuffer
 //     One host-visible buffer, persistently mapped as `void* mapped`.
 //   bool CreateReadbackStagingBuffer(ReadbackStagingBuffer&, uint32_t size)
@@ -30,59 +27,43 @@
 //   void PrepareReadbackStagingEviction()
 //     Called once before an eviction's first destroy, for backends that drain
 //     rather than defer.
-//   bool AwaitReadbackStagingSubmission(uint64_t submission)
-//     Waits for one submission, or for everything recorded so far on
-//     UINT64_MAX. False if it could not.
-//   void InvalidateReadbackStaging(const ReadbackStagingBuffer&)
-//     Makes a completed GPU write visible to the CPU. Empty where the readback
-//     memory is always host-coherent.
+// And, anywhere in the class body:
+//   std::vector<MemexportStagedRange> memexport_staged_
+//     Staged export ranges by slot key, guest address, length and slot offset.
 // No include guard: injected into a class body.
-
-// Keeps an export range off the slot of a resolve destination with the same
-// extent. Guest addresses are under 512 MB, so the key's top bits are free.
-static constexpr uint64_t kReadbackStagingMemexportTag = uint64_t(1) << 63;
 
 // Age eviction alone only runs at frame close, so a title that never swaps
 // would grow without bound.
 static constexpr uint64_t kMaxReadbackStagingBytes = 64 * 1024 * 1024;
 
 struct ReadbackStagingSlot {
-  ReadbackStagingBuffer buffers[2];
-  // 0 until that buffer is created. A key carries its own length, so a buffer
+  ReadbackStagingBuffer buffer;
+  // 0 until the buffer is created. A key carries its own length, so a buffer
   // is sized once and never resized - a copy recorded into one is never left
   // pointing at a freed buffer.
-  uint32_t sizes[2] = {0, 0};
-  // The buffer the next copy is recorded into.
-  uint32_t write_index = 0;
-  // Submission each buffer's last copy was recorded in, 0 for never written.
-  uint64_t submissions[2] = {0, 0};
+  uint32_t size = 0;
   uint64_t last_used_frame = 0;
 };
 
-// Returns the slot for this key with the buffer the next copy goes into ready,
-// or null if that buffer could not be created.
+// Returns the slot for this key with its buffer ready, or null if the buffer
+// could not be created.
 ReadbackStagingSlot* AcquireReadbackStagingSlot(uint64_t key, uint32_t length) {
   if (!length) {
     return nullptr;
   }
   ReadbackStagingSlot& slot = readback_staging_slots_[key];
-  uint32_t index = slot.write_index;
-  if (slot.sizes[index]) {
-    assert_true(slot.sizes[index] >= length);
+  if (slot.size) {
+    assert_true(slot.size >= length);
     slot.last_used_frame = frame_current_;
     return &slot;
   }
   uint32_t size = AlignReadbackBufferSize(length);
   EvictReadbackStagingToFit(size, key);
-  if (!CreateReadbackStagingBuffer(slot.buffers[index], size)) {
-    if (!slot.sizes[index ^ 1]) {
-      readback_staging_slots_.erase(key);
-    }
-    // Without touching last_used_frame, so a slot left holding one buffer
-    // ages out instead of retrying forever.
+  if (!CreateReadbackStagingBuffer(slot.buffer, size)) {
+    readback_staging_slots_.erase(key);
     return nullptr;
   }
-  slot.sizes[index] = size;
+  slot.size = size;
   readback_staging_bytes_ += size;
   slot.last_used_frame = frame_current_;
   return &slot;
@@ -97,8 +78,7 @@ void EvictReadbackStagingToFit(uint32_t size, uint64_t keep_key) {
     for (auto it = readback_staging_slots_.begin();
          it != readback_staging_slots_.end(); ++it) {
       if (it->first == keep_key ||
-          it->second.last_used_frame == frame_current_ ||
-          !(it->second.sizes[0] | it->second.sizes[1])) {
+          it->second.last_used_frame == frame_current_ || !it->second.size) {
         continue;
       }
       if (oldest == readback_staging_slots_.end() ||
@@ -119,52 +99,22 @@ void EvictReadbackStagingToFit(uint32_t size, uint64_t keep_key) {
   }
 }
 
-// The buffer a copy should be recorded into.
-ReadbackStagingBuffer& ReadbackStagingWriteBuffer(ReadbackStagingSlot& slot) {
-  return slot.buffers[slot.write_index];
-}
-
 // The slot held for this key, or null if there is none.
 ReadbackStagingSlot* FindReadbackStagingSlot(uint64_t key) {
   auto slot = readback_staging_slots_.find(key);
   return slot != readback_staging_slots_.end() ? &slot->second : nullptr;
 }
 
-// Copies a recorded staging read out to guest RAM, waiting first. deferred
-// takes the previous copy instead, waiting only on the older submission that
-// filled it. The first use of a key has no previous copy and waits either way.
-// Call once per recorded copy, since it also rotates the slot.
-bool FinishReadbackStagingToGuestRam(ReadbackStagingSlot& slot,
-                                     uint32_t address, uint32_t length,
-                                     bool deferred) {
-  uint32_t read_index = slot.write_index;
-  uint64_t await_submission = UINT64_MAX;
-  if (deferred && slot.submissions[read_index ^ 1]) {
-    read_index ^= 1;
-    await_submission = slot.submissions[read_index];
-  }
-  // Before the wait, which closes the submission the copy was recorded into.
-  slot.submissions[slot.write_index] = GetCurrentSubmission();
-  slot.write_index ^= 1;
-  if (!AwaitReadbackStagingSubmission(await_submission)) {
-    XELOGE("Readback staging: dropped the copy out of 0x{:08X} ({} bytes)",
-           address, length);
-    return false;
-  }
-  InvalidateReadbackStaging(slot.buffers[read_index]);
-  ReadbackStagingToGuestRam(slot.buffers[read_index], address, length);
-  return true;
-}
-
 // Copies length bytes out of a staging buffer into guest RAM at address. The
 // GPU copy into the staging buffer must already have completed.
 void ReadbackStagingToGuestRam(const ReadbackStagingBuffer& buffer,
-                               uint32_t address, uint32_t length) {
+                               uint32_t source_offset, uint32_t address,
+                               uint32_t length) {
   if (buffer.mapped == nullptr || !length) {
     return;
   }
   uint8_t* dest = memory_->TranslatePhysical(address);
-  uint8_t* source = static_cast<uint8_t*>(buffer.mapped);
+  uint8_t* source = static_cast<uint8_t*>(buffer.mapped) + source_offset;
   // vastcpy's non-temporal stores need both pointers and the length to be
   // cache-line aligned.
   uintptr_t unaligned = reinterpret_cast<uintptr_t>(dest) |
@@ -173,6 +123,42 @@ void ReadbackStagingToGuestRam(const ReadbackStagingBuffer& buffer,
     std::memcpy(dest, source, length);
   } else {
     memory::vastcpy(dest, source, length);
+  }
+}
+
+// Trims staged export output a later resolve overwrote, keeping the rest.
+void DropStagedMemexportOutput(uint32_t address, uint32_t length) {
+  if (!length) {
+    return;
+  }
+  uint64_t end = uint64_t(address) + length;
+  for (size_t i = 0; i < memexport_staged_.size();) {
+    MemexportStagedRange staged = memexport_staged_[i];
+    uint64_t staged_end = uint64_t(staged.address) + staged.length;
+    if (staged_end <= address || staged.address >= end) {
+      ++i;
+      continue;
+    }
+    // Split in place, copy out order decides overlapping ranges.
+    bool head = staged.address < address;
+    if (head) {
+      memexport_staged_[i].length = address - staged.address;
+      ++i;
+    }
+    if (staged_end > end) {
+      MemexportStagedRange tail = staged;
+      tail.offset += uint32_t(end - staged.address);
+      tail.address = uint32_t(end);
+      tail.length = uint32_t(staged_end - end);
+      if (head) {
+        memexport_staged_.insert(memexport_staged_.begin() + i, tail);
+      } else {
+        memexport_staged_[i] = tail;
+      }
+      ++i;
+    } else if (!head) {
+      memexport_staged_.erase(memexport_staged_.begin() + i);
+    }
   }
 }
 
@@ -209,16 +195,13 @@ void ClearReadbackStagingBuffers() {
 }
 
 void DestroyReadbackStagingSlot(ReadbackStagingSlot& slot) {
-  for (uint32_t i = 0; i < 2; ++i) {
-    if (slot.sizes[i]) {
-      DestroyReadbackStagingBuffer(slot.buffers[i]);
-      readback_staging_bytes_ -= slot.sizes[i];
-      slot.sizes[i] = 0;
-    }
+  if (slot.size) {
+    DestroyReadbackStagingBuffer(slot.buffer);
+    readback_staging_bytes_ -= slot.size;
+    slot.size = 0;
   }
 }
 
-// One pair of buffers per destination extent, keyed by MakeReadbackResolveKey
-// plus kReadbackStagingMemexportTag for export ranges.
+// One buffer per export range, keyed by MakeReadbackResolveKey.
 std::unordered_map<uint64_t, ReadbackStagingSlot> readback_staging_slots_;
 uint64_t readback_staging_bytes_ = 0;

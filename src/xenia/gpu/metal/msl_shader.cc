@@ -250,7 +250,8 @@ void SetMslShaderSourceCacheDirectory(const std::filesystem::path& cache_dir) {
   std::filesystem::create_directories(g_msl_source_cache_directory, ec);
   if (ec) {
     XELOGW("MslShader: Failed to create source cache directory {}: {}",
-           g_msl_source_cache_directory.string(), ec.message());
+           xe::strip_pii(xe::path_to_utf8(g_msl_source_cache_directory)),
+           ec.message());
     g_msl_source_cache_directory.clear();
   }
 }
@@ -433,7 +434,7 @@ static void DumpMslResolveFailureSource(const std::string& msl_source,
   std::filesystem::create_directories(dump_dir, ec);
   if (ec) {
     XELOGW("MslShader: Failed to create unresolved-entry dump directory {}: {}",
-           dump_dir.string(), ec.message());
+           xe::strip_pii(xe::path_to_utf8(dump_dir)), ec.message());
     return;
   }
   std::filesystem::path dump_path =
@@ -442,13 +443,13 @@ static void DumpMslResolveFailureSource(const std::string& msl_source,
   FILE* f = xe::filesystem::OpenFile(dump_path, "w");
   if (!f) {
     XELOGW("MslShader: Failed to open unresolved-entry dump file {}",
-           dump_path.string());
+           xe::strip_pii(xe::path_to_utf8(dump_path)));
     return;
   }
   fwrite(msl_source.data(), 1, msl_source.size(), f);
   fclose(f);
   XELOGW("MslShader: Dumped unresolved-entry MSL source to {}",
-         dump_path.string());
+         xe::strip_pii(xe::path_to_utf8(dump_path)));
 }
 
 static void AddResourceBindings(
@@ -1231,7 +1232,8 @@ bool MslShader::MslTranslation::CompileToMsl(MTL::Device* device, bool is_ios) {
     if (f) {
       fwrite(msl_source_.data(), 1, msl_source_.size(), f);
       fclose(f);
-      XELOGD("MslShader: Dumped MSL to {}", msl_path.string());
+      XELOGD("MslShader: Dumped MSL to {}",
+             xe::strip_pii(xe::path_to_utf8(msl_path)));
     }
   }
 

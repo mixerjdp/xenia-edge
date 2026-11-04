@@ -51,6 +51,8 @@ void Shader::AnalyzeUcode(StringBuffer& ucode_disasm_buffer) {
   // Gather the upper bound of the control flow instructions, and label
   // addresses, which are needed for disassembly.
   cf_pair_index_bound_ = uint32_t(ucode_data_.size() / 3);
+  // Jumps back (source, target) for finding what may reenter a label.
+  std::vector<std::pair<uint32_t, uint32_t>> backward_jumps;
   for (uint32_t i = 0; i < cf_pair_index_bound_; ++i) {
     ControlFlowInstruction cf_ab[2];
     UnpackControlFlowInstructions(ucode_data_.data() + i * 3, cf_ab);
@@ -73,12 +75,18 @@ void Shader::AnalyzeUcode(StringBuffer& ucode_disasm_buffer) {
           break;
         case ControlFlowOpcode::kCondJmp:
           label_addresses_.insert(cf.cond_jmp.address());
+          if (cf.cond_jmp.address() <= i * 2 + j) {
+            backward_jumps.emplace_back(i * 2 + j, cf.cond_jmp.address());
+          }
           break;
         case ControlFlowOpcode::kLoopStart:
           label_addresses_.insert(cf.loop_start.address());
           break;
         case ControlFlowOpcode::kLoopEnd:
           label_addresses_.insert(cf.loop_end.address());
+          if (cf.loop_end.address() <= i * 2 + j) {
+            backward_jumps.emplace_back(i * 2 + j, cf.loop_end.address());
+          }
           break;
         default:
           break;
@@ -91,6 +99,7 @@ void Shader::AnalyzeUcode(StringBuffer& ucode_disasm_buffer) {
   VertexFetchInstruction previous_vfetch_full;
   std::memset(&previous_vfetch_full, 0, sizeof(previous_vfetch_full));
   uint32_t unique_texture_bindings = 0;
+  cf_register_components_written_.assign(cf_pair_index_bound_ * 2, 0);
   for (uint32_t i = 0; i < cf_pair_index_bound_; ++i) {
     ControlFlowInstruction cf_ab[2];
     UnpackControlFlowInstructions(ucode_data_.data() + i * 3, cf_ab);
@@ -186,6 +195,54 @@ void Shader::AnalyzeUcode(StringBuffer& ucode_disasm_buffer) {
     }
   }
   ucode_disassembly_ = ucode_disasm_buffer.to_string();
+
+  // A label jumped back to may be reentered after anything within the span of
+  // the jumps back overlapping it. With subroutines, anything may be executed
+  // before returning to a label.
+  auto get_components_written = [this](uint32_t first, uint32_t last) {
+    uint64_t components_written = 0;
+    for (uint32_t cf_index = first; cf_index <= last; ++cf_index) {
+      components_written |= cf_register_components_written_[cf_index];
+    }
+    return components_written;
+  };
+  uint32_t cf_index_count = cf_pair_index_bound_ * 2;
+  reentered_label_register_components_written_.assign(cf_index_count, 0);
+  std::set<uint32_t> reentered_labels;
+  for (const auto& backward_jump : backward_jumps) {
+    reentered_labels.insert(backward_jump.second);
+  }
+  if (uses_subroutine_calls_) {
+    reentered_labels = label_addresses_;
+  }
+  for (uint32_t label : reentered_labels) {
+    if (label >= cf_index_count) {
+      continue;
+    }
+    uint32_t span_first = label, span_last = label;
+    if (uses_subroutine_calls_) {
+      span_first = 0;
+      span_last = cf_index_count - 1;
+    } else {
+      bool span_extended;
+      do {
+        span_extended = false;
+        for (const auto& backward_jump : backward_jumps) {
+          if (backward_jump.second <= span_last &&
+              backward_jump.first >= span_first &&
+              (backward_jump.first > span_last ||
+               backward_jump.second < span_first)) {
+            span_first = std::min(span_first, backward_jump.second);
+            span_last = std::max(span_last, backward_jump.first);
+            span_extended = true;
+          }
+        }
+      } while (span_extended);
+    }
+    reentered_label_register_components_written_[label] =
+        get_components_written(span_first,
+                               std::min(span_last, cf_index_count - 1));
+  }
 
   if (constant_register_map_.float_dynamic_addressing) {
     // All potentially can be referenced.
@@ -321,6 +378,10 @@ void Shader::AnalyzeUcode(StringBuffer& ucode_disasm_buffer) {
     }
   }
 
+  if (type() == xenos::ShaderType::kVertex) {
+    GatherAluRoundingSensitivity();
+  }
+
   is_ucode_analyzed_ = true;
 
   // An empty shader can be created internally by shader translators as a dummy,
@@ -367,11 +428,12 @@ void Shader::GatherExecInformation(
     if (sequence & 0b01) {
       auto& op = *reinterpret_cast<const FetchInstruction*>(op_ptr);
       if (op.opcode() == FetchOpcode::kVertexFetch) {
-        GatherVertexFetchInformation(op.vertex_fetch(), previous_vfetch_full,
-                                     ucode_disasm_buffer);
+        GatherVertexFetchInformation(op.vertex_fetch(), instr.dword_index,
+                                     previous_vfetch_full, ucode_disasm_buffer);
       } else {
-        GatherTextureFetchInformation(
-            op.texture_fetch(), unique_texture_bindings, ucode_disasm_buffer);
+        GatherTextureFetchInformation(op.texture_fetch(), instr.dword_index,
+                                      unique_texture_bindings,
+                                      ucode_disasm_buffer);
       }
     } else {
       auto& op = *reinterpret_cast<const AluInstruction*>(op_ptr);
@@ -382,7 +444,7 @@ void Shader::GatherExecInformation(
 }
 
 void Shader::GatherVertexFetchInformation(
-    const VertexFetchInstruction& op,
+    const VertexFetchInstruction& op, uint32_t exec_cf_index,
     VertexFetchInstruction& previous_vfetch_full,
     StringBuffer& ucode_disasm_buffer) {
   ParsedVertexFetchInstruction fetch_instr;
@@ -391,7 +453,7 @@ void Shader::GatherVertexFetchInformation(
   }
   fetch_instr.Disassemble(&ucode_disasm_buffer);
 
-  GatherFetchResultInformation(fetch_instr.result);
+  GatherFetchResultInformation(fetch_instr.result, exec_cf_index);
 
   // Mini-fetches inherit the operands from full fetches.
   if (!fetch_instr.is_mini_fetch) {
@@ -437,15 +499,27 @@ void Shader::GatherVertexFetchInformation(
 }
 
 void Shader::GatherTextureFetchInformation(const TextureFetchInstruction& op,
+                                           uint32_t exec_cf_index,
                                            uint32_t& unique_texture_bindings,
                                            StringBuffer& ucode_disasm_buffer) {
   TextureBinding binding;
   ParseTextureFetchInstruction(op, binding.fetch_instr);
   binding.fetch_instr.Disassemble(&ucode_disasm_buffer);
 
-  GatherFetchResultInformation(binding.fetch_instr.result);
+  GatherFetchResultInformation(binding.fetch_instr.result, exec_cf_index);
   for (size_t i = 0; i < binding.fetch_instr.operand_count; ++i) {
     GatherOperandInformation(binding.fetch_instr.operands[i]);
+  }
+  const InstructionOperand& coordinates_operand =
+      binding.fetch_instr.operands[0];
+  if (binding.fetch_instr.CanSnapToTexelCenter(false) &&
+      coordinates_operand.storage_source ==
+          InstructionStorageSource::kRegister &&
+      coordinates_operand.storage_addressing_mode ==
+          InstructionStorageAddressingMode::kAbsolute &&
+      coordinates_operand.storage_index < 16) {
+    point_fetch_coordinate_registers_ |= UINT32_C(1)
+                                         << coordinates_operand.storage_index;
   }
 
   if (binding.fetch_instr.result.GetUsedResultComponents()) {
@@ -558,19 +632,34 @@ void Shader::GatherOperandInformation(const InstructionOperand& operand) {
   }
 }
 
-void Shader::GatherFetchResultInformation(const InstructionResult& result) {
+void Shader::GatherFetchResultInformation(const InstructionResult& result,
+                                          uint32_t exec_cf_index) {
   if (!result.GetUsedWriteMask()) {
     return;
   }
   // Fetch instructions can't export - don't need the current memexport count
   // operand.
   assert_true(result.storage_target == InstructionStorageTarget::kRegister);
+  GatherRegisterWriteInformation(result, exec_cf_index);
   if (result.storage_addressing_mode ==
       InstructionStorageAddressingMode::kAbsolute) {
     register_static_address_bound_ = std::max(
         register_static_address_bound_, result.storage_index + uint32_t(1));
   } else {
     uses_register_dynamic_addressing_ = true;
+  }
+}
+
+void Shader::GatherRegisterWriteInformation(const InstructionResult& result,
+                                            uint32_t exec_cf_index) {
+  uint64_t& cf_components_written =
+      cf_register_components_written_[exec_cf_index];
+  if (result.storage_addressing_mode !=
+      InstructionStorageAddressingMode::kAbsolute) {
+    cf_components_written = ~UINT64_C(0);
+  } else if (result.storage_index < 16) {
+    cf_components_written |= uint64_t(result.GetUsedWriteMask())
+                             << (result.storage_index * 4);
   }
 }
 
@@ -582,6 +671,7 @@ void Shader::GatherAluResultInformation(const InstructionResult& result,
   }
   switch (result.storage_target) {
     case InstructionStorageTarget::kRegister:
+      GatherRegisterWriteInformation(result, exec_cf_index);
       if (result.storage_addressing_mode ==
           InstructionStorageAddressingMode::kAbsolute) {
         register_static_address_bound_ = std::max(
@@ -613,6 +703,316 @@ void Shader::GatherAluResultInformation(const InstructionResult& result,
     default:
       break;
   }
+}
+
+namespace {
+
+// Temporary register components, 4 bits per register, and the previous scalar
+// result whose values may reach a rounding-sensitive use.
+struct RoundingSensitiveValues {
+  uint64_t registers[xenos::kMaxShaderTempRegisters / 16] = {};
+  bool previous_scalar = false;
+
+  bool operator==(const RoundingSensitiveValues& other) const {
+    return !std::memcmp(registers, other.registers, sizeof(registers)) &&
+           previous_scalar == other.previous_scalar;
+  }
+  void Merge(const RoundingSensitiveValues& other) {
+    for (size_t i = 0; i < xe::countof(registers); ++i) {
+      registers[i] |= other.registers[i];
+    }
+    previous_scalar = previous_scalar || other.previous_scalar;
+  }
+
+  // aL-relative addressing may access any register.
+  uint32_t GetComponents(uint32_t reg, bool is_relative,
+                         uint32_t components) const {
+    if (!is_relative) {
+      return uint32_t(registers[reg >> 4] >> ((reg & 15) * 4)) & components;
+    }
+    uint64_t any_register = 0;
+    for (uint64_t registers_16 : registers) {
+      any_register |= registers_16;
+    }
+    any_register |= any_register >> 32;
+    any_register |= any_register >> 16;
+    any_register |= any_register >> 8;
+    any_register |= any_register >> 4;
+    return uint32_t(any_register) & components;
+  }
+  void Add(uint32_t reg, bool is_relative, uint32_t components) {
+    if (!is_relative) {
+      registers[reg >> 4] |= uint64_t(components) << ((reg & 15) * 4);
+      return;
+    }
+    for (uint64_t& registers_16 : registers) {
+      registers_16 |= uint64_t(components) * UINT64_C(0x1111111111111111);
+    }
+  }
+
+  // Components of an ALU result that may reach a rounding-sensitive use.
+  uint32_t GetResultComponents(const InstructionResult& result) const {
+    uint32_t components = result.GetUsedResultComponents();
+    switch (result.storage_target) {
+      case InstructionStorageTarget::kRegister:
+        return GetComponents(
+            result.storage_index,
+            result.storage_addressing_mode ==
+                InstructionStorageAddressingMode::kLoopRelative,
+            components);
+      case InstructionStorageTarget::kExportAddress:
+      case InstructionStorageTarget::kExportData:
+        return components;
+      default:
+        return 0;
+    }
+  }
+  void RemoveResult(const InstructionResult& result) {
+    if (result.storage_target == InstructionStorageTarget::kRegister &&
+        result.storage_addressing_mode ==
+            InstructionStorageAddressingMode::kAbsolute) {
+      registers[result.storage_index >> 4] &=
+          ~(uint64_t(result.GetUsedWriteMask())
+            << ((result.storage_index & 15) * 4));
+    }
+  }
+  void AddOperand(const InstructionOperand& operand,
+                  uint32_t operand_components) {
+    if (operand.storage_source != InstructionStorageSource::kRegister) {
+      return;
+    }
+    uint32_t components = 0;
+    for (uint32_t i = 0; i < 4; ++i) {
+      SwizzleSource component = operand.GetComponent(i);
+      if ((operand_components & (1 << i)) && component <= SwizzleSource::kW) {
+        components |= 1 << uint32_t(component);
+      }
+    }
+    Add(operand.storage_index,
+        operand.storage_addressing_mode ==
+            InstructionStorageAddressingMode::kLoopRelative,
+        components);
+  }
+};
+
+// Goes back over an instruction from the values that may reach a
+// rounding-sensitive use after it, and marks its ALU operations whose results
+// may reach one.
+void GatherInstructionRoundingSensitivity(const uint32_t* op_ptr, bool is_fetch,
+                                          RoundingSensitiveValues& values,
+                                          uint8_t& alu_results) {
+  if (is_fetch) {
+    auto& op = *reinterpret_cast<const FetchInstruction*>(op_ptr);
+    if (op.opcode() == FetchOpcode::kVertexFetch) {
+      ParsedVertexFetchInstruction instr;
+      ParseVertexFetchInstruction(op.vertex_fetch(), op.vertex_fetch(), instr);
+      if (!instr.is_predicated) {
+        values.RemoveResult(instr.result);
+      }
+      // vfetch_mini reuses the address calculated by vfetch_full.
+      if (!instr.is_mini_fetch) {
+        values.AddOperand(instr.operands[0], 0b0001);
+      }
+    } else {
+      ParsedTextureFetchInstruction instr;
+      ParseTextureFetchInstruction(op.texture_fetch(), instr);
+      if (!instr.is_predicated) {
+        values.RemoveResult(instr.result);
+      }
+    }
+    return;
+  }
+
+  ParsedAluInstruction instr;
+  ParseAluInstruction(*reinterpret_cast<const AluInstruction*>(op_ptr),
+                      xenos::ShaderType::kVertex, instr);
+
+  uint32_t vector_sensitive =
+      values.GetResultComponents(instr.vector_and_constant_result);
+  // Result components whose operands are needed, also for the operation's own
+  // rounding-sensitive use of them.
+  uint32_t vector_operands_used_for = vector_sensitive;
+  bool vector_operands_used = vector_sensitive != 0;
+  switch (instr.vector_opcode) {
+    case AluVectorOpcode::kFrc:
+    case AluVectorOpcode::kTrunc:
+    case AluVectorOpcode::kFloor:
+      vector_operands_used_for |=
+          instr.vector_and_constant_result.GetUsedResultComponents();
+      vector_operands_used = vector_operands_used_for != 0;
+      break;
+    case AluVectorOpcode::kMaxA:
+      // a0 is set from W of the first operand.
+      vector_operands_used = true;
+      break;
+    default:
+      break;
+  }
+
+  // Retaining also passes the previous scalar result on.
+  bool scalar_sensitive =
+      values.GetResultComponents(instr.scalar_result) != 0 ||
+      values.previous_scalar;
+  bool scalar_operands_used = scalar_sensitive;
+  switch (instr.scalar_opcode) {
+    case AluScalarOpcode::kMaxAs:
+    case AluScalarOpcode::kMaxAsf:
+    case AluScalarOpcode::kFrcs:
+    case AluScalarOpcode::kTruncs:
+    case AluScalarOpcode::kFloors:
+      scalar_operands_used = true;
+      break;
+    default:
+      break;
+  }
+
+  // Both operations read their operands before either writes its result.
+  if (!instr.is_predicated) {
+    values.RemoveResult(instr.vector_and_constant_result);
+    values.RemoveResult(instr.scalar_result);
+    if (instr.scalar_opcode != AluScalarOpcode::kRetainPrev) {
+      values.previous_scalar = false;
+    }
+  }
+  if (vector_operands_used) {
+    for (uint32_t i = 0; i < instr.vector_operand_count; ++i) {
+      values.AddOperand(
+          instr.vector_operands[i],
+          GetAluVectorOpNeededSourceComponents(instr.vector_opcode, i + 1,
+                                               vector_operands_used_for));
+    }
+  }
+  if (scalar_operands_used) {
+    for (uint32_t i = 0; i < instr.scalar_operand_count; ++i) {
+      const InstructionOperand& operand = instr.scalar_operands[i];
+      values.AddOperand(operand, (UINT32_C(1) << operand.component_count) - 1);
+    }
+    switch (instr.scalar_opcode) {
+      case AluScalarOpcode::kAddsPrev:
+      case AluScalarOpcode::kMulsPrev:
+      case AluScalarOpcode::kMulsPrev2:
+      case AluScalarOpcode::kSubsPrev:
+      case AluScalarOpcode::kRetainPrev:
+        values.previous_scalar = true;
+        break;
+      default:
+        break;
+    }
+  }
+
+  if (vector_sensitive) {
+    alu_results |= 0b01;
+  }
+  if (scalar_sensitive) {
+    alu_results |= 0b10;
+  }
+}
+
+}  // namespace
+
+void Shader::GatherAluRoundingSensitivity() {
+  // Backward data flow over the control flow graph, with subroutines returning
+  // to after any call.
+  uint32_t cf_index_count = cf_pair_index_bound_ * 2;
+  std::vector<ParsedExecInstruction> execs(cf_index_count);
+  std::vector<std::vector<uint32_t>> successors(cf_index_count);
+  std::vector<uint32_t> returns;
+  std::vector<uint32_t> return_targets;
+  for (uint32_t i = 0; i < cf_pair_index_bound_; ++i) {
+    ControlFlowInstruction cf_ab[2];
+    UnpackControlFlowInstructions(ucode_data_.data() + i * 3, cf_ab);
+    for (uint32_t j = 0; j < 2; ++j) {
+      uint32_t cf_index = i * 2 + j;
+      const ControlFlowInstruction& cf = cf_ab[j];
+      std::vector<uint32_t>& cf_successors = successors[cf_index];
+      auto add_successor = [&](uint32_t successor) {
+        if (successor < cf_index_count) {
+          cf_successors.push_back(successor);
+        }
+      };
+      bool next_is_successor = true;
+      switch (cf.opcode()) {
+        case ControlFlowOpcode::kExec:
+        case ControlFlowOpcode::kExecEnd:
+          ParseControlFlowExec(cf.exec, cf_index, execs[cf_index]);
+          next_is_successor = cf.opcode() != ControlFlowOpcode::kExecEnd;
+          break;
+        case ControlFlowOpcode::kCondExec:
+        case ControlFlowOpcode::kCondExecEnd:
+        case ControlFlowOpcode::kCondExecPredClean:
+        case ControlFlowOpcode::kCondExecPredCleanEnd:
+          ParseControlFlowCondExec(cf.cond_exec, cf_index, execs[cf_index]);
+          break;
+        case ControlFlowOpcode::kCondExecPred:
+        case ControlFlowOpcode::kCondExecPredEnd:
+          ParseControlFlowCondExecPred(cf.cond_exec_pred, cf_index,
+                                       execs[cf_index]);
+          break;
+        case ControlFlowOpcode::kLoopStart:
+          add_successor(cf.loop_start.address());
+          break;
+        case ControlFlowOpcode::kLoopEnd:
+          add_successor(cf.loop_end.address());
+          break;
+        case ControlFlowOpcode::kCondCall:
+          add_successor(cf.cond_call.address());
+          return_targets.push_back(cf_index + 1);
+          break;
+        case ControlFlowOpcode::kReturn:
+          // A return outside a call is skipped.
+          returns.push_back(cf_index);
+          break;
+        case ControlFlowOpcode::kCondJmp:
+          add_successor(cf.cond_jmp.address());
+          next_is_successor = !cf.cond_jmp.is_unconditional();
+          break;
+        default:
+          break;
+      }
+      if (next_is_successor) {
+        add_successor(cf_index + 1);
+      }
+    }
+  }
+  for (uint32_t cf_index : returns) {
+    for (uint32_t return_target : return_targets) {
+      if (return_target < cf_index_count) {
+        successors[cf_index].push_back(return_target);
+      }
+    }
+  }
+
+  alu_rounding_sensitive_results_.assign(ucode_data_.size() / 3, 0);
+  std::vector<RoundingSensitiveValues> values_before(cf_index_count);
+  bool values_changed;
+  do {
+    values_changed = false;
+    for (uint32_t cf_index = cf_index_count; cf_index-- > 0;) {
+      RoundingSensitiveValues values;
+      for (uint32_t successor : successors[cf_index]) {
+        values.Merge(values_before[successor]);
+      }
+      const ParsedExecInstruction& exec = execs[cf_index];
+      RoundingSensitiveValues values_if_skipped = values;
+      for (uint32_t i = exec.instruction_count; i-- > 0;) {
+        uint32_t address = exec.instruction_address + i;
+        if (address >= alu_rounding_sensitive_results_.size()) {
+          continue;
+        }
+        GatherInstructionRoundingSensitivity(
+            ucode_data_.data() + address * 3,
+            ((exec.sequence >> (i * 2)) & 0b01) != 0, values,
+            alu_rounding_sensitive_results_[address]);
+      }
+      if (exec.type != ParsedExecInstruction::Type::kUnconditional) {
+        values.Merge(values_if_skipped);
+      }
+      if (!(values == values_before[cf_index])) {
+        values_before[cf_index] = values;
+        values_changed = true;
+      }
+    }
+  } while (values_changed);
 }
 
 ShaderTranslator::ShaderTranslator() = default;
@@ -931,6 +1331,7 @@ void ShaderTranslator::TranslateExecInstructions(
   for (uint32_t instr_offset = instr.instruction_address;
        instr_offset < instr.instruction_address + instr.instruction_count;
        ++instr_offset, sequence >>= 2) {
+    instruction_address_ = instr_offset;
     const uint32_t* op_ptr = ucode_dwords + instr_offset * 3;
     if (sequence & 0b01) {
       auto& op = *reinterpret_cast<const FetchInstruction*>(op_ptr);
@@ -1136,7 +1537,9 @@ void ParseTextureFetchInstruction(const TextureFetchInstruction& op,
       opcode_info.override_component_count
           ? opcode_info.override_component_count
           : xenos::GetFetchOpDimensionComponentCount(op.dimension());
-  if (op.opcode() == FetchOpcode::kTextureFetch &&
+  // getBCF goes with a tfetch and needs the same coordinates.
+  if ((op.opcode() == FetchOpcode::kTextureFetch ||
+       op.opcode() == FetchOpcode::kGetTextureBorderColorFrac) &&
       op.dimension() == xenos::FetchOpDimension::k1D) {
     uint32_t src_swizzle = op.src_swizzle();
     uint32_t src_select_x = src_swizzle & 0x3;
@@ -1183,10 +1586,8 @@ uint32_t ParsedTextureFetchInstruction::GetNonZeroResultComponents() const {
   switch (opcode) {
     case FetchOpcode::kTextureFetch:
     case FetchOpcode::kGetTextureGradients:
-      components = 0b1111;
-      break;
     case FetchOpcode::kGetTextureBorderColorFrac:
-      components = 0b0001;
+      components = 0b1111;
       break;
     case FetchOpcode::kGetTextureComputedLod:
       // Not checking if the MipFilter is basemap because XNA doesn't accept

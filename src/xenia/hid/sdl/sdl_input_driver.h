@@ -50,6 +50,7 @@ class SDLInputDriver final : public InputDriver {
                         X_INPUT_KEYSTROKE* out_keystroke) override;
   virtual InputType GetInputType() const override;
   std::vector<InputDeviceInfo> EnumerateDevices() override;
+  void SetNativeMode(uint8_t driver_slot, bool enabled) override;
 
  private:
   struct ControllerState {
@@ -57,6 +58,15 @@ class SDLInputDriver final : public InputDriver {
     X_INPUT_CAPABILITIES caps;
     X_INPUT_STATE state;
     bool state_changed;
+    // XInput user index for devices that can be read straight from XInput,
+    // else -1.
+    int xinput_slot = -1;
+    X_INPUT_CAPABILITIES native_caps = {};
+    bool native_mode = true;
+
+    bool native() const {
+      return xinput_slot >= 0 && native_mode && native_caps.type;
+    }
   };
 
   enum class RepeatState {

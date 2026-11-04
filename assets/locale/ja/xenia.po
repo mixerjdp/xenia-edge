@@ -11,16 +11,6 @@ msgstr ""
 "Content-Transfer-Encoding: 8bit\n"
 "Plural-Forms: nplurals=1; plural=0;\n"
 
-#: src/xenia/ui/game_list_panel_wx.cc:596
-msgid ""
-"\n"
-"\n"
-"Browse for the file?"
-msgstr ""
-"\n"
-"\n"
-"ファイルを参照しますか？"
-
 #: src/xenia/ui/game_scan_progress_dialog_wx.cc:55
 msgid "   %zu already installed"
 msgstr "   %zu 件はインストール済"
@@ -1663,3 +1653,139 @@ msgstr "Xenia は %s の下で配布されています"
 #: src/xenia/ui/game_info_panel_wx.cc:212
 msgid "Content"
 msgstr "コンテンツ"
+
+#: src/xenia/app/emulator_window.cc:405
+msgid "Alternate Guitar"
+msgstr "代替ギター"
+
+#: src/xenia/app/emulator_window.cc:407
+msgid "Bass Guitar"
+msgstr "ベースギター"
+
+#: src/xenia/app/emulator_window.cc:2027
+msgid ""
+"Original Xbox games run through XeFu, the Xbox 360's backward compatibility emulator, and %s is missing from its folder:\n"
+"\n"
+"%s\n"
+"\n"
+"Copy xbox.xex and the xefu*.xex files there from the Compatibility folder of an Xbox 360 hard drive."
+msgstr ""
+"初代 Xbox のゲームは、Xbox 360 の後方互換性エミュレーターである XeFu で動作しますが、XeFu のフォルダーに %s がありません:\n"
+"\n"
+"%s\n"
+"\n"
+"Xbox 360 のハードドライブにある Compatibility フォルダーから、xbox.xex と xefu*.xex ファイルをこのフォルダーにコピーしてください。"
+
+#: src/xenia/app/emulator_window.cc:2034
+msgid "XeFu not found"
+msgstr "XeFu が見つかりません"
+
+#: src/xenia/app/emulator_window.cc:3665
+msgid ""
+"Failed to launch title.\n"
+"\n"
+"Check xenia.log for technical details."
+msgstr ""
+"タイトルを起動できませんでした。\n"
+"\n"
+"技術的な詳細は xenia.log を確認してください。"
+
+#: src/xenia/app/emulator_window.cc:3664
+msgid "Title Launch Failed!"
+msgstr "タイトルの起動に失敗しました"
+
+#: src/xenia/app/emulator_window.cc:2891
+msgid "Data migration"
+msgstr "データ移行"
+
+#: src/xenia/app/emulator_window.cc:2891
+msgid ""
+"Some of your existing data couldn't be migrated to the new profile. Items that failed: %u\n"
+"\n"
+"Check xenia.log for technical details."
+msgstr ""
+"既存のデータの一部を新しいプロファイルに移行できませんでした。失敗した項目: %u\n"
+"\n"
+"技術的な詳細は xenia.log を確認してください。"
+
+#: src/xenia/app/emulator_window.cc:2897
+msgid "Your existing data was migrated to the new profile."
+msgstr "既存のデータを新しいプロファイルに移行しました。"
+
+#: src/xenia/ui/game_list_panel_wx.cc:441
+msgid ""
+"No file path is set for this title.\n"
+"\n"
+"Browse for the file?"
+msgstr ""
+"このタイトルにはファイルパスが設定されていません。\n"
+"\n"
+"ファイルを参照しますか？"
+
+#: src/xenia/ui/game_list_panel_wx.cc:442
+msgid ""
+"File not found:\n"
+"%s\n"
+"\n"
+"Browse for the file?"
+msgstr ""
+"ファイルが見つかりません:\n"
+"%s\n"
+"\n"
+"ファイルを参照しますか？"
+
+#: src/xenia/app/emulator_window.cc:2325
+msgid "Failed to read the system update."
+msgstr "システム アップデートの読み取りに失敗しました。"
+
+#: src/xenia/app/emulator_window.cc:2329
+msgid "Failed to write the system files."
+msgstr "システム ファイルの書き込みに失敗しました。"
+
+#: src/xenia/app/emulator_window.cc:2296
+#: src/xenia/app/emulator_window.cc:2319
+#: src/xenia/app/emulator_window.cc:2324
+#: src/xenia/app/emulator_window.cc:2328
+#: src/xenia/app/emulator_window.cc:2333
+msgid "Install System Files"
+msgstr "システム ファイルのインストール"
+
+#: src/xenia/app/emulator_window.cc:1127
+msgid "Install System Files..."
+msgstr "システム ファイルのインストール…"
+
+#: src/xenia/app/emulator_window.cc:2297
+msgid "Installing the system files..."
+msgstr "システム ファイルをインストール中…"
+
+#: src/xenia/app/emulator_window.cc:2282
+msgid "Select a USB System Update"
+msgstr "USB システム アップデートを選択"
+
+#: src/xenia/app/emulator_window.cc:2310
+msgid "System files installed"
+msgstr "システム ファイルをインストールしました"
+
+#: src/xenia/app/emulator_window.cc:2335
+msgid ""
+"The previous system files couldn't be put back in place. Move their folders back or delete them to install again. They are in:\n"
+"%s"
+msgstr ""
+"以前のシステム ファイルを復元できませんでした。もう一度インストールするには、そのフォルダーを元の場所に戻すか、削除してください。フォルダーは次の場所にあります:\n"
+"%s"
+
+#: src/xenia/app/emulator_window.cc:2311
+msgid ""
+"The system files are installed in:\n"
+"%s"
+msgstr ""
+"システム ファイルは次の場所にインストールされています:\n"
+"%s"
+
+#: src/xenia/app/emulator_window.cc:2320
+msgid "This file isn't a USB system update."
+msgstr "このファイルは USB システム アップデートではありません。"
+
+#: src/xenia/app/emulator_window.cc:1035
+msgid "Start Dashboard"
+msgstr "ダッシュボードを起動"

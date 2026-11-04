@@ -18,6 +18,7 @@
 #include <string>
 #include <thread>
 
+#include "xenia/base/delegate.h"
 #include "xenia/cpu/processor.h"
 #include "xenia/gpu/register_file.h"
 #include "xenia/kernel/xthread.h"
@@ -79,6 +80,8 @@ class GraphicsSystem {
                          ui::WindowedAppContext* app_context,
                          bool with_presentation);
   virtual void Shutdown();
+  // Stops the vblank thread. Idempotent, and Shutdown does it too.
+  void StopFrameLimiter();
 
   // May be called from any thread any number of times, even during recovery
   // from a device loss.
@@ -118,8 +121,12 @@ class GraphicsSystem {
 
   void InvalidateGpuMemory();
 
+  // started_callback runs on the thread doing the loading right before it
+  // starts, which may be well after this call while the command processor is
+  // still setting up.
   void InitializeShaderStorage(
       const std::filesystem::path& cache_root, uint32_t title_id, bool blocking,
+      std::function<void()> started_callback = nullptr,
       std::function<void()> completion_callback = nullptr);
 
   void RequestFrameTrace();
@@ -144,6 +151,10 @@ class GraphicsSystem {
     scaled_aspect_x_ = x;
     scaled_aspect_y_ = y;
   };
+
+  // Whether pipelines are being created, in the background or inline, from
+  // the thread that started or finished them.
+  xe::Delegate<bool> on_shader_compilation;
 
  protected:
   GraphicsSystem();

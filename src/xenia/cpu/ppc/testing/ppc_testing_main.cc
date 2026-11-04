@@ -187,11 +187,13 @@ class TestSuite {
 
   bool Load() {
     if (!ReadMap()) {
-      XELOGE("Unable to read map for test {}", src_file_path_);
+      XELOGE("Unable to read map for test {}",
+             xe::strip_pii(xe::path_to_utf8(src_file_path_)));
       return false;
     }
     if (!ReadAnnotations()) {
-      XELOGE("Unable to read annotations for test {}", src_file_path_);
+      XELOGE("Unable to read annotations for test {}",
+             xe::strip_pii(xe::path_to_utf8(src_file_path_)));
       return false;
     }
     return true;
@@ -269,7 +271,7 @@ class TestSuite {
         current_test_case = FindTestCase(label);
         if (!current_test_case) {
           XELOGE("Test case {} not found in corresponding map for {}", label,
-                 src_file_path_);
+                 xe::strip_pii(xe::path_to_utf8(src_file_path_)));
           return false;
         }
       } else if (strlen(start) > 3 && start[0] == '#' && start[1] == '_') {
@@ -284,7 +286,8 @@ class TestSuite {
             value.erase(value.end() - 1);
           }
           if (!current_test_case) {
-            XELOGE("Annotation outside of test case in {}", src_file_path_);
+            XELOGE("Annotation outside of test case in {}",
+                   xe::strip_pii(xe::path_to_utf8(src_file_path_)));
             return false;
           }
           current_test_case->annotations.emplace_back(key, value);
@@ -338,7 +341,8 @@ class TestRunner {
 
       auto module = std::make_unique<xe::cpu::RawModule>(processor_.get());
       if (!module->LoadFile(START_ADDRESS, suite.bin_file_path())) {
-        XELOGE("Unable to load test binary {}", suite.bin_file_path());
+        XELOGE("Unable to load test binary {}",
+               xe::strip_pii(xe::path_to_utf8(suite.bin_file_path())));
         return false;
       }
       processor_->AddModule(std::move(module));
@@ -675,7 +679,8 @@ bool RunTests(const std::vector<std::string>& test_names) {
       continue;
     }
     if (!test_suite.Load()) {
-      XELOGE("TEST SUITE {} FAILED TO LOAD", test_path);
+      XELOGE("TEST SUITE {} FAILED TO LOAD",
+             xe::strip_pii(xe::path_to_utf8(test_path)));
       load_failed = true;
       continue;
     }

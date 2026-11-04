@@ -490,7 +490,11 @@ TEST_CASE("RESERVED_STORE_I32_NO_RESERVATION", "[atomic]") {
   auto* host_ptr =
       reinterpret_cast<uint32_t*>(test.memory->TranslateVirtual(guest_addr));
 
+  // Catch2 assertions are not thread-safe, so the worker records results here
+  // and the main thread checks them.
   std::atomic<bool> completed{false};
+  std::atomic<bool> store_succeeded{false};
+  std::atomic<bool> memory_changed{false};
   std::thread worker([&]() {
     test.Run(
         [&](PPCContext* ctx) {
@@ -499,8 +503,12 @@ TEST_CASE("RESERVED_STORE_I32_NO_RESERVATION", "[atomic]") {
           ctx->r[5] = 99;
         },
         [&](PPCContext* ctx) {
-          CHECK(ctx->r[3] == 0);   // store must fail
-          CHECK(*host_ptr == 42);  // memory unchanged
+          if (ctx->r[3] != 0) {
+            store_succeeded = true;
+          }
+          if (*host_ptr != 42) {
+            memory_changed = true;
+          }
         });
     completed.store(true);
   });
@@ -515,6 +523,8 @@ TEST_CASE("RESERVED_STORE_I32_NO_RESERVATION", "[atomic]") {
     FAIL("Timed out: no-reservation path likely has an infinite loop");
     std::_Exit(1);
   }
+  CHECK_FALSE(store_succeeded);
+  CHECK_FALSE(memory_changed);
 
   test.memory->SystemHeapFree(guest_addr);
 }
@@ -535,6 +545,8 @@ TEST_CASE("RESERVED_STORE_I64_NO_RESERVATION", "[atomic]") {
       reinterpret_cast<uint64_t*>(test.memory->TranslateVirtual(guest_addr));
 
   std::atomic<bool> completed{false};
+  std::atomic<bool> store_succeeded{false};
+  std::atomic<bool> memory_changed{false};
   std::thread worker([&]() {
     test.Run(
         [&](PPCContext* ctx) {
@@ -543,8 +555,12 @@ TEST_CASE("RESERVED_STORE_I64_NO_RESERVATION", "[atomic]") {
           ctx->r[5] = 99;
         },
         [&](PPCContext* ctx) {
-          CHECK(ctx->r[3] == 0);   // store must fail
-          CHECK(*host_ptr == 42);  // memory unchanged
+          if (ctx->r[3] != 0) {
+            store_succeeded = true;
+          }
+          if (*host_ptr != 42) {
+            memory_changed = true;
+          }
         });
     completed.store(true);
   });
@@ -559,6 +575,8 @@ TEST_CASE("RESERVED_STORE_I64_NO_RESERVATION", "[atomic]") {
     FAIL("Timed out: no-reservation path likely has an infinite loop");
     std::_Exit(1);
   }
+  CHECK_FALSE(store_succeeded);
+  CHECK_FALSE(memory_changed);
 
   test.memory->SystemHeapFree(guest_addr);
 }
@@ -766,4 +784,31 @@ TEST_CASE("STORE_VECTOR_LEFT_MEMCPY_HEAD", "[memory]") {
 
     test.memory->SystemHeapFree(guest_addr);
   }
+}
+
+// Float MAX/MIN are not constant-folded, so both operands can reach the
+// backend as constants.
+TEST_CASE("MAX_MIN_FLOAT_BOTH_CONSTANT", "[instr]") {
+  TestFunction test([](HIRBuilder& b) {
+    StoreFPR(b, 3,
+             b.Max(b.LoadConstantFloat64(1.0), b.LoadConstantFloat64(2.0)));
+    StoreFPR(b, 4,
+             b.Min(b.LoadConstantFloat64(-1.0), b.LoadConstantFloat64(-2.0)));
+    StoreFPR(b, 5,
+             b.Convert(b.Max(b.LoadConstantFloat32(1.0f),
+                             b.LoadConstantFloat32(2.0f)),
+                       FLOAT64_TYPE));
+    StoreFPR(b, 6,
+             b.Convert(b.Min(b.LoadConstantFloat32(-1.0f),
+                             b.LoadConstantFloat32(-2.0f)),
+                       FLOAT64_TYPE));
+    b.Return();
+  });
+  test.Run([](PPCContext* ctx) {},
+           [](PPCContext* ctx) {
+             REQUIRE(ctx->f[3] == 2.0);
+             REQUIRE(ctx->f[4] == -2.0);
+             REQUIRE(ctx->f[5] == 2.0);
+             REQUIRE(ctx->f[6] == -2.0);
+           });
 }

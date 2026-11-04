@@ -13,6 +13,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <unordered_set>
 
 #include <wx/aui/framemanager.h>
 #include <wx/dnd.h>
@@ -140,6 +141,7 @@ class WxWindow : public Window {
   wxSize pending_resize_size_;
   bool cursor_currently_auto_hidden_ = false;
   bool menu_open_ = false;
+  std::unordered_set<VirtualKey> keys_down_;
   uint32_t dpi_ = 96;
   std::function<void()> content_visibility_callback_;
 

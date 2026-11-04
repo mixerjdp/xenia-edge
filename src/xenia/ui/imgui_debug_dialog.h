@@ -65,7 +65,6 @@ class ImGuiDebugDialog : public ImGuiGamepadDialog {
                           double value, bool clear_gpu_caches = false);
 
   void ApplyAnisoOverride(int32_t value);
-  void ApplyOQSaturation(double value);
   void ApplyOQLowerThreshold();
   void ApplyOQUpperThreshold();
   void ApplyLogLevel();
@@ -85,10 +84,10 @@ class ImGuiDebugDialog : public ImGuiGamepadDialog {
   bool submit_on_primary_buffer_end_;
   int32_t occlusion_query_fake_lower_threshold_;
   int32_t occlusion_query_fake_upper_threshold_;
-  double occlusion_query_saturation_;
   // Presentation / Display
   bool present_letterbox_;
   // Resolution Scaling / Resolve
+  bool readback_resolve_;
   bool draw_resolution_scaled_texture_offsets_;
   bool readback_resolve_half_pixel_offset_;
   bool resolve_resolution_scale_fill_half_pixel_offset_;

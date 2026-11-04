@@ -44,6 +44,9 @@ struct InputDeviceInfo {
   // encounter. Devices that should only be bound by explicit user action set
   // this to false.
   bool auto_bind = true;
+  // Subtype the device reports when read natively (XInput), 0 if the device
+  // has no native mode.
+  uint8_t native_subtype = 0;
 };
 
 class InputDriver {
@@ -70,6 +73,15 @@ class InputDriver {
   virtual void OnBoundToSlot(uint8_t /*driver_slot*/, uint32_t /*guest_slot*/) {
   }
   virtual void OnUnboundFromSlot(uint8_t /*driver_slot*/) {}
+
+  // Chooses between a device's native mode and the driver's own mapping.
+  virtual void SetNativeMode(uint8_t /*driver_slot*/, bool /*enabled*/) {}
+
+  // Drops queued keystrokes made while UI held the input so the title doesn't
+  // get them once it closes.
+  virtual void DiscardKeystrokes() {}
+  // Forgets keystrokes the previous title received or left queued.
+  virtual void ResetKeystrokes() {}
 
   // Drivers invoke NotifyDevicesChanged() after their EnumerateDevices result
   // changes (hotplug add/remove). InputSystem registers this callback during

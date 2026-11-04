@@ -12,16 +12,6 @@ msgstr ""
 "Plural-Forms: nplurals=3; plural=(n%10==1 && n%100!=11 ? 0 : n%10>=2 && "
 "n%10<=4 && (n%100<10 || n%100>=20) ? 1 : 2);\n"
 
-#: src/xenia/ui/game_list_panel_wx.cc:596
-msgid ""
-"\n"
-"\n"
-"Browse for the file?"
-msgstr ""
-"\n"
-"\n"
-"Потражи датотеку ручно?"
-
 #: src/xenia/ui/game_scan_progress_dialog_wx.cc:55
 msgid "   %zu already installed"
 msgstr "   већ инсталирано: %zu"
@@ -1659,3 +1649,139 @@ msgstr "Xenia се дистрибуира под %s"
 #: src/xenia/ui/game_info_panel_wx.cc:212
 msgid "Content"
 msgstr "Садржај"
+
+#: src/xenia/app/emulator_window.cc:405
+msgid "Alternate Guitar"
+msgstr "Алтернативна гитара"
+
+#: src/xenia/app/emulator_window.cc:407
+msgid "Bass Guitar"
+msgstr "Бас-гитара"
+
+#: src/xenia/app/emulator_window.cc:2027
+msgid ""
+"Original Xbox games run through XeFu, the Xbox 360's backward compatibility emulator, and %s is missing from its folder:\n"
+"\n"
+"%s\n"
+"\n"
+"Copy xbox.xex and the xefu*.xex files there from the Compatibility folder of an Xbox 360 hard drive."
+msgstr ""
+"Игре за оригинални Xbox покрећу се преко XeFu-а, емулатора уназадне компатибилности конзоле Xbox 360, али у његовој фасцикли недостаје %s:\n"
+"\n"
+"%s\n"
+"\n"
+"Копирајте тамо xbox.xex и датотеке xefu*.xex из фасцикле Compatibility на чврстом диску конзоле Xbox 360."
+
+#: src/xenia/app/emulator_window.cc:2034
+msgid "XeFu not found"
+msgstr "XeFu није пронађен"
+
+#: src/xenia/app/emulator_window.cc:3665
+msgid ""
+"Failed to launch title.\n"
+"\n"
+"Check xenia.log for technical details."
+msgstr ""
+"Покретање игре није успело.\n"
+"\n"
+"Техничке детаље потражите у датотеци xenia.log."
+
+#: src/xenia/app/emulator_window.cc:3664
+msgid "Title Launch Failed!"
+msgstr "Покретање игре није успело!"
+
+#: src/xenia/app/emulator_window.cc:2891
+msgid "Data migration"
+msgstr "Пренос података"
+
+#: src/xenia/app/emulator_window.cc:2891
+msgid ""
+"Some of your existing data couldn't be migrated to the new profile. Items that failed: %u\n"
+"\n"
+"Check xenia.log for technical details."
+msgstr ""
+"Неке ваше постојеће податке није било могуће пренети у нови профил. Неуспеле ставке: %u\n"
+"\n"
+"Техничке детаље потражите у датотеци xenia.log."
+
+#: src/xenia/app/emulator_window.cc:2897
+msgid "Your existing data was migrated to the new profile."
+msgstr "Ваши постојећи подаци су пренети у нови профил."
+
+#: src/xenia/ui/game_list_panel_wx.cc:441
+msgid ""
+"No file path is set for this title.\n"
+"\n"
+"Browse for the file?"
+msgstr ""
+"За ову игру није постављена путања датотеке.\n"
+"\n"
+"Потражи датотеку ручно?"
+
+#: src/xenia/ui/game_list_panel_wx.cc:442
+msgid ""
+"File not found:\n"
+"%s\n"
+"\n"
+"Browse for the file?"
+msgstr ""
+"Датотека није пронађена:\n"
+"%s\n"
+"\n"
+"Потражи датотеку ручно?"
+
+#: src/xenia/app/emulator_window.cc:2325
+msgid "Failed to read the system update."
+msgstr "Читање ажурирања система није успело."
+
+#: src/xenia/app/emulator_window.cc:2329
+msgid "Failed to write the system files."
+msgstr "Уписивање системских датотека није успело."
+
+#: src/xenia/app/emulator_window.cc:2296
+#: src/xenia/app/emulator_window.cc:2319
+#: src/xenia/app/emulator_window.cc:2324
+#: src/xenia/app/emulator_window.cc:2328
+#: src/xenia/app/emulator_window.cc:2333
+msgid "Install System Files"
+msgstr "Инсталација системских датотека"
+
+#: src/xenia/app/emulator_window.cc:1127
+msgid "Install System Files..."
+msgstr "Инсталирај системске датотеке…"
+
+#: src/xenia/app/emulator_window.cc:2297
+msgid "Installing the system files..."
+msgstr "Инсталирање системских датотека…"
+
+#: src/xenia/app/emulator_window.cc:2282
+msgid "Select a USB System Update"
+msgstr "Изабери ажурирање система за USB"
+
+#: src/xenia/app/emulator_window.cc:2310
+msgid "System files installed"
+msgstr "Системске датотеке су инсталиране"
+
+#: src/xenia/app/emulator_window.cc:2335
+msgid ""
+"The previous system files couldn't be put back in place. Move their folders back or delete them to install again. They are in:\n"
+"%s"
+msgstr ""
+"Претходне системске датотеке није било могуће вратити на место. Да бисте поновили инсталацију, преместите њихове фасцикле назад или их избришите. Налазе се у фасцикли:\n"
+"%s"
+
+#: src/xenia/app/emulator_window.cc:2311
+msgid ""
+"The system files are installed in:\n"
+"%s"
+msgstr ""
+"Системске датотеке су инсталиране у фасциклу:\n"
+"%s"
+
+#: src/xenia/app/emulator_window.cc:2320
+msgid "This file isn't a USB system update."
+msgstr "Ова датотека није ажурирање система за USB."
+
+#: src/xenia/app/emulator_window.cc:1035
+msgid "Start Dashboard"
+msgstr "Покрени Xbox контролну таблу"

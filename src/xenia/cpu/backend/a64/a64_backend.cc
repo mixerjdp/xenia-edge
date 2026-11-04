@@ -9,12 +9,13 @@
 
 #include "xenia/cpu/backend/a64/a64_backend.h"
 
+#include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstring>
 #include <utility>
 
 #include "xenia/base/assert.h"
-#include "xenia/base/atomic.h"
 #include "xenia/base/byte_order.h"
 #include "xenia/base/clock.h"
 #include "xenia/base/exception_handler.h"
@@ -39,6 +40,7 @@
 #include "xenia/cpu/backend/a64/a64_tracers.h"
 #include "xenia/cpu/backend/vrsqrte_table.h"
 #include "xenia/cpu/breakpoint.h"
+#include "xenia/cpu/mmio_handler.h"
 #include "xenia/cpu/ppc/ppc_context.h"
 #include "xenia/cpu/processor.h"
 #include "xenia/cpu/stack_walker.h"
@@ -94,15 +96,48 @@ class A64HelperEmitter : public A64Emitter {
 
   HostToGuestThunk EmitHostToGuestThunk();
   GuestToHostThunk EmitGuestToHostThunk();
+  GuestToHostThunk EmitGuestToHostThunkNoVec();
   ResolveFunctionThunk EmitResolveFunctionThunk();
   void* EmitGuestAndHostSynchronizeStackHelper();
+  void* EmitReturnToHostHelper();
   void* EmitVRsqrtefpHelper(void** out_vector_entry);
   void* EmitFrsqrteHelper();
+  void* EmitReservedStoreHelper(bool bit64, ReservedStoreFaultSite& fault_site);
+  ReservedStoreThunk EmitReservedStoreThunk(void* helper);
+
+ private:
+  // Clobbers x11. Installs the AAPCS64 default FPCR for host code.
+  void EmitEnterHostFpcr();
+  // Clobbers x11/x12. Reads FPCR back first and skips the msr, which is
+  // context-synchronizing, when it already holds fpcr_fpu.
+  void EmitRestoreFpuFpcr();
 };
 
 A64HelperEmitter::A64HelperEmitter(A64Backend* backend,
                                    XbyakA64Allocator* allocator)
     : A64Emitter(backend, allocator) {}
+
+void A64HelperEmitter::EmitEnterHostFpcr() {
+  // Host C code runs with the AAPCS64 default FPCR (round to nearest, no
+  // flush-to-zero), not the guest's scalar mode: mtfsf can put rounding
+  // controls or FPSCR.NI (FZ) in fpcr_fpu, which host code must not inherit.
+  Xbyak_aarch64::Label host_fpcr_ready;
+  mrs(x11, 3, 3, 4, 4, 0);  // mrs x11, FPCR
+  cbz(x11, host_fpcr_ready);
+  msr(3, 3, 4, 4, 0, xzr);
+  L(host_fpcr_ready);
+}
+
+void A64HelperEmitter::EmitRestoreFpuFpcr() {
+  Xbyak_aarch64::Label fpcr_unchanged;
+  ldr(w11,
+      ptr(x19, static_cast<uint32_t>(offsetof(A64BackendContext, fpcr_fpu))));
+  mrs(x12, 3, 3, 4, 4, 0);  // mrs x12, FPCR
+  cmp(w11, w12);
+  b(Xbyak_aarch64::EQ, fpcr_unchanged);
+  msr(3, 3, 4, 4, 0, x11);
+  L(fpcr_unchanged);
+}
 
 // --------------------------------------------------------------------------
 // HostToGuestThunk
@@ -161,11 +196,10 @@ HostToGuestThunk A64HelperEmitter::EmitHostToGuestThunk() {
   // x21 = virtual_membase (loaded from context)
   ldr(x21, ptr(x20, static_cast<int32_t>(
                         offsetof(ppc::PPCContext, virtual_membase))));
-  // Restore the guest scalar FPCR on every host->guest entry so host-side
-  // work done before the call can't leak a stale rounding / non-IEEE mode.
-  ldr(w11,
-      ptr(x19, static_cast<uint32_t>(offsetof(A64BackendContext, fpcr_fpu))));
-  msr(3, 3, 4, 4, 0, x11);
+  // Keep the host FPCR for the return, and enter in the guest's scalar mode.
+  mrs(x12, 3, 3, 4, 4, 0);  // mrs x12, FPCR
+  str(x12, ptr(sp, static_cast<uint32_t>(StackLayout::THUNK_HOST_FPCR)));
+  EmitRestoreFpuFpcr();
   // x0 still holds target, x2 holds return address.
   // The guest function's prolog stores x0 to GUEST_RET_ADDR on its stack
   // frame. Move the target to a scratch reg and put the guest return
@@ -176,6 +210,15 @@ HostToGuestThunk A64HelperEmitter::EmitHostToGuestThunk() {
 
   // Call the guest function.
   blr(x9);
+
+  // Host code after the guest returns runs in the host's FPCR, not the guest's.
+  Xbyak_aarch64::Label host_fpcr_restored;
+  ldr(x11, ptr(sp, static_cast<uint32_t>(StackLayout::THUNK_HOST_FPCR)));
+  mrs(x12, 3, 3, 4, 4, 0);  // mrs x12, FPCR
+  cmp(x11, x12);
+  b(Xbyak_aarch64::EQ, host_fpcr_restored);
+  msr(3, 3, 4, 4, 0, x11);
+  L(host_fpcr_restored);
 
   code_offsets.epilog = getSize();
 
@@ -260,6 +303,9 @@ GuestToHostThunk A64HelperEmitter::EmitGuestToHostThunk() {
   //   x29, x30     sp + 0x1C0
   //   Total: 0x1D0 = 464 bytes (16-byte aligned)
   const size_t g2h_stack = 464;
+  // x30's slot in the x29/x30 pair at the top of the frame.
+  constexpr int32_t lr_offset = 0x1C8;
+  static_assert(g2h_stack - lr_offset == StackLayout::THUNK_CALLER_RET_ADDR);
   sub(sp, sp, static_cast<uint32_t>(g2h_stack));
   code_offsets.prolog_stack_alloc = getSize();
 
@@ -279,9 +325,11 @@ GuestToHostThunk A64HelperEmitter::EmitGuestToHostThunk() {
   stp(Xbyak_aarch64::QReg(28), Xbyak_aarch64::QReg(29), ptr(sp, 0x180));
   stp(Xbyak_aarch64::QReg(30), Xbyak_aarch64::QReg(31), ptr(sp, 0x1A0));
   // Save x29/x30 (FP/LR).
-  stp(x29, x30, ptr(sp, 0x1C0));
+  stp(x29, x30, ptr(sp, lr_offset - 8));
 
   code_offsets.body = getSize();
+
+  EmitEnterHostFpcr();
 
   // Call host function.
   // AAPCS64: x0=first arg. We set x0=context (from x20).
@@ -293,14 +341,13 @@ GuestToHostThunk A64HelperEmitter::EmitGuestToHostThunk() {
   // Host callbacks may change FPCR. Restore the guest scalar FPCR before
   // resuming the JIT so later guest ops observe the cached PPC mode.
   // x19 (backend context) is callee-saved, so it survives the host call.
-  ldr(w11,
-      ptr(x19, static_cast<uint32_t>(offsetof(A64BackendContext, fpcr_fpu))));
-  msr(3, 3, 4, 4, 0, x11);
+  // x0 holds the host return value here and must not be touched.
+  EmitRestoreFpuFpcr();
 
   code_offsets.epilog = getSize();
 
   // Restore.
-  ldp(x29, x30, ptr(sp, 0x1C0));
+  ldp(x29, x30, ptr(sp, lr_offset - 8));
   ldp(Xbyak_aarch64::QReg(30), Xbyak_aarch64::QReg(31), ptr(sp, 0x1A0));
   ldp(Xbyak_aarch64::QReg(28), Xbyak_aarch64::QReg(29), ptr(sp, 0x180));
   ldp(Xbyak_aarch64::QReg(26), Xbyak_aarch64::QReg(27), ptr(sp, 0x160));
@@ -330,7 +377,65 @@ GuestToHostThunk A64HelperEmitter::EmitGuestToHostThunk() {
   func_info.prolog_stack_alloc_offset =
       code_offsets.prolog_stack_alloc - code_offsets.prolog;
   func_info.stack_size = g2h_stack;
-  func_info.lr_save_offset = 0x1C8;  // stp x29, x30, [sp, #0x1C0]
+  func_info.lr_save_offset = lr_offset;
+
+  void* fn = Emplace(func_info);
+  return reinterpret_cast<GuestToHostThunk>(fn);
+}
+
+// --------------------------------------------------------------------------
+// GuestToHostThunkNoVec
+// --------------------------------------------------------------------------
+// GuestToHostThunk without the q4-q31 save/restore, for CallExtern. No HIR
+// value is live in a vector register across a call: guest-to-guest calls are
+// a bare blr into a callee that uses q4-q31 freely, and ContextPromotionPass
+// stops at the first volatile instruction. CallExtern checks and takes the
+// full thunk where a value is live anyway. CallNativeSafe, which sequences
+// emit with operands in flight, always takes the full thunk.
+GuestToHostThunk A64HelperEmitter::EmitGuestToHostThunkNoVec() {
+  struct {
+    size_t prolog;
+    size_t prolog_stack_alloc;
+    size_t body;
+    size_t epilog;
+    size_t tail;
+  } code_offsets = {};
+
+  code_offsets.prolog = getSize();
+
+  const size_t g2h_stack = 16;  // x29/x30 only
+  constexpr int32_t lr_offset = 0x08;
+  static_assert(g2h_stack - lr_offset == StackLayout::THUNK_CALLER_RET_ADDR);
+  sub(sp, sp, static_cast<uint32_t>(g2h_stack));
+  code_offsets.prolog_stack_alloc = getSize();
+  stp(x29, x30, ptr(sp, lr_offset - 8));
+
+  code_offsets.body = getSize();
+
+  EmitEnterHostFpcr();
+  mov(x9, x0);   // x9 = target function (scratch)
+  mov(x0, x20);  // x0 = PPCContext*
+  blr(x9);
+  EmitRestoreFpuFpcr();
+
+  code_offsets.epilog = getSize();
+
+  ldp(x29, x30, ptr(sp, lr_offset - 8));
+  add(sp, sp, static_cast<uint32_t>(g2h_stack));
+  ret();
+
+  code_offsets.tail = getSize();
+
+  EmitFunctionInfo func_info = {};
+  func_info.code_size.total = getSize();
+  func_info.code_size.prolog = code_offsets.body - code_offsets.prolog;
+  func_info.code_size.body = code_offsets.epilog - code_offsets.body;
+  func_info.code_size.epilog = code_offsets.tail - code_offsets.epilog;
+  func_info.code_size.tail = getSize() - code_offsets.tail;
+  func_info.prolog_stack_alloc_offset =
+      code_offsets.prolog_stack_alloc - code_offsets.prolog;
+  func_info.stack_size = g2h_stack;
+  func_info.lr_save_offset = lr_offset;
 
   void* fn = Emplace(func_info);
   return reinterpret_cast<GuestToHostThunk>(fn);
@@ -377,6 +482,10 @@ ResolveFunctionThunk A64HelperEmitter::EmitResolveFunctionThunk() {
   blr(x9);
   // x0 now holds the resolved host machine code address.
   mov(x9, x0);
+
+  // The resolved function is entered in the scalar FPU mode, and the host
+  // resolve may have changed FPCR.
+  EmitRestoreFpuFpcr();
 
   code_offsets.epilog = getSize();
 
@@ -479,6 +588,52 @@ void* A64HelperEmitter::EmitGuestAndHostSynchronizeStackHelper() {
   L(underflow);
   // Should be impossible — stackpoint array underflowed.
   brk(0xF001);  // assertion failure
+
+  code_offsets.epilog = getSize();
+  code_offsets.tail = getSize();
+
+  EmitFunctionInfo func_info = {};
+  func_info.code_size.total = getSize();
+  func_info.code_size.prolog = code_offsets.body - code_offsets.prolog;
+  func_info.code_size.body = code_offsets.epilog - code_offsets.body;
+  func_info.code_size.epilog = code_offsets.tail - code_offsets.epilog;
+  func_info.code_size.tail = getSize() - code_offsets.tail;
+  func_info.prolog_stack_alloc_offset =
+      code_offsets.prolog_stack_alloc - code_offsets.prolog;
+  func_info.stack_size = 0;
+
+  return Emplace(func_info);
+}
+
+// --------------------------------------------------------------------------
+// ReturnToHostHelper
+// --------------------------------------------------------------------------
+// Branched to in place of a dynamic code target that is the host return
+// address. ResolveHostReturn recorded the frame host code entered, which
+// returns there as its epilog would.
+void* A64HelperEmitter::EmitReturnToHostHelper() {
+  struct {
+    size_t prolog;
+    size_t prolog_stack_alloc;
+    size_t body;
+    size_t epilog;
+    size_t tail;
+  } code_offsets = {};
+
+  code_offsets.prolog = getSize();
+  code_offsets.prolog_stack_alloc = getSize();
+  code_offsets.body = getSize();
+
+  ldr(w9, ptr(x19, static_cast<uint32_t>(offsetof(
+                       A64BackendContext, host_return_stackpoint_depth))));
+  str(w9, ptr(x19, static_cast<uint32_t>(
+                       offsetof(A64BackendContext, current_stackpoint_depth))));
+  ldr(x30, ptr(x19, static_cast<uint32_t>(
+                        offsetof(A64BackendContext, host_return_address))));
+  ldr(x9, ptr(x19, static_cast<uint32_t>(
+                       offsetof(A64BackendContext, host_return_stack))));
+  mov(sp, x9);
+  ret();
 
   code_offsets.epilog = getSize();
   code_offsets.tail = getSize();
@@ -779,6 +934,184 @@ void* A64HelperEmitter::EmitFrsqrteHelper() {
   return Emplace(func_info);
 }
 
+// w12 = guest address, x1 = host address, x2 = value
+// w0 = 1 if the store landed. Clobbers x0-x3, x8-x17 and the flags.
+void* A64HelperEmitter::EmitReservedStoreHelper(
+    bool bit64, ReservedStoreFaultSite& fault_site) {
+  using namespace Xbyak_aarch64;
+  struct {
+    size_t prolog;
+    size_t prolog_stack_alloc;
+    size_t body;
+    size_t epilog;
+    size_t tail;
+  } code_offsets = {};
+  code_offsets.prolog = getSize();
+  code_offsets.prolog_stack_alloc = getSize();
+  code_offsets.body = getSize();
+
+  auto bctx = [this](size_t offset) {
+    return ptr(x19, static_cast<uint32_t>(offset));
+  };
+  constexpr uint32_t kReserveFlagBit = 1u << kA64BackendHasReserveBit;
+  const bool lse = IsFeatureEnabled(kA64EmitLSE);
+  Label fail, release_fail, claim_mismatch, value_mismatch;
+
+  // stwcx. always clears the reservation, stored or not
+  ldr(w8, bctx(offsetof(A64BackendContext, flags)));
+  and_(w9, w8, static_cast<uint64_t>(~kReserveFlagBit));
+  str(w9, bctx(offsetof(A64BackendContext, flags)));
+  tst(w8, static_cast<uint64_t>(kReserveFlagBit));
+  b(EQ, fail);
+
+  // the reservation must be for the address we're storing to
+  ldr(w10, bctx(offsetof(A64BackendContext, reserve_address)));
+  cmp(w10, w12);
+  b(NE, fail);
+
+  ldr(x11, bctx(offsetof(A64BackendContext, reserve_helper_)));
+  ubfx(w13, w12, A64_RESERVE_GRANULE_SHIFT, A64_RESERVE_ENTRY_BITS);
+  add(x11, x11, x13, LSL, 2);
+  // claim the generation (even to odd) so no other store can land until we
+  // publish the next even value, odd snapshots always fail
+  ldr(w15, bctx(offsetof(A64BackendContext, reserve_generation)));
+  tbnz(w15, 0, fail);
+  add(w17, w15, 1);
+
+  // a fault here leaves the claim in x11 and w17 for the handler
+  size_t first_access;
+  size_t last_access;
+  if (lse) {
+    mov(w14, w15);
+    casal(w14, w17, ptr(x11));
+    cmp(w14, w15);
+    b(NE, fail);
+
+    ldr(x16, bctx(offsetof(A64BackendContext, cached_reserve_value_)));
+    // casal returns the old value in the compare register, so keep a copy
+    mov(x3, x16);
+    first_access = getSize();
+    last_access = first_access;
+    if (bit64) {
+      casal(x16, x2, ptr(x1));
+      cmp(x16, x3);
+    } else {
+      casal(w16, w2, ptr(x1));
+      cmp(w16, w3);
+    }
+    b(NE, release_fail);
+  } else {
+    Label claim_retry, cas_retry;
+    L(claim_retry);
+    ldaxr(w14, ptr(x11));
+    cmp(w14, w15);
+    b(NE, claim_mismatch);
+    stlxr(w13, w17, ptr(x11));
+    cbnz(w13, claim_retry);
+
+    ldr(x16, bctx(offsetof(A64BackendContext, cached_reserve_value_)));
+    L(cas_retry);
+    first_access = getSize();
+    if (bit64) {
+      ldaxr(x14, ptr(x1));
+      cmp(x14, x16);
+      b(NE, value_mismatch);
+      last_access = getSize();
+      stlxr(w15, x2, ptr(x1));
+    } else {
+      ldaxr(w14, ptr(x1));
+      cmp(w14, w16);
+      b(NE, value_mismatch);
+      last_access = getSize();
+      stlxr(w15, w2, ptr(x1));
+    }
+    cbnz(w15, cas_retry);
+  }
+
+  add(w17, w17, 1);
+  stlr(w17, ptr(x11));
+  mov(w0, 1);
+  ret();
+
+  if (!lse) {
+    // ldaxr compare failed, drop the exclusive monitor
+    L(claim_mismatch);
+    clrex(15);
+    b(fail);
+    L(value_mismatch);
+    clrex(15);
+  }
+  // claimed, so publish even on failure
+  L(release_fail);
+  add(w17, w17, 1);
+  stlr(w17, ptr(x11));
+  const size_t fail_offset = getSize();
+  L(fail);
+  mov(w0, 0);
+  ret();
+
+  code_offsets.epilog = getSize();
+  code_offsets.tail = getSize();
+
+  EmitFunctionInfo func_info = {};
+  func_info.code_size.total = getSize();
+  func_info.code_size.prolog = code_offsets.body - code_offsets.prolog;
+  func_info.code_size.body = code_offsets.epilog - code_offsets.body;
+  func_info.code_size.epilog = code_offsets.tail - code_offsets.epilog;
+  func_info.code_size.tail = getSize() - code_offsets.tail;
+  func_info.prolog_stack_alloc_offset =
+      code_offsets.prolog_stack_alloc - code_offsets.prolog;
+  func_info.stack_size = 0;
+
+  auto helper = reinterpret_cast<uint8_t*>(Emplace(func_info));
+  fault_site.first_access = reinterpret_cast<uint64_t>(helper + first_access);
+  fault_site.last_access = reinterpret_cast<uint64_t>(helper + last_access);
+  fault_site.fail = reinterpret_cast<uint64_t>(helper + fail_offset);
+  return helper;
+}
+
+// Puts host arguments where the stwcx. helper takes them, so a fault in a host
+// store is released the same way as one in guest code.
+// w0 = guest address, x1 = context, x2 = value, x3 = host address
+ReservedStoreThunk A64HelperEmitter::EmitReservedStoreThunk(void* helper) {
+  struct {
+    size_t prolog;
+    size_t prolog_stack_alloc;
+    size_t body;
+    size_t epilog;
+    size_t tail;
+  } code_offsets = {};
+  code_offsets.prolog = getSize();
+  sub(sp, sp, static_cast<uint32_t>(16));
+  code_offsets.prolog_stack_alloc = getSize();
+  stp(x19, x30, ptr(sp, 0x00));
+  code_offsets.body = getSize();
+
+  sub(x19, x1, static_cast<uint32_t>(sizeof(A64BackendContext)));
+  mov(w12, w0);
+  mov(x1, x3);
+  mov(x9, reinterpret_cast<uint64_t>(helper));
+  blr(x9);
+
+  code_offsets.epilog = getSize();
+  ldp(x19, x30, ptr(sp, 0x00));
+  add(sp, sp, static_cast<uint32_t>(16));
+  ret();
+  code_offsets.tail = getSize();
+
+  EmitFunctionInfo func_info = {};
+  func_info.code_size.total = getSize();
+  func_info.code_size.prolog = code_offsets.body - code_offsets.prolog;
+  func_info.code_size.body = code_offsets.epilog - code_offsets.body;
+  func_info.code_size.epilog = code_offsets.tail - code_offsets.epilog;
+  func_info.code_size.tail = getSize() - code_offsets.tail;
+  func_info.prolog_stack_alloc_offset =
+      code_offsets.prolog_stack_alloc - code_offsets.prolog;
+  func_info.stack_size = 16;
+
+  return reinterpret_cast<ReservedStoreThunk>(Emplace(func_info));
+}
+
 // ==========================================================================
 // Reservation helpers. A global per-granule generation counter so
 // cross-thread stores invalidate other threads' reservations. A CAS on the
@@ -800,10 +1133,9 @@ std::atomic<uint32_t>& ReserveGranule(ReserveHelper* reserve_helper,
 uint64_t TryAcquireReservationHelper(void* raw_context,
                                      uint64_t guest_address) {
   auto* bctx = BackendContextFromRawContext(raw_context);
-  auto& granule =
-      ReserveGranule(bctx->reserve_helper_, uint32_t(guest_address));
   // snapshot the generation first, the acquire pins the value read after
-  bctx->reserve_generation = granule.load(std::memory_order_acquire);
+  bctx->reserve_generation = AwaitReserveGranule(
+      ReserveGranule(bctx->reserve_helper_, uint32_t(guest_address)));
   bctx->reserve_address = uint32_t(guest_address);
   // lwarx replaces any reservation this thread already held
   bctx->flags |= 1u << kA64BackendHasReserveBit;
@@ -820,45 +1152,30 @@ T ReservedLoadImpl(ppc::PPCContext* context, uint32_t address) {
   return xe::byte_swap(raw);
 }
 
-template <typename T>
-uint64_t ReservedStoreImpl(void* raw_context, uint64_t guest_address,
-                           uint64_t host_address, uint64_t value) {
+}  // namespace
+
+uint64_t A64Backend::AwaitReservation(void* raw_context,
+                                      uint64_t guest_address) {
   auto* bctx = BackendContextFromRawContext(raw_context);
-  const uint32_t reserve_flag = 1u << kA64BackendHasReserveBit;
-  const bool had_reservation = (bctx->flags & reserve_flag) != 0;
-  // stwcx. always clears the reservation, stored or not
-  bctx->flags &= ~reserve_flag;
-  // the reservation must be for the address we're storing to
-  if (!had_reservation || bctx->reserve_address != uint32_t(guest_address)) {
-    return 0;
-  }
-
-  auto& granule =
-      ReserveGranule(bctx->reserve_helper_, uint32_t(guest_address));
-  // a store to this granule since our lwarx kills the reservation
-  if (granule.load(std::memory_order_acquire) != bctx->reserve_generation) {
-    return 0;
-  }
-
-  bool exchange_ok;
-  if constexpr (sizeof(T) == sizeof(uint64_t)) {
-    exchange_ok = xe::atomic_cas(
-        bctx->cached_reserve_value_, uint64_t(value),
-        reinterpret_cast<volatile uint64_t*>(uintptr_t(host_address)));
-  } else {
-    exchange_ok = xe::atomic_cas(
-        uint32_t(bctx->cached_reserve_value_), uint32_t(value),
-        reinterpret_cast<volatile uint32_t*>(uintptr_t(host_address)));
-  }
-
-  if (exchange_ok) {
-    // the store landed, so kill other reservations on this granule
-    granule.fetch_add(1, std::memory_order_release);
-  }
-  return exchange_ok ? 1 : 0;
+  bctx->reserve_generation = AwaitReserveGranule(
+      ReserveGranule(bctx->reserve_helper_, uint32_t(guest_address)));
+  return 0;
 }
 
-}  // namespace
+uint64_t A64Backend::ReleaseFaultingReservedStore(void* data, Exception* ex) {
+  auto* backend = reinterpret_cast<A64Backend*>(data);
+  for (const auto& site : backend->reserved_store_fault_sites_) {
+    if (ex->pc() < site.first_access || ex->pc() > site.last_access) {
+      continue;
+    }
+    // x11 = the claimed granule, w17 = its odd generation
+    const HostThreadContext& context = *ex->thread_context();
+    reinterpret_cast<std::atomic<uint32_t>*>(context.x[11])
+        ->store(uint32_t(context.x[17]) + 1, std::memory_order_release);
+    return site.fail;
+  }
+  return 0;
+}
 
 uint32_t A64Backend::ReservedLoad32(ppc::PPCContext* context,
                                     uint32_t address) {
@@ -872,25 +1189,42 @@ uint64_t A64Backend::ReservedLoad64(ppc::PPCContext* context,
 
 bool A64Backend::ReservedStore32(ppc::PPCContext* context, uint32_t address,
                                  uint32_t value) {
-  return ReservedStoreImpl<uint32_t>(
-             context, address,
-             reinterpret_cast<uint64_t>(
-                 context->TranslateVirtual<uint32_t*>(address)),
-             xe::byte_swap(value)) != 0;
+  return reserved_store_32_thunk_(
+      address, context, xe::byte_swap(value),
+      context->TranslateVirtual<uint32_t*>(address));
 }
 
 bool A64Backend::ReservedStore64(ppc::PPCContext* context, uint32_t address,
                                  uint64_t value) {
-  return ReservedStoreImpl<uint64_t>(
-             context, address,
-             reinterpret_cast<uint64_t>(
-                 context->TranslateVirtual<uint64_t*>(address)),
-             xe::byte_swap(value)) != 0;
+  return reserved_store_64_thunk_(
+      address, context, xe::byte_swap(value),
+      context->TranslateVirtual<uint64_t*>(address));
 }
 
 // ==========================================================================
 // ResolveFunction — runtime function resolution.
 // ==========================================================================
+
+// The function the live frame stackpoints[index] runs, from the address its
+// call into the next frame returns to, or else its call into host code.
+static A64Function* LookupFrameFunction(A64Backend* backend,
+                                        const A64BackendStackpoint* stackpoints,
+                                        uint32_t index, uint32_t depth) {
+  auto* code_cache = backend->code_cache();
+  if (index + 1 < depth) {
+    // The next frame's prolog saved it, unless host code entered that frame.
+    if (auto* function = static_cast<A64Function*>(
+            code_cache->LookupFunction(*reinterpret_cast<const uint64_t*>(
+                stackpoints[index + 1].host_stack_ +
+                StackLayout::HOST_RET_ADDR)))) {
+      return function;
+    }
+  }
+  // Otherwise the frame is in a call through a thunk, which saved x30 below it.
+  return static_cast<A64Function*>(code_cache->LookupFunction(
+      *reinterpret_cast<const uint64_t*>(stackpoints[index].host_stack_ -
+                                         StackLayout::THUNK_CALLER_RET_ADDR)));
+}
 
 // Where a return site in an already translated function continues, when the
 // guest is unwinding to it past more than one frame, or 0. The caller decides
@@ -907,22 +1241,35 @@ static uint64_t ResolveLongjmp(ppc::PPCContext* guest_context,
   }
   const uint32_t live_frames =
       backend_context->current_stackpoint_depth - pending_pops;
-  for (auto* entry : processor->FindFunctionsWithAddress(target_address)) {
-    auto* afunc = static_cast<A64Function*>(entry);
-    const uintptr_t host_address =
-        afunc->MapGuestAddressToMachineCode(target_address);
-    if (!host_address || afunc->machine_code() ==
-                             reinterpret_cast<const uint8_t*>(host_address)) {
+  const A64BackendStackpoint* stackpoints = backend_context->stackpoints;
+  const uint32_t stack_pointer = static_cast<uint32_t>(guest_context->r[1]);
+  const uint32_t sync_depth =
+      FindStackpointSyncDepth(stackpoints, live_frames, stack_pointer);
+  if (!sync_depth) {
+    return 0;
+  }
+  // The target's code only fits the frame of the function it was translated
+  // in. r1 alone can name the wrong frame: a callee entered at the stack
+  // pointer longjmp restores records the same r1 as its caller runs at, and
+  // XeFu's generated code keeps the x86 stack pointer in r1.
+  for (uint32_t i = sync_depth; i-- > 0;) {
+    // The frame longjmp returns to made a call, so it runs below the stack
+    // pointer it was entered with.
+    if (stackpoints[i].guest_stack_ <= stack_pointer) {
       continue;
     }
-    const uint32_t sync_depth =
-        FindStackpointSyncDepth(backend_context->stackpoints, live_frames,
-                                static_cast<uint32_t>(guest_context->r[1]));
-    if (sync_depth != 0) {
-      backend_context->pending_stackpoint_sync_depth = sync_depth;
+    auto* function = LookupFrameFunction(backend, stackpoints, i, live_frames);
+    // Landing on a function's first instruction would skip its prolog.
+    if (!function || function->address() == target_address) {
+      continue;
+    }
+    // A function's range can hold unreachable instructions it has no code for.
+    if (const uintptr_t host_address =
+            function->MapGuestAddressToMachineCode(target_address)) {
+      // The stack synchronization helper at the target restores this frame.
+      backend_context->pending_stackpoint_sync_depth = i + 1;
       return host_address;
     }
-    break;
   }
   return 0;
 }
@@ -964,24 +1311,44 @@ uint64_t ResolveFunction(void* raw_context, uint64_t target_address) {
   return reinterpret_cast<uint64_t>(code);
 }
 
-// Where a dynamic code branch to the instruction after a call continues in
-// translated code, or 0. While the frame of that call is live, the branch
-// returns into it however many frames it skips or bytes the callee popped, and
-// the stack synchronization helper at the target restores the calling frame
-// recorded here. Once the call has returned, as for setjmp, the guest stack
-// decides how far to unwind. |pending_pops| is how many stackpoints the branch
-// still pops after resolving. |out_is_return_site| tells the caller whether the
-// target follows a call, which is never worth caching.
-static uint64_t ResolveDynamicReturn(ppc::PPCContext* guest_context,
-                                     uint32_t target_address,
-                                     uint32_t pending_pops,
-                                     bool* out_is_return_site) {
-  *out_is_return_site = false;
-  if (!cvars::a64_enable_host_guest_stack_synchronization) {
-    return 0;
+// Where a dynamic code branch to kHostReturnAddress continues, or 0. Guest code
+// can divert its return and branch to the saved address from deeper frames, as
+// XeFu's trap handler does, so the branch returns to host code from the
+// innermost frame host code entered. That can be the frame a tail branch is
+// about to pop, which returning pops anyway.
+static uint64_t ResolveHostReturn(ppc::PPCContext* guest_context) {
+  auto* backend = static_cast<A64Backend*>(guest_context->processor->backend());
+  auto* backend_context = backend->BackendContextForGuestContext(guest_context);
+  const uint32_t depth = backend_context->current_stackpoint_depth;
+  for (uint32_t i = depth; i-- > 0;) {
+    const uint64_t frame = backend_context->stackpoints[i].host_stack_;
+    // A tail call passes the address on to the function taking the frame.
+    if (*reinterpret_cast<const uint32_t*>(
+            frame + StackLayout::GUEST_RET_ADDR) != kHostReturnAddress) {
+      continue;
+    }
+    auto* function =
+        LookupFrameFunction(backend, backend_context->stackpoints, i, depth);
+    if (!function) {
+      return 0;
+    }
+    backend_context->host_return_stackpoint_depth = i;
+    backend_context->host_return_stack = frame + function->stack_size();
+    backend_context->host_return_address =
+        *reinterpret_cast<const uint64_t*>(frame + StackLayout::HOST_RET_ADDR);
+    return reinterpret_cast<uint64_t>(backend->return_to_host_helper());
   }
-  auto* processor = guest_context->processor;
-  auto* backend = static_cast<A64Backend*>(processor->backend());
+  return 0;
+}
+
+// The host address in a live frame that a dynamic code branch to the
+// instruction after its call returns to, or 0. The branch returns there however
+// many frames it skips or bytes the callee popped. The stack synchronization
+// helper at the target restores the calling frame recorded here.
+// |pending_pops| is how many stackpoints the branch still pops after resolving.
+static uint64_t FindLiveReturn(ppc::PPCContext* guest_context,
+                               uint32_t target_address, uint32_t pending_pops) {
+  auto* backend = static_cast<A64Backend*>(guest_context->processor->backend());
   auto* backend_context = backend->BackendContextForGuestContext(guest_context);
   const uint32_t depth = backend_context->current_stackpoint_depth;
   const uint32_t live_frames = depth > pending_pops ? depth - pending_pops : 0;
@@ -1017,14 +1384,37 @@ static uint64_t ResolveDynamicReturn(ppc::PPCContext* guest_context,
     }
   }
   if (found_host_address) {
-    // Matching a recorded return address proves the target follows a call.
-    *out_is_return_site = true;
     // The helper restores stackpoints[depth - 1], so this names the calling
     // frame, whose record is the host stack it called with because a64 records
     // one after the prolog allocation.
     backend_context->pending_stackpoint_sync_depth = found_index;
-    return found_host_address;
   }
+  return found_host_address;
+}
+
+// Where a dynamic code branch to the instruction after a call continues in
+// translated code, or 0. While the frame of that call is live, the branch
+// returns into it. Once the call has returned, as for setjmp, the guest stack
+// decides how far to unwind. |pending_pops| is as for FindLiveReturn and
+// |out_is_return_site| tells the caller whether the target follows a call.
+static uint64_t ResolveDynamicReturn(ppc::PPCContext* guest_context,
+                                     uint32_t target_address,
+                                     uint32_t pending_pops,
+                                     bool* out_is_return_site) {
+  *out_is_return_site = false;
+  if (!cvars::a64_enable_host_guest_stack_synchronization) {
+    return 0;
+  }
+  if (target_address == kHostReturnAddress) {
+    return ResolveHostReturn(guest_context);
+  }
+  if (uint64_t host_address =
+          FindLiveReturn(guest_context, target_address, pending_pops)) {
+    // Matching a recorded return address proves the target follows a call.
+    *out_is_return_site = true;
+    return host_address;
+  }
+  auto* processor = guest_context->processor;
 
   // Dynamic code has no instruction flags, so recognize the call before it.
   if (target_address < 4) {
@@ -1052,19 +1442,39 @@ static uint32_t DynamicCallCacheIndex(uint32_t guest_address) {
          (kA64DynamicCallCacheSize - 1);
 }
 
-// Resolves a target without an indirection slot and caches it per thread.
+// Resolves a target without an indirection slot and caches it per thread. A
+// direct bl is never a return and skips the return site checks.
 static uint64_t ResolveDynamicFunction(void* raw_context,
                                        uint64_t target_address,
-                                       uint32_t pending_pops) {
+                                       uint32_t pending_pops,
+                                       bool direct = false) {
   auto guest_context = reinterpret_cast<ppc::PPCContext*>(raw_context);
   bool is_return_site = false;
-  if (uint64_t return_address = ResolveDynamicReturn(
-          guest_context, static_cast<uint32_t>(target_address), pending_pops,
-          &is_return_site)) {
-    return return_address;
+  if (!direct) {
+    if (uint64_t return_address = ResolveDynamicReturn(
+            guest_context, static_cast<uint32_t>(target_address), pending_pops,
+            &is_return_site)) {
+      static_cast<A64Backend*>(guest_context->processor->backend())
+          ->BackendContextForGuestContext(raw_context)
+          ->dynamic_target_in_body = 1;
+      return return_address;
+    }
   }
+  const uint64_t sweep_count = guest_context->processor->code_sweep_count();
   auto function = guest_context->processor->ResolveFunction(
       static_cast<uint32_t>(target_address));
+  bool redirected = false;
+  if (!function || !function->is_guest()) {
+    // The guest can handle the fetch fault and continue the call elsewhere.
+    if (auto hook = guest_context->processor->code_fault_hook()) {
+      if (const uint32_t resume_address =
+              hook(guest_context, static_cast<uint32_t>(target_address))) {
+        target_address = resume_address;
+        function = guest_context->processor->ResolveFunction(resume_address);
+        redirected = true;
+      }
+    }
+  }
   if (!function || !function->is_guest()) {
     XELOGE("No guest code at {:08X} for a dynamic call",
            static_cast<uint32_t>(target_address));
@@ -1072,23 +1482,37 @@ static uint64_t ResolveDynamicFunction(void* raw_context,
   }
   const uint64_t host_address = reinterpret_cast<uint64_t>(
       static_cast<A64Function*>(function)->machine_code());
+  // A redirect isn't cached, since the checks above were for the original
+  // target.
+  if (redirected) {
+    return host_address;
+  }
   auto backend = static_cast<A64Backend*>(guest_context->processor->backend());
   auto bctx = backend->BackendContextForGuestContext(raw_context);
   if (!bctx->dynamic_call_cache) {
     bctx->dynamic_call_cache =
         new A64DynamicCallCacheEntry[kA64DynamicCallCacheSize];
     for (uint32_t i = 0; i < kA64DynamicCallCacheSize; ++i) {
-      bctx->dynamic_call_cache[i] = {UINT32_MAX, 0, 0};
+      bctx->dynamic_call_cache[i] = {UINT32_MAX, kA64DynamicCallAny, 0};
     }
   }
-  // A return resolves to an address that is only valid for the unwind that
-  // reached it, and caching the site would skip that unwind on every later
-  // return, so only targets a call can reach are cached.
-  if (!is_return_site) {
-    auto& entry = bctx->dynamic_call_cache[DynamicCallCacheIndex(
-        static_cast<uint32_t>(target_address))];
-    entry.host_address = host_address;
-    entry.guest_address = static_cast<uint32_t>(target_address);
+  // An unwind lands at an address only valid for the frame it found and is
+  // never cached. A return site's entry has a branch look for a live frame
+  // first.
+  auto& entry = bctx->dynamic_call_cache[DynamicCallCacheIndex(
+      static_cast<uint32_t>(target_address))];
+  entry.host_address = host_address;
+  entry.kind = direct           ? kA64DynamicCallDirectOnly
+               : is_return_site ? kA64DynamicCallReturnSite
+                                : kA64DynamicCallAny;
+  entry.guest_address = static_cast<uint32_t>(target_address);
+  // A sweep since the resolve began may have dropped the function before the
+  // entry was there for it to clear. The fence pairs with the sweep's count
+  // bump before it clears entries.
+  std::atomic_thread_fence(std::memory_order_seq_cst);
+  if (guest_context->processor->code_sweep_count() != sweep_count) {
+    entry.host_address = 0;
+    entry.guest_address = UINT32_MAX;
   }
   return host_address;
 }
@@ -1097,9 +1521,65 @@ uint64_t ResolveDynamicCall(void* raw_context, uint64_t target_address) {
   return ResolveDynamicFunction(raw_context, target_address, 0);
 }
 
+uint64_t ResolveDirectDynamicCall(void* raw_context, uint64_t target_address) {
+  return ResolveDynamicFunction(raw_context, target_address, 0, true);
+}
+
 // A tail branch pops the current function's stackpoint after resolving.
 uint64_t ResolveDynamicTailCall(void* raw_context, uint64_t target_address) {
   return ResolveDynamicFunction(raw_context, target_address, 1);
+}
+
+// Whether ResolveLongjmp could land a branch inside a function body, which
+// takes the top two live frames being below r1.
+static bool MayResolveLongjmp(ppc::PPCContext* guest_context,
+                              uint32_t pending_pops) {
+  auto bctx = static_cast<A64Backend*>(guest_context->processor->backend())
+                  ->BackendContextForGuestContext(guest_context);
+  const uint32_t depth = bctx->current_stackpoint_depth;
+  if (depth < pending_pops + 3) {
+    return false;
+  }
+  const uint32_t top = depth - pending_pops - 1;
+  const uint32_t stack_pointer = static_cast<uint32_t>(guest_context->r[1]);
+  return stack_pointer > bctx->stackpoints[top].guest_stack_ &&
+         stack_pointer > bctx->stackpoints[top - 1].guest_stack_;
+}
+
+// A branch to a return site with a cached function takes the function unless
+// a live frame returns there or a longjmp could land in a body, which the full
+// resolve handles.
+static uint64_t ResolveCachedReturnSite(void* raw_context,
+                                        uint64_t target_address,
+                                        uint32_t pending_pops) {
+  auto guest_context = reinterpret_cast<ppc::PPCContext*>(raw_context);
+  auto bctx = static_cast<A64Backend*>(guest_context->processor->backend())
+                  ->BackendContextForGuestContext(raw_context);
+  const uint32_t target = static_cast<uint32_t>(target_address);
+  if (uint64_t host_address =
+          FindLiveReturn(guest_context, target, pending_pops)) {
+    bctx->dynamic_target_in_body = 1;
+    return host_address;
+  }
+  // Read once, as another thread can invalidate the entry meanwhile.
+  const auto& entry = bctx->dynamic_call_cache[DynamicCallCacheIndex(target)];
+  const uint64_t cached_address = entry.host_address;
+  if (MayResolveLongjmp(guest_context, pending_pops) ||
+      entry.guest_address != target ||
+      entry.kind != kA64DynamicCallReturnSite || !cached_address) {
+    return ResolveDynamicFunction(raw_context, target_address, pending_pops);
+  }
+  return cached_address;
+}
+
+uint64_t ResolveCachedReturnSiteCall(void* raw_context,
+                                     uint64_t target_address) {
+  return ResolveCachedReturnSite(raw_context, target_address, 0);
+}
+
+uint64_t ResolveCachedReturnSiteTail(void* raw_context,
+                                     uint64_t target_address) {
+  return ResolveCachedReturnSite(raw_context, target_address, 1);
 }
 
 // ==========================================================================
@@ -1187,6 +1667,10 @@ A64Backend::A64Backend() {
 
 A64Backend::~A64Backend() {
   ExceptionHandler::Uninstall(&ExceptionCallbackThunk, this);
+  // gone if Memory was torn down first
+  if (auto mmio_handler = MMIOHandler::global_handler()) {
+    mmio_handler->SetReservedStoreFaultCallback(nullptr, nullptr);
+  }
   if (guest_trampoline_memory_) {
     memory::DeallocFixed(guest_trampoline_memory_,
                          kGuestTrampolineSize * MAX_GUEST_TRAMPOLINES,
@@ -1235,12 +1719,15 @@ bool A64Backend::Initialize(Processor* processor) {
   XbyakA64Allocator allocator;
   A64HelperEmitter thunk_emitter(this, &allocator);
 
+  // First, at offset 0 of the code cache, so that an encoded slot of 0 names
+  // it. See CommitIndirectionChunks.
+  resolve_function_thunk_ = thunk_emitter.EmitResolveFunctionThunk();
   host_to_guest_thunk_ = thunk_emitter.EmitHostToGuestThunk();
   guest_to_host_thunk_ = thunk_emitter.EmitGuestToHostThunk();
-  resolve_function_thunk_ = thunk_emitter.EmitResolveFunctionThunk();
+  guest_to_host_thunk_no_vec_ = thunk_emitter.EmitGuestToHostThunkNoVec();
 
   if (!host_to_guest_thunk_ || !guest_to_host_thunk_ ||
-      !resolve_function_thunk_) {
+      !guest_to_host_thunk_no_vec_ || !resolve_function_thunk_) {
     XELOGE("A64Backend: Failed to generate thunks");
     return false;
   }
@@ -1248,11 +1735,20 @@ bool A64Backend::Initialize(Processor* processor) {
   if (cvars::a64_enable_host_guest_stack_synchronization) {
     synchronize_guest_and_host_stack_helper_ =
         thunk_emitter.EmitGuestAndHostSynchronizeStackHelper();
+    return_to_host_helper_ = thunk_emitter.EmitReturnToHostHelper();
   }
 
   vrsqrtefp_scalar_helper_ =
       thunk_emitter.EmitVRsqrtefpHelper(&vrsqrtefp_vector_helper_);
   frsqrte_helper_ = thunk_emitter.EmitFrsqrteHelper();
+  reserved_store_32_helper_ = thunk_emitter.EmitReservedStoreHelper(
+      false, reserved_store_fault_sites_[0]);
+  reserved_store_64_helper_ = thunk_emitter.EmitReservedStoreHelper(
+      true, reserved_store_fault_sites_[1]);
+  reserved_store_32_thunk_ =
+      thunk_emitter.EmitReservedStoreThunk(reserved_store_32_helper_);
+  reserved_store_64_thunk_ =
+      thunk_emitter.EmitReservedStoreThunk(reserved_store_64_helper_);
 
   // Set the indirection table default to point at the resolve thunk.
   // Use 64-bit encoding: the resolve thunk address is encoded as a rel32
@@ -1262,8 +1758,7 @@ bool A64Backend::Initialize(Processor* processor) {
       ->set_indirection_default_64(
           reinterpret_cast<uint64_t>(resolve_function_thunk_));
 
-  // Commit the indirection table range used by guest trampolines so that
-  // CreateGuestTrampoline can call AddIndirection without faulting.
+  // Commit the indirection table range used by guest trampolines.
   code_cache_->CommitExecutableRange(GUEST_TRAMPOLINE_BASE,
                                      GUEST_TRAMPOLINE_END);
 
@@ -1272,6 +1767,10 @@ bool A64Backend::Initialize(Processor* processor) {
 
   // Register exception handler for MMIO access from JIT code.
   ExceptionHandler::Install(ExceptionCallbackThunk, this);
+  if (auto mmio_handler = MMIOHandler::global_handler()) {
+    mmio_handler->SetReservedStoreFaultCallback(ReleaseFaultingReservedStore,
+                                                this);
+  }
 
   // Lets the memory system tell us which guest instructions faulted on MMIO,
   // so they get recompiled into a direct call instead of taking the signal
@@ -1461,6 +1960,28 @@ void A64Backend::InitializeBackendContext(void* ctx) {
   a64_ctx->fpcr_vmx_daz = DEFAULT_VMX_FPCR;   // never follows NJM
   a64_ctx->flags = (1U << kA64BackendNJMOn);  // NJM on by default
   a64_ctx->guest_tick_count = Clock::GetGuestTickCountPointer();
+  auto* cache = code_cache_.get();
+  a64_ctx->indirection_table_bias = cache->indirection_table_base_bias();
+  a64_ctx->code_execute_base = cache->execute_base_address();
+  a64_ctx->external_indirection_table =
+      cache->external_indirection_table_base_address();
+  a64_ctx->guest_to_host_thunk_address =
+      reinterpret_cast<uint64_t>(guest_to_host_thunk_);
+  a64_ctx->guest_to_host_thunk_no_vec_address =
+      reinterpret_cast<uint64_t>(guest_to_host_thunk_no_vec_);
+  a64_ctx->synchronize_guest_and_host_stack_helper_address =
+      reinterpret_cast<uint64_t>(synchronize_guest_and_host_stack_helper_);
+  a64_ctx->vrsqrtefp_scalar_helper_address =
+      reinterpret_cast<uint64_t>(vrsqrtefp_scalar_helper_);
+  a64_ctx->vrsqrtefp_vector_helper_address =
+      reinterpret_cast<uint64_t>(vrsqrtefp_vector_helper_);
+  a64_ctx->frsqrte_helper_address = reinterpret_cast<uint64_t>(frsqrte_helper_);
+  a64_ctx->reserved_store_32_helper_address =
+      reinterpret_cast<uint64_t>(reserved_store_32_helper_);
+  a64_ctx->reserved_store_64_helper_address =
+      reinterpret_cast<uint64_t>(reserved_store_64_helper_);
+  a64_ctx->preempt_yield_handler_address =
+      reinterpret_cast<uint64_t>(&preempt_yield_handler);
 
   auto set_est = [&](int index, float value) {
     uint32_t bits;
@@ -1503,6 +2024,10 @@ void A64Backend::InitializeBackendContext(void* ctx) {
 
   a64_ctx->stackpoints = AllocStackpoints();
   a64_ctx->dynamic_call_cache = nullptr;
+  {
+    auto global_lock = global_critical_region_.Acquire();
+    backend_contexts_.push_back(ctx);
+  }
 
   // Reset the live host FPCR for a fresh PPC context so one test's rounding
   // state does not leak into the next on the shared PPC test runner thread.
@@ -1515,8 +2040,44 @@ void A64Backend::DeinitializeBackendContext(void* ctx) {
     delete[] a64_ctx->stackpoints;
     a64_ctx->stackpoints = nullptr;
   }
+  auto global_lock = global_critical_region_.Acquire();
+  backend_contexts_.erase(
+      std::remove(backend_contexts_.begin(), backend_contexts_.end(), ctx),
+      backend_contexts_.end());
+  // InvalidateDynamicCalls walks a registered context's cache under the lock.
   delete[] a64_ctx->dynamic_call_cache;
   a64_ctx->dynamic_call_cache = nullptr;
+}
+
+void A64Backend::InvalidateDynamicCalls(uint32_t start, uint32_t end) {
+  auto global_lock = global_critical_region_.Acquire();
+  // A range with fewer instructions than the cache has slots only checks the
+  // slots those hash to.
+  const bool targeted = end - start < kA64DynamicCallCacheSize * 4;
+  auto invalidate = [start, end](A64DynamicCallCacheEntry& entry) {
+    if (entry.guest_address >= start && entry.guest_address <= end) {
+      // The lookup only rejects an entry whose host address is zero.
+      entry.host_address = 0;
+      entry.guest_address = UINT32_MAX;
+    }
+  };
+  for (void* ctx : backend_contexts_) {
+    A64BackendContext* bctx = BackendContextForGuestContext(ctx);
+    if (!bctx->dynamic_call_cache) {
+      continue;
+    }
+    if (targeted) {
+      for (uint64_t address = start & ~uint32_t(3); address <= end;
+           address += 4) {
+        invalidate(bctx->dynamic_call_cache[DynamicCallCacheIndex(
+            static_cast<uint32_t>(address))]);
+      }
+    } else {
+      for (uint32_t i = 0; i < kA64DynamicCallCacheSize; ++i) {
+        invalidate(bctx->dynamic_call_cache[i]);
+      }
+    }
+  }
 }
 
 void A64Backend::PrepareForReentry(void* ctx) {
@@ -1638,23 +2199,10 @@ std::string A64Backend::FormatSequenceKey(uint64_t key) const {
   return a64::FormatSequenceKey(key);
 }
 
-// PPC rounding mode (3-bit) to ARM64 FPCR value.
-// Same table as in a64_sequences.cc SET_ROUNDING_MODE.
-static constexpr uint32_t fpcr_table[8] = {
-    (0b00 << 22),              // PPC 0: nearest, IEEE
-    (0b11 << 22),              // PPC 1: toward zero, IEEE
-    (0b01 << 22),              // PPC 2: toward +inf, IEEE
-    (0b10 << 22),              // PPC 3: toward -inf, IEEE
-    (0b00 << 22) | (1 << 24),  // PPC 4: nearest, flush-to-zero
-    (0b11 << 22) | (1 << 24),  // PPC 5: toward zero, flush-to-zero
-    (0b01 << 22) | (1 << 24),  // PPC 6: toward +inf, flush-to-zero
-    (0b10 << 22) | (1 << 24),  // PPC 7: toward -inf, flush-to-zero
-};
-
 void A64Backend::SetGuestRoundingMode(void* ctx, unsigned int mode) {
   A64BackendContext* bctx = BackendContextForGuestContext(ctx);
   uint32_t control = mode & 7;
-  uint32_t fpcr_val = fpcr_table[control];
+  uint32_t fpcr_val = kGuestFpcrTable[control];
 #if XE_COMPILER_MSVC
   // MSVC ARM64 intrinsic: ARM64_FPCR = register ID 0x5A20.
   _WriteStatusReg(0x5A20, static_cast<uint64_t>(fpcr_val));
@@ -1732,6 +2280,24 @@ bool A64Backend::ExceptionCallbackThunk(Exception* ex, void* data) {
 }
 
 bool A64Backend::ExceptionCallback(Exception* ex) {
+  if (ex->code() == Exception::Code::kAccessViolation) {
+    if (code_cache_->CommitIndirectionFault(ex->fault_address())) {
+      // A slot in a chunk of the table nothing had committed yet.
+      return true;
+    }
+    if (!ex->pc() && !code_cache_->encoded_indirection()) {
+      // A call through a slot of a chunk another thread was still filling.
+      // JIT calls leave the guest address in w16, as the resolve thunk takes
+      // it, and return into the code cache.
+      const HostThreadContext& context = *ex->thread_context();
+      const uint64_t code_base = code_cache_->execute_base_address();
+      if (code_cache_->HasIndirectionSlot(uint32_t(context.x[16])) &&
+          context.x[30] - code_base < code_cache_->total_size()) {
+        ex->set_resume_pc(reinterpret_cast<uint64_t>(resolve_function_thunk_));
+        return true;
+      }
+    }
+  }
   if (ex->code() != Exception::Code::kIllegalInstruction) {
     return false;
   }

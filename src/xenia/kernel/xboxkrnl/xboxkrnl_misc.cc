@@ -7,6 +7,10 @@
  ******************************************************************************
  */
 
+#include <memory>
+
+#include "xenia/base/math.h"
+#include "xenia/cpu/lzx.h"
 #include "xenia/cpu/processor.h"
 #include "xenia/kernel/util/shim_utils.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_private.h"
@@ -174,6 +178,148 @@ dword_result_t MicDeviceRequest_entry(pointer_t<X_MIC_DEVICE> device_ptr) {
   return X_STATUS_PENDING;
 }
 DECLARE_XBOXKRNL_EXPORT1(MicDeviceRequest, kNone, kStub);
+
+// Event tracing. A producer tests the mask of enabled events at +8 of its
+// registration before it logs. Nothing collects the events here. The
+// registration is zeroed so no event is enabled. The size check and the size
+// written at +0 are guesses.
+struct X_ETX_PRODUCER_REGISTRATION {
+  xe::be<uint32_t> size;
+};
+
+dword_result_t EtxProducerRegister_entry(dword_t provider, lpvoid_t events,
+                                         dword_t event_count, dword_t flags,
+                                         dword_t registration_size,
+                                         lpvoid_t registration) {
+  if (registration_size < 0x40 || !registration) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+  registration.Zero(registration_size);
+  registration.as<X_ETX_PRODUCER_REGISTRATION*>()->size =
+      uint32_t(registration_size);
+  return X_STATUS_SUCCESS;
+}
+DECLARE_XBOXKRNL_EXPORT1(EtxProducerRegister, kNone, kStub);
+
+dword_result_t EtxProducerUnregister_entry(
+    pointer_t<X_ETX_PRODUCER_REGISTRATION> registration) {
+  if (!registration || registration->size < 0x40) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+  return X_STATUS_SUCCESS;
+}
+DECLARE_XBOXKRNL_EXPORT1(EtxProducerUnregister, kNone, kStub);
+
+// The kernel's LZX decompression as cabinets use it. A context keeps the
+// stream and each call passes one compressed frame.
+//
+// A context is a host object so its handle is checked and it goes with the
+// object table. On the console it's a guest allocation that takes no handle.
+class XLdiContext : public XObject {
+ public:
+  XLdiContext(KernelState* kernel_state,
+              std::unique_ptr<LzxFrameDecoder> decoder)
+      : XObject(kernel_state, Type::Undefined, true),
+        decoder(std::move(decoder)) {}
+
+  const std::unique_ptr<LzxFrameDecoder> decoder;
+};
+
+static object_ref<XObject> LookupLdiContext(uint32_t handle,
+                                            XLdiContext** out_context) {
+  auto object = kernel_state()->object_table()->LookupObject<XObject>(handle);
+  *out_context = dynamic_cast<XLdiContext*>(object.get());
+  return object;
+}
+
+constexpr uint32_t kLdiErrorNone = 0;
+constexpr uint32_t kLdiErrorNotEnoughMemory = 1;
+constexpr uint32_t kLdiErrorBadParameters = 2;
+constexpr uint32_t kLdiErrorBufferOverflow = 3;
+constexpr uint32_t kLdiErrorFailed = 4;
+constexpr uint32_t kLdiErrorConfiguration = 5;
+// An LZX frame inflates to 32 KB and can be up to 6 KB larger compressed.
+constexpr uint32_t kLdiFrameSize = 0x8000;
+constexpr uint32_t kLdiSourceBufferMin = kLdiFrameSize + 0x1800;
+
+dword_result_t LDICreateDecompression_entry(
+    lpdword_t data_block_max, lpdword_t configuration, dword_t alloc_function,
+    dword_t free_function, dword_t unknown, lpdword_t source_buffer_min,
+    lpdword_t handle_ptr) {
+  // LZXDECOMPRESS: the window size, then the CPU type.
+  if (!configuration || !handle_ptr) {
+    return kLdiErrorBadParameters;
+  }
+  const uint32_t window_size = *configuration;
+  if (!xe::is_pow2(window_size) || window_size < 0x8000 ||
+      window_size > 0x200000) {
+    return kLdiErrorConfiguration;
+  }
+  auto decoder = std::make_unique<LzxFrameDecoder>(window_size);
+  if (!decoder->Reset()) {
+    return kLdiErrorNotEnoughMemory;
+  }
+  // The creation reference passes to the handle.
+  auto context = object_ref<XLdiContext>(
+      new XLdiContext(kernel_state(), std::move(decoder)));
+  *handle_ptr = context->handle();
+  if (source_buffer_min) {
+    *source_buffer_min = kLdiSourceBufferMin;
+  }
+  return kLdiErrorNone;
+}
+DECLARE_XBOXKRNL_EXPORT1(LDICreateDecompression, kNone, kImplemented);
+
+dword_result_t LDIDecompress_entry(dword_t handle, lpvoid_t source,
+                                   dword_t source_size, lpvoid_t dest,
+                                   lpdword_t dest_size) {
+  if (!source || !dest || !dest_size) {
+    return kLdiErrorBadParameters;
+  }
+  XLdiContext* context;
+  auto object = LookupLdiContext(handle, &context);
+  if (!context) {
+    return kLdiErrorBadParameters;
+  }
+  // The size the caller expects this frame to inflate to.
+  const uint32_t frame_size = *dest_size;
+  if (!frame_size || frame_size > kLdiFrameSize) {
+    return kLdiErrorBufferOverflow;
+  }
+  if (source_size > kLdiSourceBufferMin) {
+    return kLdiErrorBadParameters;
+  }
+  if (!context->decoder->Decompress(source.as<const uint8_t*>(), source_size,
+                                    dest.as<uint8_t*>(), frame_size)) {
+    return kLdiErrorFailed;
+  }
+  return kLdiErrorNone;
+}
+DECLARE_XBOXKRNL_EXPORT1(LDIDecompress, kNone, kImplemented);
+
+dword_result_t LDIResetDecompression_entry(dword_t handle) {
+  XLdiContext* context;
+  auto object = LookupLdiContext(handle, &context);
+  if (!context) {
+    return kLdiErrorBadParameters;
+  }
+  if (!context->decoder->Reset()) {
+    return kLdiErrorNotEnoughMemory;
+  }
+  return kLdiErrorNone;
+}
+DECLARE_XBOXKRNL_EXPORT1(LDIResetDecompression, kNone, kImplemented);
+
+dword_result_t LDIDestroyDecompression_entry(dword_t handle) {
+  XLdiContext* context;
+  auto object = LookupLdiContext(handle, &context);
+  if (!context) {
+    return kLdiErrorBadParameters;
+  }
+  context->ReleaseHandle();
+  return kLdiErrorNone;
+}
+DECLARE_XBOXKRNL_EXPORT1(LDIDestroyDecompression, kNone, kImplemented);
 
 }  // namespace xboxkrnl
 }  // namespace kernel

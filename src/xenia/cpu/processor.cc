@@ -125,18 +125,60 @@ class DynamicCodeModule : public Module {
            (protect & kMemoryProtectRead);
   }
 
+  // Through the physical view, whose protection is what ContainsAddress
+  // checks.
   const uint8_t* TranslateCode(uint32_t address) const override {
-    return memory_->TranslateVirtual<const uint8_t*>(
-        memory_->UserModeKernelAddress(address));
+    return memory_->TranslateForRead(memory_->UserModeKernelAddress(address));
+  }
+
+  // A call is taken to return unless the code after it is a known entry. XeFu
+  // packs the stubs of x86 CALLs back to back, each ending in a bl to its
+  // dispatcher that never returns, and the next stub's entry is declared by
+  // the call to it. An entry left from older code there only splits the
+  // function, since the code after the call still runs next.
+  bool EndsBeforeCallReturn(uint32_t address) override {
+    return LookupSymbol(address, false) != nullptr;
+  }
+
+  // Dynamic code has no .pdata so only the swept range bounds the scan. It's
+  // used only where the range ends on an unconditional branch. A range that
+  // covers part of a function, like a patch or an old sweep of reused memory,
+  // rarely does and doesn't cut the function off. A branch that links counts
+  // too: XeFu ends its blocks with a bl that never returns. Taken when the
+  // function is compiled, since a call can declare it before its code is
+  // written.
+  void BoundFunction(GuestFunction* function) {
+    const uint32_t address = function->address();
+    const uint32_t end = processor_->SweptCodeEnd(address);
+    const uint32_t last = ((end + 3) & ~uint32_t(3)) - 4;
+    if (end && last > address && ContainsAddress(last) &&
+        IsUnconditionalBranch(
+            xe::load_and_swap<uint32_t>(TranslateCode(last)))) {
+      function->set_end_address(last);
+    }
   }
 
  protected:
   std::unique_ptr<Function> CreateFunction(uint32_t address) override {
-    return std::unique_ptr<Function>(
-        processor_->backend()->CreateGuestFunction(this, address));
+    return processor_->backend()->CreateGuestFunction(this, address);
   }
 
  private:
+  // b, blr or bctr, with or without link.
+  static bool IsUnconditionalBranch(uint32_t code) {
+    switch (code >> 26) {
+      case 18:
+        return true;
+      case 19: {
+        const uint32_t extended = (code >> 1) & 0x3FF;
+        const uint32_t bo = (code >> 21) & 0x1F;
+        return (extended == 16 || extended == 528) && (bo & 0x14) == 0x14;
+      }
+      default:
+        return false;
+    }
+  }
+
   std::string name_;
 };
 
@@ -412,13 +454,14 @@ bool Processor::AddModule(std::unique_ptr<Module> module) {
   return true;
 }
 
-void Processor::RemoveModule(const std::string_view name) {
+void Processor::RemoveModule(const Module* module) {
   auto global_lock = global_critical_region_.Acquire();
 
+  // A title update has the same name as the module it patches.
   auto itr = std::ranges::find_if(
       std::as_const(modules_),
-      [name](std::unique_ptr<xe::cpu::Module> const& module) {
-        return module->name() == name;
+      [module](std::unique_ptr<xe::cpu::Module> const& entry) {
+        return entry.get() == module;
       });
 
   if (itr != modules_.cend()) {
@@ -487,20 +530,199 @@ void Processor::RemoveFunctionByAddress(uint32_t address) {
   entry_table_.Delete(address);
 }
 
+template <typename Callback>
+void Processor::ForEachCodePiece(uint64_t start, uint64_t end,
+                                 Callback&& callback) {
+  for (uint64_t piece = start; piece < end;) {
+    const uint64_t piece_end =
+        std::min<uint64_t>((piece & ~uint64_t(0xFFF)) + 0x1000, end);
+    const uint64_t key = CodeRangeKey(uint32_t(piece));
+    callback(key, key + (piece_end - piece));
+    piece = piece_end;
+  }
+}
+
+template <typename Callback>
+void Processor::ForEachCodePiece(const Function* function,
+                                 Callback&& callback) {
+  const uint64_t start = function->address();
+  // The end address is the last instruction's.
+  const uint64_t end = std::max<uint64_t>(function->end_address(), start) + 4;
+  ForEachCodePiece(start, end, callback);
+}
+
 void Processor::InvalidateCodeRange(uint32_t address, uint32_t length) {
   if (!length) {
     return;
   }
   const uint32_t end = address + length - 1;
   auto global_lock = global_critical_region_.Acquire();
-  for (Function* function : entry_table_.DeleteRange(address, end)) {
+  const uint64_t sweep_count = code_sweep_count_.fetch_add(1) + 1;
+  RecordSweptCode(address, length);
+  auto forget = [this, address, end](Function* function) {
+    if (!function) {
+      return;
+    }
     // The entry is what a call looks up, but the module would hand back the
     // same already defined symbol and never compile the new code.
-    if (function && function->module()) {
+    if (function->module()) {
       function->module()->ForgetSymbol(function->address());
     }
+    // The dynamic call cache keys a function by its entry, which the range
+    // misses for a patch inside it or code compiled under another name.
+    if (function->address() < address || function->address() > end) {
+      backend_->InvalidateDynamicCalls(function->address(),
+                                       function->address());
+    }
+  };
+  for (Function* function : entry_table_.DeleteRange(address, end)) {
+    forget(function);
+  }
+  // Dynamic code compiled under another name for the same memory, and the
+  // swept keys for compiles in flight to check.
+  const bool compiling = !compile_sweep_counts_.empty();
+  if (compiling || !dynamic_code_pieces_.empty()) {
+    auto sweep_piece = [&](uint64_t key, uint64_t end_key) {
+      if (compiling) {
+        if (!compile_sweeps_.empty() &&
+            compile_sweeps_.back().count == sweep_count &&
+            compile_sweeps_.back().end_key == key) {
+          compile_sweeps_.back().end_key = end_key;
+        } else {
+          compile_sweeps_.push_back({sweep_count, key, end_key});
+        }
+      }
+      // No piece crosses a page, which makes the page's first key the lowest
+      // that can overlap.
+      auto it = dynamic_code_pieces_.lower_bound(key & ~uint64_t(0xFFF));
+      while (it != dynamic_code_pieces_.end() && it->first < end_key) {
+        if (it->second.end_key <= key) {
+          ++it;
+          continue;
+        }
+        const uint32_t function_address = it->second.function_address;
+        it = dynamic_code_pieces_.erase(it);
+        for (Function* function :
+             entry_table_.DeleteRange(function_address, function_address)) {
+          forget(function);
+        }
+      }
+    };
+    ForEachCodePiece(address, uint64_t(end) + 1, sweep_piece);
   }
   backend_->InvalidateDynamicCalls(address, end);
+}
+
+void Processor::RecordDynamicCode(const Function* function) {
+  auto global_lock = global_critical_region_.Acquire();
+  ForEachCodePiece(function, [&](uint64_t key, uint64_t end_key) {
+    // A recompile of the same function reuses its piece rather than piling up.
+    auto [first, last] = dynamic_code_pieces_.equal_range(key);
+    auto same = std::find_if(first, last, [function](const auto& existing) {
+      return existing.second.function_address == function->address();
+    });
+    if (same != last) {
+      same->second.end_key = std::max(same->second.end_key, end_key);
+    } else {
+      dynamic_code_pieces_.emplace(
+          key, DynamicCodePiece{end_key, function->address()});
+    }
+  });
+}
+
+uint64_t Processor::BeginCompile() {
+  const uint64_t sweep_count = code_sweep_count_.load();
+  compile_sweep_counts_.insert(sweep_count);
+  return sweep_count;
+}
+
+void Processor::EndCompile(uint64_t sweep_count) {
+  compile_sweep_counts_.erase(compile_sweep_counts_.find(sweep_count));
+  // Only sweeps after the oldest compile still in flight began can matter.
+  const uint64_t oldest = compile_sweep_counts_.empty()
+                              ? UINT64_MAX
+                              : *compile_sweep_counts_.begin();
+  while (!compile_sweeps_.empty() && compile_sweeps_.front().count <= oldest) {
+    compile_sweeps_.pop_front();
+  }
+}
+
+bool Processor::SweptSince(const Function* function, uint64_t sweep_count) {
+  if (compile_sweeps_.empty() || compile_sweeps_.back().count <= sweep_count) {
+    return false;
+  }
+  bool swept = false;
+  ForEachCodePiece(function, [&](uint64_t key, uint64_t end_key) {
+    // The log is in count order, so only its tail is newer.
+    for (auto sweep = compile_sweeps_.rbegin();
+         !swept && sweep != compile_sweeps_.rend() &&
+         sweep->count > sweep_count;
+         ++sweep) {
+      swept = sweep->start_key < end_key && key < sweep->end_key;
+    }
+  });
+  return swept;
+}
+
+void Processor::RecordSweptCode(uint32_t address, uint32_t length) {
+  if (!dynamic_code_enabled_.load()) {
+    // Only dynamic code is bounded this way, and nothing prunes the map.
+    return;
+  }
+  // Spans are keyed by physical address, so a range whose pages aren't
+  // physically contiguous would claim someone else's memory.
+  const uint64_t span_start = CodeRangeKey(address);
+  const uint64_t span_end = span_start + length;
+  if (CodeRangeKey(address + length - 1) != span_end - 1) {
+    return;
+  }
+  // Spans stay exact rather than merging, since back-to-back blocks must not
+  // bound each other. A sweep replaces any span it overlaps, except a single
+  // instruction patched past a span's start, which keeps the block's end.
+  auto range = swept_code_ranges_.lower_bound(span_start);
+  if (range != swept_code_ranges_.begin()) {
+    auto previous = range;
+    --previous;
+    if (previous->second > span_start) {
+      if (length == 4 && previous->second >= span_end) {
+        return;
+      }
+      range = previous;
+    }
+  }
+  while (range != swept_code_ranges_.end() && range->first < span_end) {
+    range = swept_code_ranges_.erase(range);
+  }
+  swept_code_ranges_.emplace(span_start, span_end);
+}
+
+uint64_t Processor::CodeRangeKey(uint32_t address) {
+  const uint32_t kernel_address = memory_->UserModeKernelAddress(address);
+  auto heap = memory_->LookupHeap(kernel_address);
+  if (heap && heap->heap_type() == HeapType::kGuestPhysical) {
+    const uint32_t physical_address =
+        memory_->GetPhysicalAddress(kernel_address);
+    if (physical_address != UINT32_MAX) {
+      return kPhysicalCodeKey | physical_address;
+    }
+  }
+  return kernel_address;
+}
+
+uint32_t Processor::SweptCodeEnd(uint32_t address) {
+  auto global_lock = global_critical_region_.Acquire();
+  const uint64_t key = CodeRangeKey(address);
+  auto range = swept_code_ranges_.upper_bound(key);
+  if (range == swept_code_ranges_.begin()) {
+    return 0;
+  }
+  --range;
+  if (key >= range->second) {
+    return 0;
+  }
+  // The range may be keyed by another address for the same memory, so convert
+  // back to this one.
+  return address + uint32_t(range->second - key);
 }
 
 Function* Processor::ResolveFunction(uint32_t address) {
@@ -508,34 +730,69 @@ Function* Processor::ResolveFunction(uint32_t address) {
   Entry::Status status = entry_table_.GetOrCreate(address, &entry);
   if (status == Entry::STATUS_NEW) {
     // Needs to be generated. We have the 'lock' on it and must do so now.
-
-    // Grab symbol declaration.
-    auto function = LookupFunction(address);
-
-    if (!function) {
-      entry_table_.MarkFailed(entry);
-      return nullptr;
+    Module* module = LookupModule(address);
+    // A sweep of dynamic code while it compiles means the compile may have
+    // read the old code, so it runs again. Code of a loaded module doesn't,
+    // since its loader set up some of its symbols and a new symbol would lack
+    // that.
+    const bool dynamic = IsDynamicCode(module);
+    uint64_t sweep_count = 0;
+    if (dynamic) {
+      auto global_lock = global_critical_region_.Acquire();
+      sweep_count = BeginCompile();
     }
+    constexpr uint32_t kMaxCompileAttempts = 4;
+    for (uint32_t attempt = 1;; ++attempt) {
+      // Grab symbol declaration.
+      auto function = module ? LookupFunction(module, address) : nullptr;
+      const bool defined = function && DemandFunction(function);
 
-    if (!DemandFunction(function)) {
-      entry_table_.MarkFailed(entry);
-      return nullptr;
-    }
-    // only add it to the list of resolved functions if resolving succeeded
-    auto module_for = function->module();
-
-    auto xexmod = dynamic_cast<XexModule*>(module_for);
-    if (xexmod) {
-      auto addr_flags = xexmod->GetInstructionAddressFlags(address);
-      if (addr_flags) {
-        InfoCacheFlags bits{};
-        bits.was_resolved = 1;
-        AtomicSetInfoCacheFlags(addr_flags, bits);
+      if (defined) {
+        // only add it to the list of resolved functions if resolving succeeded
+        auto xexmod = dynamic_cast<XexModule*>(module);
+        if (xexmod) {
+          auto addr_flags = xexmod->GetInstructionAddressFlags(address);
+          if (addr_flags) {
+            InfoCacheFlags bits{};
+            bits.was_resolved = 1;
+            AtomicSetInfoCacheFlags(addr_flags, bits);
+          }
+        }
       }
-    }
 
-    entry_table_.MarkReady(entry, function, function->end_address());
-    status = Entry::STATUS_READY;
+      // A sweep must not land between the check and the publish, nor find
+      // dynamic code ready before its pieces are recorded.
+      auto global_lock = global_critical_region_.Acquire();
+      bool swept = false;
+      if (dynamic) {
+        swept = defined && SweptSince(function, sweep_count);
+        EndCompile(sweep_count);
+      }
+      if (!defined) {
+        entry_table_.MarkFailed(entry);
+        return nullptr;
+      }
+      if (swept) {
+        // The module would hand back the same already defined symbol.
+        module->ForgetSymbol(address);
+        if (attempt < kMaxCompileAttempts) {
+          sweep_count = BeginCompile();
+          continue;
+        }
+        // Code the guest keeps rewriting runs once for the callers waiting on
+        // it, and the next call compiles it again. The count tells those that
+        // cache it to drop it.
+        entry_table_.MarkReady(entry, function, function->end_address());
+        entry_table_.Delete(address);
+        code_sweep_count_.fetch_add(1);
+        return function;
+      }
+      entry_table_.MarkReady(entry, function, function->end_address());
+      if (dynamic) {
+        RecordDynamicCode(function);
+      }
+      return function;
+    }
   }
   if (status == Entry::STATUS_READY) {
     // Ready to use.
@@ -674,6 +931,10 @@ bool Processor::DemandFunction(Function* function) {
   if (symbol_status == Symbol::Status::kNew) {
     // Symbol is undefined, so define now.
     assert_true(function->is_guest());
+    if (IsDynamicCode(module)) {
+      static_cast<DynamicCodeModule*>(module)->BoundFunction(
+          static_cast<GuestFunction*>(function));
+    }
     if (!frontend_->DefineFunction(static_cast<GuestFunction*>(function),
                                    debug_info_flags_)) {
       function->set_status(Symbol::Status::kFailed);

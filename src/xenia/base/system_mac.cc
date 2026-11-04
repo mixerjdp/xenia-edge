@@ -7,6 +7,8 @@
  ******************************************************************************
  */
 
+#include <CoreFoundation/CoreFoundation.h>
+#include <IOKit/IOKitLib.h>
 #include <crt_externs.h>
 #include <spawn.h>
 #include <sys/wait.h>
@@ -97,5 +99,44 @@ void ShowSimpleMessageBox(SimpleMessageBoxType type, std::string_view message) {
 }
 
 bool SetProcessPriorityClass(const uint32_t priority_class) { return true; }
+
+std::string GetMachineId() {
+  // The hardware UUID. MACH_PORT_NULL picks the default main port.
+  io_service_t platform = IOServiceGetMatchingService(
+      MACH_PORT_NULL, IOServiceMatching("IOPlatformExpertDevice"));
+  if (!platform) {
+    return {};
+  }
+  auto uuid = static_cast<CFStringRef>(IORegistryEntryCreateCFProperty(
+      platform, CFSTR(kIOPlatformUUIDKey), kCFAllocatorDefault, 0));
+  IOObjectRelease(platform);
+  if (!uuid) {
+    return {};
+  }
+  char buffer[64];
+  const bool converted =
+      CFStringGetCString(uuid, buffer, sizeof(buffer), kCFStringEncodingUTF8);
+  CFRelease(uuid);
+  return converted ? std::string(buffer) : std::string();
+}
+
+bool ExecutableHasX86_64Slice() {
+  static const bool has_slice = [] {
+    CFArrayRef archs =
+        CFBundleCopyExecutableArchitectures(CFBundleGetMainBundle());
+    if (!archs) {
+      return false;
+    }
+    int32_t x86_64 = kCFBundleExecutableArchitectureX86_64;
+    CFNumberRef x86_64_number =
+        CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &x86_64);
+    bool result = CFArrayContainsValue(
+        archs, CFRangeMake(0, CFArrayGetCount(archs)), x86_64_number);
+    CFRelease(x86_64_number);
+    CFRelease(archs);
+    return result;
+  }();
+  return has_slice;
+}
 
 }  // namespace xe

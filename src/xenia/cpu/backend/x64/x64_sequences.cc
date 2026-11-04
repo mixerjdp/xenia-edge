@@ -46,10 +46,6 @@ DEFINE_bool(use_fast_dot_product, false,
             "all infinite results to QNaN.",
             "CPU");
 
-DEFINE_bool(no_round_to_single, false,
-            "Not for users, breaks games. Skip rounding double values to "
-            "single precision and back",
-            "CPU");
 DEFINE_bool(inline_loadclock, false,
             "Directly read cached guest clock without calling the LoadClock "
             "method (it gets repeatedly updated by calls from other threads)",
@@ -451,6 +447,70 @@ struct TOSINGLE_F64_F64
   }
 };
 EMITTER_OPCODE_TABLE(OPCODE_TO_SINGLE, TOSINGLE_F64_F64);
+
+// ============================================================================
+// OPCODE_UNPACK_SINGLE
+// ============================================================================
+// lfs widens without quieting, so only a signaling NaN needs the quiet bit the
+// host convert set cleared again.
+struct UNPACK_SINGLE
+    : Sequence<UNPACK_SINGLE, I<OPCODE_UNPACK_SINGLE, F64Op, I32Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    e.ChangeMxcsrMode(MXCSRMode::Fpu);
+    if (i.src1.is_constant) {
+      e.mov(e.eax, i.src1.constant());
+    } else {
+      e.mov(e.eax, i.src1);
+    }
+    e.vmovd(e.xmm0, e.eax);
+    e.vcvtss2sd(i.dest, e.xmm0);
+
+    Xbyak::Label done;
+    // An all-ones exponent is a NaN or an infinity; an infinity's bit 51 is
+    // already clear.
+    e.mov(e.edx, e.eax);
+    e.and_(e.edx, 0x7FFFFFFFu);
+    e.cmp(e.edx, 0x7F800000u);
+    e.jb(done);
+    // A quiet NaN already has the bit the convert set.
+    e.test(e.eax, 1u << 22);
+    e.jnz(done);
+    e.vmovq(e.rdx, i.dest);
+    e.btr(e.rdx, 51);
+    e.vmovq(i.dest, e.rdx);
+    e.L(done);
+  }
+};
+EMITTER_OPCODE_TABLE(OPCODE_UNPACK_SINGLE, UNPACK_SINGLE);
+
+// ============================================================================
+// OPCODE_PACK_SINGLE
+// ============================================================================
+// stfs narrows without quieting: a NaN gets the double's quiet bit back.
+struct PACK_SINGLE
+    : Sequence<PACK_SINGLE, I<OPCODE_PACK_SINGLE, I32Op, F64Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    e.ChangeMxcsrMode(MXCSRMode::Fpu);
+    Xbyak::Xmm src = GetInputRegOrConstant(e, i.src1, e.xmm1);
+    e.vcvtsd2ss(e.xmm0, src);
+    e.vmovd(i.dest, e.xmm0);
+
+    Xbyak::Label done;
+    e.vmovq(e.rax, src);
+    e.mov(e.rdx, e.rax);
+    // AND r64 only takes a sign-extended imm32, so clear the sign with BTR.
+    e.btr(e.rdx, 63);
+    e.mov(e.rcx, 0x7FF0000000000000ull);
+    e.cmp(e.rdx, e.rcx);
+    e.jbe(done);
+    e.shr(e.rax, 51 - 22);
+    e.and_(e.eax, 1u << 22);
+    e.and_(i.dest, ~(1u << 22));
+    e.or_(i.dest, e.eax);
+    e.L(done);
+  }
+};
+EMITTER_OPCODE_TABLE(OPCODE_PACK_SINGLE, PACK_SINGLE);
 // ============================================================================
 // OPCODE_ROUND
 // ============================================================================
@@ -602,7 +662,11 @@ EMITTER_OPCODE_TABLE(OPCODE_CONTEXT_BARRIER, CONTEXT_BARRIER);
 // ============================================================================
 struct MAX_F32 : Sequence<MAX_F32, I<OPCODE_MAX, F32Op, F32Op, F32Op>> {
   static void Emit(X64Emitter& e, const EmitArgType& i) {
-    assert_impossible_sequence(MAX_F32);
+    e.ChangeMxcsrMode(MXCSRMode::Fpu);
+    EmitCommutativeBinaryXmmOp(e, i,
+                               [](X64Emitter& e, Xmm dest, Xmm src1, Xmm src2) {
+                                 e.vmaxss(dest, src1, src2);
+                               });
   }
 };
 struct MAX_F64 : Sequence<MAX_F64, I<OPCODE_MAX, F64Op, F64Op, F64Op>> {
@@ -636,6 +700,55 @@ struct MAX_V128 : Sequence<MAX_V128, I<OPCODE_MAX, V128Op, V128Op, V128Op>> {
   }
 };
 EMITTER_OPCODE_TABLE(OPCODE_MAX, MAX_F32, MAX_F64, MAX_V128);
+
+// ============================================================================
+// OPCODE_DENORMAL_QUIRK
+// ============================================================================
+// quirk = (any operand denormal) && (all operands finite), as i8 0/1.
+struct DENORMAL_QUIRK
+    : Sequence<DENORMAL_QUIRK,
+               I<OPCODE_DENORMAL_QUIRK, I8Op, F64Op, F64Op, F64Op>> {
+  static void Emit(X64Emitter& e, const EmitArgType& i) {
+    const Xmm ops[3] = {GetInputRegOrConstant(e, i.src1, e.xmm0),
+                        GetInputRegOrConstant(e, i.src2, e.xmm1),
+                        GetInputRegOrConstant(e, i.src3, e.xmm2)};
+    // rcx = min(|op| - 1): below 0x000FFFFFFFFFFFFF iff some operand is
+    // denormal. Subtracting one wraps a zero up to the top.
+    for (int k = 0; k < 3; ++k) {
+      const auto& gp = (k == 0) ? e.rcx : e.rax;
+      e.vmovq(gp, ops[k]);
+      e.btr(gp, 63);
+      e.sub(gp, 1);
+      if (k != 0) {
+        e.cmp(e.rax, e.rcx);
+        e.cmovb(e.rcx, e.rax);
+      }
+    }
+    e.mov(e.rax, 0x000FFFFFFFFFFFFFull);
+    e.cmp(e.rcx, e.rax);
+    Xbyak::Label slow, done;
+    e.jb(slow);
+    e.xor_(i.dest.reg().cvt32(), i.dest.reg().cvt32());
+    e.jmp(done);
+
+    // rcx = max(|op|): below infinity iff every operand is finite.
+    e.L(slow);
+    for (int k = 0; k < 3; ++k) {
+      const auto& gp = (k == 0) ? e.rcx : e.rax;
+      e.vmovq(gp, ops[k]);
+      e.btr(gp, 63);
+      if (k != 0) {
+        e.cmp(e.rax, e.rcx);
+        e.cmova(e.rcx, e.rax);
+      }
+    }
+    e.mov(e.rax, 0x7FF0000000000000ull);
+    e.cmp(e.rcx, e.rax);
+    e.setb(i.dest);
+    e.L(done);
+  }
+};
+EMITTER_OPCODE_TABLE(OPCODE_DENORMAL_QUIRK, DENORMAL_QUIRK);
 
 // ============================================================================
 // OPCODE_MIN
@@ -672,7 +785,11 @@ struct MIN_I64 : Sequence<MIN_I64, I<OPCODE_MIN, I64Op, I64Op, I64Op>> {
 };
 struct MIN_F32 : Sequence<MIN_F32, I<OPCODE_MIN, F32Op, F32Op, F32Op>> {
   static void Emit(X64Emitter& e, const EmitArgType& i) {
-    assert_impossible_sequence(MIN_F32);
+    e.ChangeMxcsrMode(MXCSRMode::Fpu);
+    EmitCommutativeBinaryXmmOp(e, i,
+                               [](X64Emitter& e, Xmm dest, Xmm src1, Xmm src2) {
+                                 e.vminss(dest, src1, src2);
+                               });
   }
 };
 struct MIN_F64 : Sequence<MIN_F64, I<OPCODE_MIN, F64Op, F64Op, F64Op>> {
@@ -1283,7 +1400,10 @@ struct COMPARE_NE_F32
   static void Emit(X64Emitter& e, const EmitArgType& i) {
     e.ChangeMxcsrMode(MXCSRMode::Fpu);
     if (!HasPrecedingCmpOfSameValues(i.instr)) {
-      e.vcomiss(i.src1, i.src2);
+      EmitCommutativeBinaryXmmOp(
+          e, i, [](X64Emitter& e, I8Op dest, const Xmm& src1, const Xmm& src2) {
+            e.vcomiss(src1, src2);
+          });
     }
     CompareNeDoSetne(e, i.instr, i.dest);
   }
@@ -1293,7 +1413,10 @@ struct COMPARE_NE_F64
   static void Emit(X64Emitter& e, const EmitArgType& i) {
     e.ChangeMxcsrMode(MXCSRMode::Fpu);
     if (!HasPrecedingCmpOfSameValues(i.instr)) {
-      e.vcomisd(i.src1, i.src2);
+      EmitCommutativeBinaryXmmOp(
+          e, i, [](X64Emitter& e, I8Op dest, const Xmm& src1, const Xmm& src2) {
+            e.vcomisd(src1, src2);
+          });
     }
     CompareNeDoSetne(e, i.instr, i.dest);
   }
@@ -1364,48 +1487,48 @@ EMITTER_ASSOCIATIVE_COMPARE_XX(UGE, setae, setbe);
 
 // https://web.archive.org/web/20171129015931/https://x86.renejeschke.de/html/file_module_x86_id_288.html
 // Original link: https://x86.renejeschke.de/html/file_module_x86_id_288.html
-#define EMITTER_ASSOCIATIVE_COMPARE_FLT_XX(op, emit_instr)            \
-  struct COMPARE_##op##_F32                                           \
-      : Sequence<COMPARE_##op##_F32,                                  \
-                 I<OPCODE_COMPARE_##op, I8Op, F32Op, F32Op>> {        \
-    static void Emit(X64Emitter& e, const EmitArgType& i) {           \
-      e.ChangeMxcsrMode(MXCSRMode::Fpu);                              \
-      if (!HasPrecedingCmpOfSameValues(i.instr)) {                    \
-        e.vcomiss(i.src1, i.src2);                                    \
-      }                                                               \
-      unsigned ctxoffset = 0;                                         \
-      if (MayCombineSetxWithFollowingCtxStore(i.instr, ctxoffset)) {  \
-        e.emit_instr(e.byte[e.GetContextReg() + ctxoffset]);          \
-      } else {                                                        \
-        e.emit_instr(i.dest);                                         \
-      }                                                               \
-    }                                                                 \
-  };                                                                  \
-  struct COMPARE_##op##_F64                                           \
-      : Sequence<COMPARE_##op##_F64,                                  \
-                 I<OPCODE_COMPARE_##op, I8Op, F64Op, F64Op>> {        \
-    static void Emit(X64Emitter& e, const EmitArgType& i) {           \
-      e.ChangeMxcsrMode(MXCSRMode::Fpu);                              \
-      if (!HasPrecedingCmpOfSameValues(i.instr)) {                    \
-        if (i.src1.is_constant) {                                     \
-          e.LoadConstantXmm(e.xmm0, i.src1.constant());               \
-          e.vcomisd(e.xmm0, i.src2);                                  \
-        } else if (i.src2.is_constant) {                              \
-          e.LoadConstantXmm(e.xmm0, i.src2.constant());               \
-          e.vcomisd(i.src1, e.xmm0);                                  \
-        } else {                                                      \
-          e.vcomisd(i.src1, i.src2);                                  \
-        }                                                             \
-      }                                                               \
-      unsigned ctxoffset = 0;                                         \
-      if (MayCombineSetxWithFollowingCtxStore(i.instr, ctxoffset)) {  \
-        e.emit_instr(e.byte[e.GetContextReg() + ctxoffset]);          \
-      } else {                                                        \
-        e.emit_instr(i.dest);                                         \
-      }                                                               \
-    }                                                                 \
-  };                                                                  \
-  EMITTER_OPCODE_TABLE(OPCODE_COMPARE_##op##_FLT, COMPARE_##op##_F32, \
+#define EMITTER_ASSOCIATIVE_COMPARE_FLT_XX(op, emit_instr)                   \
+  struct COMPARE_##op##_F32                                                  \
+      : Sequence<COMPARE_##op##_F32,                                         \
+                 I<OPCODE_COMPARE_##op, I8Op, F32Op, F32Op>> {               \
+    static void Emit(X64Emitter& e, const EmitArgType& i) {                  \
+      e.ChangeMxcsrMode(MXCSRMode::Fpu);                                     \
+      if (!HasPrecedingCmpOfSameValues(i.instr)) {                           \
+        EmitAssociativeBinaryXmmOp(                                          \
+            e, i,                                                            \
+            [](X64Emitter& e, I8Op dest, const Xmm& src1, const Xmm& src2) { \
+              e.vcomiss(src1, src2);                                         \
+            });                                                              \
+      }                                                                      \
+      unsigned ctxoffset = 0;                                                \
+      if (MayCombineSetxWithFollowingCtxStore(i.instr, ctxoffset)) {         \
+        e.emit_instr(e.byte[e.GetContextReg() + ctxoffset]);                 \
+      } else {                                                               \
+        e.emit_instr(i.dest);                                                \
+      }                                                                      \
+    }                                                                        \
+  };                                                                         \
+  struct COMPARE_##op##_F64                                                  \
+      : Sequence<COMPARE_##op##_F64,                                         \
+                 I<OPCODE_COMPARE_##op, I8Op, F64Op, F64Op>> {               \
+    static void Emit(X64Emitter& e, const EmitArgType& i) {                  \
+      e.ChangeMxcsrMode(MXCSRMode::Fpu);                                     \
+      if (!HasPrecedingCmpOfSameValues(i.instr)) {                           \
+        EmitAssociativeBinaryXmmOp(                                          \
+            e, i,                                                            \
+            [](X64Emitter& e, I8Op dest, const Xmm& src1, const Xmm& src2) { \
+              e.vcomisd(src1, src2);                                         \
+            });                                                              \
+      }                                                                      \
+      unsigned ctxoffset = 0;                                                \
+      if (MayCombineSetxWithFollowingCtxStore(i.instr, ctxoffset)) {         \
+        e.emit_instr(e.byte[e.GetContextReg() + ctxoffset]);                 \
+      } else {                                                               \
+        e.emit_instr(i.dest);                                                \
+      }                                                                      \
+    }                                                                        \
+  };                                                                         \
+  EMITTER_OPCODE_TABLE(OPCODE_COMPARE_##op##_FLT, COMPARE_##op##_F32,        \
                        COMPARE_##op##_F64);
 EMITTER_ASSOCIATIVE_COMPARE_FLT_XX(SLT, setb);
 EMITTER_ASSOCIATIVE_COMPARE_FLT_XX(SLE, setbe);

@@ -310,12 +310,15 @@ enum Opcode {
   OPCODE_TO_SINGLE,  // i could not find a decent name to assign to this opcode,
                      // as we already have OPCODE_ROUND. round double to float (
                      // ppc "single" fpu instruction result rounding behavior )
+  OPCODE_UNPACK_SINGLE,  // lfs: widen single bits, keeping a signaling NaN
+  OPCODE_PACK_SINGLE,    // stfs: narrow to single bits, keeping a signaling NaN
   OPCODE_SET_NJM,
   OPCODE_DELAY_EXECUTION,  // for db16cyc
   OPCODE_RESERVED_LOAD,
   OPCODE_RESERVED_STORE,
   OPCODE_LOAD_BARRIER,
   OPCODE_CHECK_PREEMPT,
+  OPCODE_DENORMAL_QUIRK,
 
   __OPCODE_MAX_VALUE,  // Keep at end.
 };

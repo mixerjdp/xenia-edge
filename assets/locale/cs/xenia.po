@@ -11,16 +11,6 @@ msgstr ""
 "Content-Transfer-Encoding: 8bit\n"
 "Plural-Forms: nplurals=3; plural=(n==1) ? 0 : (n>=2 && n<=4) ? 1 : 2;\n"
 
-#: src/xenia/ui/game_list_panel_wx.cc:596
-msgid ""
-"\n"
-"\n"
-"Browse for the file?"
-msgstr ""
-"\n"
-"\n"
-"Vyhledat soubor?"
-
 #: src/xenia/ui/game_scan_progress_dialog_wx.cc:55
 msgid "   %zu already installed"
 msgstr "   již nainstalováno: %zu"
@@ -1657,3 +1647,139 @@ msgstr "Xenia je šířena pod %s"
 #: src/xenia/ui/game_info_panel_wx.cc:212
 msgid "Content"
 msgstr "Obsah"
+
+#: src/xenia/app/emulator_window.cc:405
+msgid "Alternate Guitar"
+msgstr "Alternativní kytara"
+
+#: src/xenia/app/emulator_window.cc:407
+msgid "Bass Guitar"
+msgstr "Baskytara"
+
+#: src/xenia/app/emulator_window.cc:2027
+msgid ""
+"Original Xbox games run through XeFu, the Xbox 360's backward compatibility emulator, and %s is missing from its folder:\n"
+"\n"
+"%s\n"
+"\n"
+"Copy xbox.xex and the xefu*.xex files there from the Compatibility folder of an Xbox 360 hard drive."
+msgstr ""
+"Hry pro původní Xbox běží přes XeFu, emulátor zpětné kompatibility konzole Xbox 360, ale v jeho složce chybí %s:\n"
+"\n"
+"%s\n"
+"\n"
+"Zkopírujte tam xbox.xex a soubory xefu*.xex ze složky Compatibility na pevném disku konzole Xbox 360."
+
+#: src/xenia/app/emulator_window.cc:2034
+msgid "XeFu not found"
+msgstr "XeFu nenalezen"
+
+#: src/xenia/app/emulator_window.cc:3665
+msgid ""
+"Failed to launch title.\n"
+"\n"
+"Check xenia.log for technical details."
+msgstr ""
+"Titul se nepodařilo spustit.\n"
+"\n"
+"Technické podrobnosti najdete v souboru xenia.log."
+
+#: src/xenia/app/emulator_window.cc:3664
+msgid "Title Launch Failed!"
+msgstr "Spuštění titulu selhalo!"
+
+#: src/xenia/app/emulator_window.cc:2891
+msgid "Data migration"
+msgstr "Migrace dat"
+
+#: src/xenia/app/emulator_window.cc:2891
+msgid ""
+"Some of your existing data couldn't be migrated to the new profile. Items that failed: %u\n"
+"\n"
+"Check xenia.log for technical details."
+msgstr ""
+"Některá vaše stávající data se nepodařilo migrovat do nového profilu. Neúspěšné položky: %u\n"
+"\n"
+"Technické podrobnosti najdete v souboru xenia.log."
+
+#: src/xenia/app/emulator_window.cc:2897
+msgid "Your existing data was migrated to the new profile."
+msgstr "Vaše stávající data byla migrována do nového profilu."
+
+#: src/xenia/ui/game_list_panel_wx.cc:441
+msgid ""
+"No file path is set for this title.\n"
+"\n"
+"Browse for the file?"
+msgstr ""
+"Pro tento titul není nastavena cesta k souboru.\n"
+"\n"
+"Vyhledat soubor?"
+
+#: src/xenia/ui/game_list_panel_wx.cc:442
+msgid ""
+"File not found:\n"
+"%s\n"
+"\n"
+"Browse for the file?"
+msgstr ""
+"Soubor nenalezen:\n"
+"%s\n"
+"\n"
+"Vyhledat soubor?"
+
+#: src/xenia/app/emulator_window.cc:2325
+msgid "Failed to read the system update."
+msgstr "Aktualizaci systému se nepodařilo přečíst."
+
+#: src/xenia/app/emulator_window.cc:2329
+msgid "Failed to write the system files."
+msgstr "Systémové soubory se nepodařilo zapsat."
+
+#: src/xenia/app/emulator_window.cc:2296
+#: src/xenia/app/emulator_window.cc:2319
+#: src/xenia/app/emulator_window.cc:2324
+#: src/xenia/app/emulator_window.cc:2328
+#: src/xenia/app/emulator_window.cc:2333
+msgid "Install System Files"
+msgstr "Instalace systémových souborů"
+
+#: src/xenia/app/emulator_window.cc:1127
+msgid "Install System Files..."
+msgstr "Nainstalovat systémové soubory…"
+
+#: src/xenia/app/emulator_window.cc:2297
+msgid "Installing the system files..."
+msgstr "Probíhá instalace systémových souborů…"
+
+#: src/xenia/app/emulator_window.cc:2282
+msgid "Select a USB System Update"
+msgstr "Vyberte aktualizaci systému pro USB"
+
+#: src/xenia/app/emulator_window.cc:2310
+msgid "System files installed"
+msgstr "Systémové soubory nainstalovány"
+
+#: src/xenia/app/emulator_window.cc:2335
+msgid ""
+"The previous system files couldn't be put back in place. Move their folders back or delete them to install again. They are in:\n"
+"%s"
+msgstr ""
+"Předchozí systémové soubory se nepodařilo vrátit na původní místo. Chcete-li instalaci zopakovat, přesuňte jejich složky zpět nebo je odstraňte. Najdete je ve složce:\n"
+"%s"
+
+#: src/xenia/app/emulator_window.cc:2311
+msgid ""
+"The system files are installed in:\n"
+"%s"
+msgstr ""
+"Systémové soubory jsou nainstalovány ve složce:\n"
+"%s"
+
+#: src/xenia/app/emulator_window.cc:2320
+msgid "This file isn't a USB system update."
+msgstr "Tento soubor není aktualizací systému pro USB."
+
+#: src/xenia/app/emulator_window.cc:1035
+msgid "Start Dashboard"
+msgstr "Spustit ovládací centrum Xbox"

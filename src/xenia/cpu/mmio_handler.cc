@@ -400,6 +400,24 @@ bool MMIOHandler::ExceptionCallbackThunk(Exception* ex, void* data) {
 }
 
 bool MMIOHandler::ExceptionCallback(Exception* ex) {
+  // Before anything here can wait on the global lock, which a thread retrying a
+  // stwcx. on the claimed granule may hold.
+  uint64_t reserved_store_fail_pc = 0;
+  if (reserved_store_fault_callback_ &&
+      ex->code() == Exception::Code::kAccessViolation) {
+    reserved_store_fail_pc =
+        reserved_store_fault_callback_(reserved_store_fault_context_, ex);
+  }
+  if (!HandleAccessViolation(ex)) {
+    return false;
+  }
+  if (reserved_store_fail_pc) {
+    ex->set_resume_pc(reserved_store_fail_pc);
+  }
+  return true;
+}
+
+bool MMIOHandler::HandleAccessViolation(Exception* ex) {
   if (ex->code() != Exception::Code::kAccessViolation) {
     return false;
   }
@@ -411,7 +429,8 @@ bool MMIOHandler::ExceptionCallback(Exception* ex) {
     return false;
   }
   bool is_write = operation == Exception::AccessViolationOperation::kWrite;
-  // User mode views are never protected, so no MMIO range or watch applies.
+  // No MMIO range applies to the user mode views. The memory callback takes
+  // their faults, write watches included.
   const uint64_t user_membase =
       uint64_t(user_membase_.load(std::memory_order_relaxed));
   if (user_membase && ex->fault_address() - user_membase < 0x100000000ull) {
@@ -420,7 +439,7 @@ bool MMIOHandler::ExceptionCallback(Exception* ex) {
     }
     return access_violation_callback_(
         global_critical_region_.Acquire(), access_violation_callback_context_,
-        reinterpret_cast<void*>(ex->fault_address()), is_write);
+        reinterpret_cast<void*>(ex->fault_address()), is_write, ex);
   }
   if (ex->fault_address() < uint64_t(virtual_membase_) ||
       ex->fault_address() > uint64_t(memory_end_)) {
@@ -463,7 +482,7 @@ bool MMIOHandler::ExceptionCallback(Exception* ex) {
     if (access_violation_callback_) {
       return access_violation_callback_(std::move(lock),
                                         access_violation_callback_context_,
-                                        fault_host_address, is_write);
+                                        fault_host_address, is_write, ex);
     }
     return false;
 #else
@@ -481,7 +500,7 @@ bool MMIOHandler::ExceptionCallback(Exception* ex) {
     if (access_violation_callback_) {
       return access_violation_callback_(std::move(lock),
                                         access_violation_callback_context_,
-                                        fault_host_address, is_write);
+                                        fault_host_address, is_write, ex);
     }
     return false;
 #endif

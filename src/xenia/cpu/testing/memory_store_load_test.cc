@@ -329,3 +329,49 @@ TEST_CASE("LOAD_F64_BYTE_SWAP", "[instr]") {
         test.memory->SystemHeapFree(static_cast<uint32_t>(ctx->r[4]));
       });
 }
+
+// =============================================================================
+// Guest addresses at or above 0xE0000000 are 4 KiB further into the host
+// mapping on hosts with larger pages. The remap is decided on the effective
+// address, not on the base register before the displacement is added.
+// =============================================================================
+TEST_CASE("LOAD_OFFSET_PHYSICAL_REMAP", "[instr]") {
+  TestFunction test([](HIRBuilder& b) {
+    // Base below the boundary, displacement carries it across.
+    StoreGPR(b, 10,
+             b.ZeroExtend(b.LoadOffset(LoadGPR(b, 3), b.LoadConstantInt64(0x20),
+                                       INT32_TYPE),
+                          INT64_TYPE));
+    // Base above the boundary, negative displacement takes it below.
+    StoreGPR(b, 11,
+             b.ZeroExtend(b.LoadOffset(LoadGPR(b, 4),
+                                       b.LoadConstantInt64(-0x20), INT32_TYPE),
+                          INT64_TYPE));
+    // Base above the boundary, no displacement.
+    StoreGPR(b, 12,
+             b.ZeroExtend(b.Load(LoadGPR(b, 5), INT32_TYPE), INT64_TYPE));
+    b.Return();
+  });
+  REQUIRE(test.memory->LookupHeap(0xDF000000)
+              ->AllocFixed(0xDF000000, 0x1000000, 0x1000000,
+                           kMemoryAllocationReserve | kMemoryAllocationCommit,
+                           kMemoryProtectRead | kMemoryProtectWrite));
+  REQUIRE(test.memory->LookupHeap(0xE0000000)
+              ->AllocFixed(0xE0000000, 0x10000, 0x1000,
+                           kMemoryAllocationReserve | kMemoryAllocationCommit,
+                           kMemoryProtectRead | kMemoryProtectWrite));
+  *test.memory->TranslateVirtual<uint32_t*>(0xDFFFFFF0) = 0x11111111;
+  *test.memory->TranslateVirtual<uint32_t*>(0xE0000010) = 0x22222222;
+  *test.memory->TranslateVirtual<uint32_t*>(0xE0000030) = 0x33333333;
+  test.Run(
+      [](PPCContext* ctx) {
+        ctx->r[3] = 0xDFFFFFF0;
+        ctx->r[4] = 0xE0000010;
+        ctx->r[5] = 0xE0000030;
+      },
+      [](PPCContext* ctx) {
+        REQUIRE(ctx->r[10] == 0x22222222);
+        REQUIRE(ctx->r[11] == 0x11111111);
+        REQUIRE(ctx->r[12] == 0x33333333);
+      });
+}

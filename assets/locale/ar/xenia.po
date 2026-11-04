@@ -12,16 +12,6 @@ msgstr ""
 "Plural-Forms: nplurals=6; plural=(n==0 ? 0 : n==1 ? 1 : n==2 ? 2 : n%100>=3 "
 "&& n%100<=10 ? 3 : n%100>=11 ? 4 : 5);\n"
 
-#: src/xenia/ui/game_list_panel_wx.cc:596
-msgid ""
-"\n"
-"\n"
-"Browse for the file?"
-msgstr ""
-"\n"
-"\n"
-"هل تريد استعراض الملف؟"
-
 #: src/xenia/ui/game_scan_progress_dialog_wx.cc:55
 msgid "   %zu already installed"
 msgstr "   %zu مثبتة مسبقًا"
@@ -1656,3 +1646,139 @@ msgstr "يتم توزيع Xenia بموجب %s"
 #: src/xenia/ui/game_info_panel_wx.cc:212
 msgid "Content"
 msgstr "المحتوى"
+
+#: src/xenia/app/emulator_window.cc:405
+msgid "Alternate Guitar"
+msgstr "غيتار بديل"
+
+#: src/xenia/app/emulator_window.cc:407
+msgid "Bass Guitar"
+msgstr "غيتار باس"
+
+#: src/xenia/app/emulator_window.cc:2027
+msgid ""
+"Original Xbox games run through XeFu, the Xbox 360's backward compatibility emulator, and %s is missing from its folder:\n"
+"\n"
+"%s\n"
+"\n"
+"Copy xbox.xex and the xefu*.xex files there from the Compatibility folder of an Xbox 360 hard drive."
+msgstr ""
+"تعمل ألعاب Xbox الأصلي عبر XeFu، وهو محاكي التوافق مع الإصدارات السابقة في Xbox 360، لكن الملف %s مفقود من مجلده:\n"
+"\n"
+"%s\n"
+"\n"
+"انسخ xbox.xex وملفات xefu*.xex إلى هذا المجلد من مجلد Compatibility على القرص الثابت لجهاز Xbox 360."
+
+#: src/xenia/app/emulator_window.cc:2034
+msgid "XeFu not found"
+msgstr "لم يتم العثور على XeFu"
+
+#: src/xenia/app/emulator_window.cc:3665
+msgid ""
+"Failed to launch title.\n"
+"\n"
+"Check xenia.log for technical details."
+msgstr ""
+"فشل تشغيل اللعبة.\n"
+"\n"
+"راجع xenia.log للاطلاع على التفاصيل الفنية."
+
+#: src/xenia/app/emulator_window.cc:3664
+msgid "Title Launch Failed!"
+msgstr "فشل تشغيل اللعبة!"
+
+#: src/xenia/app/emulator_window.cc:2891
+msgid "Data migration"
+msgstr "نقل البيانات"
+
+#: src/xenia/app/emulator_window.cc:2891
+msgid ""
+"Some of your existing data couldn't be migrated to the new profile. Items that failed: %u\n"
+"\n"
+"Check xenia.log for technical details."
+msgstr ""
+"تعذّر نقل بعض بياناتك الحالية إلى ملف التعريف الجديد. العناصر التي فشلت: %u\n"
+"\n"
+"راجع xenia.log للاطلاع على التفاصيل الفنية."
+
+#: src/xenia/app/emulator_window.cc:2897
+msgid "Your existing data was migrated to the new profile."
+msgstr "تم نقل بياناتك الحالية إلى ملف التعريف الجديد."
+
+#: src/xenia/ui/game_list_panel_wx.cc:441
+msgid ""
+"No file path is set for this title.\n"
+"\n"
+"Browse for the file?"
+msgstr ""
+"لم يتم تعيين مسار للملف لهذه اللعبة.\n"
+"\n"
+"هل تريد استعراض الملف؟"
+
+#: src/xenia/ui/game_list_panel_wx.cc:442
+msgid ""
+"File not found:\n"
+"%s\n"
+"\n"
+"Browse for the file?"
+msgstr ""
+"الملف غير موجود:\n"
+"%s\n"
+"\n"
+"هل تريد استعراض الملف؟"
+
+#: src/xenia/app/emulator_window.cc:2325
+msgid "Failed to read the system update."
+msgstr "تعذّرت قراءة تحديث النظام."
+
+#: src/xenia/app/emulator_window.cc:2329
+msgid "Failed to write the system files."
+msgstr "تعذّرت كتابة ملفات النظام."
+
+#: src/xenia/app/emulator_window.cc:2296
+#: src/xenia/app/emulator_window.cc:2319
+#: src/xenia/app/emulator_window.cc:2324
+#: src/xenia/app/emulator_window.cc:2328
+#: src/xenia/app/emulator_window.cc:2333
+msgid "Install System Files"
+msgstr "تثبيت ملفات النظام"
+
+#: src/xenia/app/emulator_window.cc:1127
+msgid "Install System Files..."
+msgstr "تثبيت ملفات النظام…"
+
+#: src/xenia/app/emulator_window.cc:2297
+msgid "Installing the system files..."
+msgstr "جارٍ تثبيت ملفات النظام…"
+
+#: src/xenia/app/emulator_window.cc:2282
+msgid "Select a USB System Update"
+msgstr "تحديد تحديث النظام عبر USB"
+
+#: src/xenia/app/emulator_window.cc:2310
+msgid "System files installed"
+msgstr "تم تثبيت ملفات النظام"
+
+#: src/xenia/app/emulator_window.cc:2335
+msgid ""
+"The previous system files couldn't be put back in place. Move their folders back or delete them to install again. They are in:\n"
+"%s"
+msgstr ""
+"تعذّرت إعادة ملفات النظام السابقة إلى مكانها. انقل مجلداتها إلى مكانها الأصلي أو احذفها لتتمكن من التثبيت مرة أخرى. وهي موجودة في:\n"
+"%s"
+
+#: src/xenia/app/emulator_window.cc:2311
+msgid ""
+"The system files are installed in:\n"
+"%s"
+msgstr ""
+"ملفات النظام مثبّتة في:\n"
+"%s"
+
+#: src/xenia/app/emulator_window.cc:2320
+msgid "This file isn't a USB system update."
+msgstr "هذا الملف ليس تحديثًا للنظام عبر USB."
+
+#: src/xenia/app/emulator_window.cc:1035
+msgid "Start Dashboard"
+msgstr "تشغيل Xbox Dashboard"

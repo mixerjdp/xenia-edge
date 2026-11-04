@@ -1128,3 +1128,40 @@ TEST_CASE("ROTATE_LEFT_I32", "[bitwise]") {
         REQUIRE(static_cast<uint32_t>(ctx->r[3]) == 0x12345678);
       });
 }
+
+// ============================================================================
+// Float compares with a constant operand
+// ============================================================================
+TEST_CASE("COMPARE_FLOAT_CONSTANT_OPERAND", "[compare]") {
+  TestFunction test([](HIRBuilder& b) {
+    auto x = b.Convert(LoadFPR(b, 4), FLOAT32_TYPE);
+    auto y = LoadFPR(b, 4);
+    StoreGPR(
+        b, 3,
+        b.ZeroExtend(b.CompareSLT(x, b.LoadConstantFloat32(2.0f)), INT64_TYPE));
+    StoreGPR(
+        b, 4,
+        b.ZeroExtend(b.CompareSGT(b.LoadConstantFloat32(2.0f), x), INT64_TYPE));
+    StoreGPR(
+        b, 5,
+        b.ZeroExtend(b.CompareNE(x, b.LoadConstantFloat32(1.5f)), INT64_TYPE));
+    StoreGPR(
+        b, 6,
+        b.ZeroExtend(b.CompareNE(y, b.LoadConstantFloat64(1.5)), INT64_TYPE));
+    b.Return();
+  });
+  test.Run([](PPCContext* ctx) { ctx->f[4] = 1.5; },
+           [](PPCContext* ctx) {
+             REQUIRE(ctx->r[3] == 1);
+             REQUIRE(ctx->r[4] == 1);
+             REQUIRE(ctx->r[5] == 0);
+             REQUIRE(ctx->r[6] == 0);
+           });
+  test.Run([](PPCContext* ctx) { ctx->f[4] = 3.0; },
+           [](PPCContext* ctx) {
+             REQUIRE(ctx->r[3] == 0);
+             REQUIRE(ctx->r[4] == 0);
+             REQUIRE(ctx->r[5] == 1);
+             REQUIRE(ctx->r[6] == 1);
+           });
+}

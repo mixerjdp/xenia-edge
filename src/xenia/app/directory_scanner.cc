@@ -22,6 +22,7 @@
 #include "xenia/base/logging.h"
 #include "xenia/vfs/iso_metadata.h"
 #include "xenia/vfs/stfs_metadata.h"
+#include "xenia/vfs/xbe_metadata.h"
 #include "xenia/vfs/xex_metadata.h"
 #include "xenia/vfs/zar_metadata.h"
 #include "xenia/xbox.h"
@@ -38,7 +39,7 @@ std::string ToLowerAscii(std::string s) {
 }
 
 bool IsKnownLaunchableExtension(const std::string& ext) {
-  return ext == ".xex" || ext == ".iso" || ext == ".zar";
+  return ext == ".xex" || ext == ".xbe" || ext == ".iso" || ext == ".zar";
 }
 
 // GOD packages put their data fragments in a sibling "<hash>.data" dir of
@@ -86,6 +87,45 @@ DiscoveredGame MakeFromXex(const std::filesystem::path& path,
   return g;
 }
 
+// Keeps |png| for import and decodes it for the dialog, so the dialog never
+// has to do PNG work on the UI thread.
+void SetIcon(DiscoveredGame& g, std::vector<uint8_t> png) {
+  g.icon_png = std::move(png);
+  int w = 0, h = 0, channels = 0;
+  unsigned char* pixels = stbi_load_from_memory(
+      g.icon_png.data(), static_cast<int>(g.icon_png.size()), &w, &h, &channels,
+      STBI_rgb_alpha);
+  if (pixels) {
+    g.icon_width = w;
+    g.icon_height = h;
+    g.icon_rgba.assign(pixels, pixels + (static_cast<size_t>(w) * h * 4));
+    stbi_image_free(pixels);
+  }
+}
+
+// An original Xbox game is what its executable says it is, whatever holds it.
+void ApplyXbe(DiscoveredGame& g, const vfs::XbeMetadata& m) {
+  g.title_id = m.title_id;
+  g.title_id_hex = fmt::format("{:08X}", m.title_id);
+  g.media_id = 0;
+  g.title_name = m.title_name;
+  g.version = vfs::XexVersion::FromValue(m.version).ToString();
+  g.disc_number = static_cast<uint8_t>(m.disc_number);
+  g.disc_count = 0;
+  if (!m.icon_png.empty()) {
+    SetIcon(g, m.icon_png);
+  }
+}
+
+DiscoveredGame MakeFromXbe(const std::filesystem::path& path,
+                           const char* format, const vfs::XbeMetadata& m) {
+  DiscoveredGame g;
+  g.path = path;
+  g.format = format;
+  ApplyXbe(g, m);
+  return g;
+}
+
 DiscoveredGame MakeFromStfs(const std::filesystem::path& path,
                             const vfs::StfsMetadata& m) {
   DiscoveredGame g;
@@ -101,21 +141,8 @@ DiscoveredGame MakeFromStfs(const std::filesystem::path& path,
   g.content_type_name = ResolveContentTypeName(m.content_type);
   g.disc_number = m.disc_number;
   g.disc_count = m.disc_count;
-
-  // Keep PNG bytes for the GPD writer; decode RGBA here so the dialog
-  // never has to do PNG work on the UI thread.
   if (!m.icon_data.empty()) {
-    g.icon_png = m.icon_data;
-    int w = 0, h = 0, channels = 0;
-    unsigned char* pixels = stbi_load_from_memory(
-        g.icon_png.data(), static_cast<int>(g.icon_png.size()), &w, &h,
-        &channels, STBI_rgb_alpha);
-    if (pixels) {
-      g.icon_width = w;
-      g.icon_height = h;
-      g.icon_rgba.assign(pixels, pixels + (static_cast<size_t>(w) * h * 4));
-      stbi_image_free(pixels);
-    }
+    SetIcon(g, m.icon_data);
   }
   return g;
 }
@@ -190,10 +217,12 @@ size_t DirectoryScanner::CountResultsWithTitleId(
 }
 
 void DirectoryScanner::Run(std::filesystem::path root) {
-  XELOGI("DirectoryScanner: scan start, root='{}'", xe::path_to_utf8(root));
+  XELOGI("DirectoryScanner: scan start, root='{}'",
+         xe::strip_pii(xe::path_to_utf8(root)));
   std::error_code ec;
   if (!std::filesystem::is_directory(root, ec) || ec) {
-    XELOGW("DirectoryScanner: not a directory: {} ({})", xe::path_to_utf8(root),
+    XELOGW("DirectoryScanner: not a directory: {} ({})",
+           xe::strip_pii(xe::path_to_utf8(root)),
            ec ? ec.message() : "is_directory=false");
     std::lock_guard<std::mutex> lock(mu_);
     progress_.done = true;
@@ -262,10 +291,10 @@ void DirectoryScanner::WorkerLoop() {
       ScanDirectory(dir);
     } catch (const std::exception& e) {
       XELOGE("DirectoryScanner: worker exception in '{}': {}",
-             xe::path_to_utf8(dir), e.what());
+             xe::strip_pii(xe::path_to_utf8(dir)), xe::strip_pii(e.what()));
     } catch (...) {
       XELOGE("DirectoryScanner: worker unknown exception in '{}'",
-             xe::path_to_utf8(dir));
+             xe::strip_pii(xe::path_to_utf8(dir)));
     }
 
     {
@@ -309,7 +338,7 @@ void DirectoryScanner::ScanDirectory(const std::filesystem::path& dir) {
     return;
   }
   SetCurrentDirectory(dir);
-  XELOGD("DirectoryScanner: enter '{}'", xe::path_to_utf8(dir));
+  XELOGD("DirectoryScanner: enter '{}'", xe::strip_pii(xe::path_to_utf8(dir)));
 
   std::vector<std::filesystem::path> files;
   std::vector<std::filesystem::path> subdirs;
@@ -319,8 +348,8 @@ void DirectoryScanner::ScanDirectory(const std::filesystem::path& dir) {
     auto opts = std::filesystem::directory_options::skip_permission_denied;
     auto it = std::filesystem::directory_iterator(dir, opts, ec);
     if (ec) {
-      XELOGW("DirectoryScanner: cannot open '{}': {}", xe::path_to_utf8(dir),
-             ec.message());
+      XELOGW("DirectoryScanner: cannot open '{}': {}",
+             xe::strip_pii(xe::path_to_utf8(dir)), ec.message());
       return;
     }
     auto end = std::filesystem::directory_iterator();
@@ -333,7 +362,7 @@ void DirectoryScanner::ScanDirectory(const std::filesystem::path& dir) {
       bool is_file = entry.is_regular_file(ftec);
       if (ftec) {
         XELOGW("DirectoryScanner: is_regular_file failed on '{}': {}",
-               xe::path_to_utf8(entry.path()), ftec.message());
+               xe::strip_pii(xe::path_to_utf8(entry.path())), ftec.message());
         ftec.clear();
         entries_skipped++;
       } else if (is_file) {
@@ -342,13 +371,13 @@ void DirectoryScanner::ScanDirectory(const std::filesystem::path& dir) {
         bool is_dir = entry.is_directory(ftec);
         if (ftec) {
           XELOGW("DirectoryScanner: is_directory failed on '{}': {}",
-                 xe::path_to_utf8(entry.path()), ftec.message());
+                 xe::strip_pii(xe::path_to_utf8(entry.path())), ftec.message());
           ftec.clear();
           entries_skipped++;
         } else if (is_dir) {
           if (IsGodDataDirectory(entry.path())) {
             XELOGD("DirectoryScanner:   skip god data dir '{}'",
-                   xe::path_to_utf8(entry.path()));
+                   xe::strip_pii(xe::path_to_utf8(entry.path())));
           } else {
             subdirs.push_back(entry.path());
           }
@@ -360,14 +389,15 @@ void DirectoryScanner::ScanDirectory(const std::filesystem::path& dir) {
       it.increment(ec);
       if (ec) {
         XELOGW("DirectoryScanner: increment failed in '{}': {}",
-               xe::path_to_utf8(dir), ec.message());
+               xe::strip_pii(xe::path_to_utf8(dir)), ec.message());
         ec.clear();
       }
     }
   }
 
   XELOGD("DirectoryScanner: '{}' contains {} files, {} subdirs ({} skipped)",
-         xe::path_to_utf8(dir), files.size(), subdirs.size(), entries_skipped);
+         xe::strip_pii(xe::path_to_utf8(dir)), files.size(), subdirs.size(),
+         entries_skipped);
 
   std::sort(files.begin(), files.end());
   std::sort(subdirs.begin(), subdirs.end());
@@ -376,7 +406,8 @@ void DirectoryScanner::ScanDirectory(const std::filesystem::path& dir) {
   size_t phase1_hits = 0;
 
   // Phase 1: only default.xex is a launchable XEX; other .xex files are
-  // modules/companions and skipped. ISO/ZAR collected as multi-game.
+  // modules/companions and skipped. The same goes for an original Xbox
+  // default.xbe. ISO/ZAR collected as multi-game.
   for (const auto& path : files) {
     if (cancel_requested_.load()) {
       return;
@@ -385,17 +416,23 @@ void DirectoryScanner::ScanDirectory(const std::filesystem::path& dir) {
     if (!IsKnownLaunchableExtension(ext)) {
       continue;
     }
-    if (ext == ".xex" &&
-        ToLowerAscii(xe::path_to_utf8(path.filename())) != "default.xex") {
-      XELOGD("DirectoryScanner:   skip non-default xex '{}'",
-             xe::path_to_utf8(path));
+    if ((ext == ".xex" || ext == ".xbe") &&
+        ToLowerAscii(xe::path_to_utf8(path.stem())) != "default") {
+      XELOGD("DirectoryScanner:   skip non-default {} '{}'", ext,
+             xe::strip_pii(xe::path_to_utf8(path)));
+      continue;
+    }
+    // A default executable makes the directory a game, but a disc for both
+    // consoles holds a default.xbe and a default.xex, one game each.
+    if (found_xex && ext != ".xex" && ext != ".xbe") {
       continue;
     }
     {
       std::lock_guard<std::mutex> lock(mu_);
       progress_.files_probed++;
     }
-    XELOGD("DirectoryScanner:   probe {} '{}'", ext, xe::path_to_utf8(path));
+    XELOGD("DirectoryScanner:   probe {} '{}'", ext,
+           xe::strip_pii(xe::path_to_utf8(path)));
     try {
       if (ext == ".xex") {
         if (auto m = vfs::ExtractXexMetadata(path)) {
@@ -404,14 +441,31 @@ void DirectoryScanner::ScanDirectory(const std::filesystem::path& dir) {
           RecordGame(MakeFromXex(path, "xex", *m));
           found_xex = true;
           phase1_hits++;
-          break;  // default.xex terminates current directory.
+          continue;
         }
         XELOGD("DirectoryScanner:     -> xex miss");
+      } else if (ext == ".xbe") {
+        if (auto m = vfs::ExtractXbeMetadata(path)) {
+          XELOGD("DirectoryScanner:     -> xbe hit, title_id={:08X}",
+                 m->title_id);
+          RecordGame(MakeFromXbe(path, "xbe", *m));
+          found_xex = true;
+          phase1_hits++;
+          continue;
+        }
+        XELOGD("DirectoryScanner:     -> xbe miss");
       } else if (ext == ".iso") {
         if (auto m = vfs::ExtractIsoMetadata(path)) {
           XELOGD("DirectoryScanner:     -> iso hit, title_id={:08X}",
                  m->title_id);
           RecordGame(MakeFromXex(path, "iso", *m));
+          phase1_hits++;
+        } else if (auto xbe = vfs::ExtractXbeMetadata(path)) {
+          XELOGD(
+              "DirectoryScanner:     -> original Xbox iso hit, "
+              "title_id={:08X}",
+              xbe->title_id);
+          RecordGame(MakeFromXbe(path, "iso", *xbe));
           phase1_hits++;
         } else {
           XELOGD("DirectoryScanner:     -> iso miss");
@@ -428,10 +482,10 @@ void DirectoryScanner::ScanDirectory(const std::filesystem::path& dir) {
       }
     } catch (const std::exception& e) {
       XELOGW("DirectoryScanner: extractor threw on '{}': {}",
-             xe::path_to_utf8(path), e.what());
+             xe::strip_pii(xe::path_to_utf8(path)), xe::strip_pii(e.what()));
     } catch (...) {
       XELOGW("DirectoryScanner: extractor threw on '{}' (unknown)",
-             xe::path_to_utf8(path));
+             xe::strip_pii(xe::path_to_utf8(path)));
     }
   }
 
@@ -455,30 +509,45 @@ void DirectoryScanner::ScanDirectory(const std::filesystem::path& dir) {
       phase2_probed++;
       try {
         if (auto m = vfs::ExtractStfsMetadata(path, language_)) {
+          if (m->content_type == uint32_t(XContentType::kXboxTitle)) {
+            if (auto xbe = vfs::ExtractXbeMetadata(path)) {
+              XELOGD(
+                  "DirectoryScanner:   original Xbox stfs hit '{}' — "
+                  "title_id={:08X}, name='{}'",
+                  xe::strip_pii(xe::path_to_utf8(path)), xbe->title_id,
+                  xbe->title_name);
+              DiscoveredGame g = MakeFromStfs(path, *m);
+              ApplyXbe(g, *xbe);
+              RecordGame(std::move(g));
+              phase2_hits++;
+              continue;
+            }
+          }
           if (!IsLaunchableContentType(m->content_type)) {
             XELOGD(
                 "DirectoryScanner:   stfs filtered '{}' — content_type="
                 "0x{:08X} ({}), name='{}'",
-                xe::path_to_utf8(path), m->content_type,
+                xe::strip_pii(xe::path_to_utf8(path)), m->content_type,
                 ResolveContentTypeName(m->content_type), m->display_name);
             continue;
           }
           XELOGD(
               "DirectoryScanner:   stfs hit '{}' — title_id={:08X}, "
               "content_type=0x{:08X}, name='{}'",
-              xe::path_to_utf8(path), m->title_id, m->content_type,
-              m->display_name);
+              xe::strip_pii(xe::path_to_utf8(path)), m->title_id,
+              m->content_type, m->display_name);
           RecordGame(MakeFromStfs(path, *m));
           phase2_hits++;
         } else {
-          XELOGD("DirectoryScanner:   stfs miss '{}'", xe::path_to_utf8(path));
+          XELOGD("DirectoryScanner:   stfs miss '{}'",
+                 xe::strip_pii(xe::path_to_utf8(path)));
         }
       } catch (const std::exception& e) {
         XELOGW("DirectoryScanner: stfs probe threw on '{}': {}",
-               xe::path_to_utf8(path), e.what());
+               xe::strip_pii(xe::path_to_utf8(path)), xe::strip_pii(e.what()));
       } catch (...) {
         XELOGW("DirectoryScanner: stfs probe threw on '{}' (unknown)",
-               xe::path_to_utf8(path));
+               xe::strip_pii(xe::path_to_utf8(path)));
       }
     }
   }
@@ -486,8 +555,8 @@ void DirectoryScanner::ScanDirectory(const std::filesystem::path& dir) {
   XELOGD(
       "DirectoryScanner: leave '{}' — found_xex={}, phase1_hits={}, "
       "phase2_probed={}, phase2_hits={}, recurse={}",
-      xe::path_to_utf8(dir), found_xex, phase1_hits, phase2_probed, phase2_hits,
-      !found_xex);
+      xe::strip_pii(xe::path_to_utf8(dir)), found_xex, phase1_hits,
+      phase2_probed, phase2_hits, !found_xex);
 
   // Phase 3: recurse only when no XEX found in this directory.
   if (!found_xex && !cancel_requested_.load()) {

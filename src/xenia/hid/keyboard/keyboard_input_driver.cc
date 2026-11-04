@@ -260,8 +260,6 @@ X_RESULT KeyboardInputDriver::GetState(uint32_t user_index,
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
 
-  packet_number_++;
-
   uint16_t buttons = 0;
   uint8_t left_trigger = 0;
   uint8_t right_trigger = 0;
@@ -356,7 +354,6 @@ X_RESULT KeyboardInputDriver::GetState(uint32_t user_index,
     }
   }
 
-  out_state->packet_number = packet_number_;
   out_state->gamepad.buttons = buttons;
   out_state->gamepad.left_trigger = left_trigger;
   out_state->gamepad.right_trigger = right_trigger;
@@ -364,6 +361,15 @@ X_RESULT KeyboardInputDriver::GetState(uint32_t user_index,
   out_state->gamepad.thumb_ly = thumb_ly;
   out_state->gamepad.thumb_rx = thumb_rx;
   out_state->gamepad.thumb_ry = thumb_ry;
+  {
+    std::lock_guard<xe_mutex> guard(state_lock_);
+    if (std::memcmp(&out_state->gamepad, &last_gamepad_,
+                    sizeof(last_gamepad_)) != 0) {
+      last_gamepad_ = out_state->gamepad;
+      ++packet_number_;
+    }
+    out_state->packet_number = packet_number_;
+  }
 
   if (IsPassthroughEnabled()) {
     std::memset(out_state, 0, sizeof(*out_state));
@@ -386,17 +392,19 @@ X_RESULT KeyboardInputDriver::GetKeystroke(uint32_t user_index, uint32_t flags,
   uint16_t keystroke_flags = 0;
   uint8_t hid_code = 0;
 
-  // Pop from the queue.
+  // Pop from the queue. A release is sent only for a press the title received,
+  // and repeats of a press it didn't receive aren't a new press.
+  auto global_lock = global_critical_region_.Acquire();
   KeyEvent evt;
-  {
-    auto global_lock = global_critical_region_.Acquire();
+  do {
     if (key_events_.empty()) {
       // No keys!
       return X_ERROR_EMPTY;
     }
     evt = key_events_.front();
     key_events_.pop();
-  }
+  } while (evt.transition ? evt.prev_state && !delivered_.count(evt.virtual_key)
+                          : !delivered_.erase(evt.virtual_key));
 
   if (!IsPassthroughEnabled()) {
     for (const KeyBinding& b : key_bindings_) {
@@ -428,7 +436,7 @@ X_RESULT KeyboardInputDriver::GetKeystroke(uint32_t user_index, uint32_t flags,
   if (xinput_virtual_key != ui::VirtualKey::kNone) {
     if (evt.transition == true) {
       keystroke_flags |= 0x0001;  // XINPUT_KEYSTROKE_KEYDOWN
-      if (evt.prev_state == evt.transition) {
+      if (!delivered_.insert(evt.virtual_key).second) {
         keystroke_flags |= 0x0004;  // XINPUT_KEYSTROKE_REPEAT
       }
     } else if (evt.transition == false) {
@@ -477,12 +485,52 @@ void KeyboardInputDriver::ClearPressedKeys() {
   for (auto& b : key_bindings_) {
     b.is_pressed = false;
   }
+  // Keystroke readers get the releases too.
+  for (const auto& [virtual_key, is_capital] : keys_down_) {
+    KeyEvent release;
+    release.virtual_key = virtual_key;
+    release.is_capital = is_capital;
+    key_events_.push(release);
+  }
+  keys_down_.clear();
+}
+
+void KeyboardInputDriver::DiscardKeystrokes() {
+  auto global_lock = global_critical_region_.Acquire();
+  // Releases of presses the title received are kept so they still pair.
+  std::queue<KeyEvent> releases;
+  for (; !key_events_.empty(); key_events_.pop()) {
+    const KeyEvent& evt = key_events_.front();
+    if (!evt.transition && delivered_.count(evt.virtual_key)) {
+      releases.push(evt);
+    }
+  }
+  key_events_.swap(releases);
+}
+
+void KeyboardInputDriver::ResetKeystrokes() {
+  auto global_lock = global_critical_region_.Acquire();
+  key_events_ = {};
+  delivered_.clear();
 }
 
 void KeyboardInputDriver::OnKey(ui::KeyEvent& e, bool is_down) {
   auto global_lock = global_critical_region_.Acquire();
 
-  const bool is_capital = e.is_shift_pressed();
+  // Ignore releases and repeats of keys whose press another listener handled.
+  // A held key keeps the shift state of its press so it maps to one binding
+  // throughout.
+  auto it = keys_down_.find(e.virtual_key());
+  if (it == keys_down_.end()) {
+    if (!is_down || e.prev_state()) {
+      return;
+    }
+    it = keys_down_.emplace(e.virtual_key(), e.is_shift_pressed()).first;
+  }
+  const bool is_capital = it->second;
+  if (!is_down) {
+    keys_down_.erase(it);
+  }
 
   KeyEvent key;
   key.virtual_key = e.virtual_key();
@@ -541,8 +589,6 @@ std::vector<InputDeviceInfo> KeyboardInputDriver::EnumerateDevices() {
   info.driver_slot = 0;
   info.stable_id = "keyboard";
   info.display_name = "Keyboard";
-  // User must explicitly bind the keyboard via the menu.
-  info.auto_bind = false;
   return {info};
 }
 

@@ -11,16 +11,6 @@ msgstr ""
 "Content-Transfer-Encoding: 8bit\n"
 "Plural-Forms: nplurals=1; plural=0;\n"
 
-#: src/xenia/ui/game_list_panel_wx.cc:596
-msgid ""
-"\n"
-"\n"
-"Browse for the file?"
-msgstr ""
-"\n"
-"\n"
-"是否瀏覽尋找檔案？"
-
 #: src/xenia/ui/game_scan_progress_dialog_wx.cc:55
 msgid "   %zu already installed"
 msgstr "   %zu 個已安裝"
@@ -1653,3 +1643,139 @@ msgstr "Xenia 依據 %s 散布"
 #: src/xenia/ui/game_info_panel_wx.cc:212
 msgid "Content"
 msgstr "內容"
+
+#: src/xenia/app/emulator_window.cc:405
+msgid "Alternate Guitar"
+msgstr "替代吉他"
+
+#: src/xenia/app/emulator_window.cc:407
+msgid "Bass Guitar"
+msgstr "貝斯"
+
+#: src/xenia/app/emulator_window.cc:2027
+msgid ""
+"Original Xbox games run through XeFu, the Xbox 360's backward compatibility emulator, and %s is missing from its folder:\n"
+"\n"
+"%s\n"
+"\n"
+"Copy xbox.xex and the xefu*.xex files there from the Compatibility folder of an Xbox 360 hard drive."
+msgstr ""
+"初代 Xbox 遊戲透過 Xbox 360 的回溯相容模擬器 XeFu 執行，但 XeFu 資料夾中缺少 %s：\n"
+"\n"
+"%s\n"
+"\n"
+"請將 Xbox 360 硬碟 Compatibility 資料夾中的 xbox.xex 和 xefu*.xex 檔案複製到該資料夾。"
+
+#: src/xenia/app/emulator_window.cc:2034
+msgid "XeFu not found"
+msgstr "找不到 XeFu"
+
+#: src/xenia/app/emulator_window.cc:3665
+msgid ""
+"Failed to launch title.\n"
+"\n"
+"Check xenia.log for technical details."
+msgstr ""
+"無法啟動遊戲。\n"
+"\n"
+"請查看 xenia.log 以了解技術詳細資料。"
+
+#: src/xenia/app/emulator_window.cc:3664
+msgid "Title Launch Failed!"
+msgstr "遊戲啟動失敗！"
+
+#: src/xenia/app/emulator_window.cc:2891
+msgid "Data migration"
+msgstr "資料轉移"
+
+#: src/xenia/app/emulator_window.cc:2891
+msgid ""
+"Some of your existing data couldn't be migrated to the new profile. Items that failed: %u\n"
+"\n"
+"Check xenia.log for technical details."
+msgstr ""
+"部分現有資料無法轉移到新設定檔。失敗的項目：%u\n"
+"\n"
+"請查看 xenia.log 以了解技術詳細資料。"
+
+#: src/xenia/app/emulator_window.cc:2897
+msgid "Your existing data was migrated to the new profile."
+msgstr "現有資料已轉移到新設定檔。"
+
+#: src/xenia/ui/game_list_panel_wx.cc:441
+msgid ""
+"No file path is set for this title.\n"
+"\n"
+"Browse for the file?"
+msgstr ""
+"未為此遊戲設定檔案路徑。\n"
+"\n"
+"是否瀏覽尋找檔案？"
+
+#: src/xenia/ui/game_list_panel_wx.cc:442
+msgid ""
+"File not found:\n"
+"%s\n"
+"\n"
+"Browse for the file?"
+msgstr ""
+"找不到檔案:\n"
+"%s\n"
+"\n"
+"是否瀏覽尋找檔案？"
+
+#: src/xenia/app/emulator_window.cc:2325
+msgid "Failed to read the system update."
+msgstr "無法讀取系統更新。"
+
+#: src/xenia/app/emulator_window.cc:2329
+msgid "Failed to write the system files."
+msgstr "無法寫入系統檔案。"
+
+#: src/xenia/app/emulator_window.cc:2296
+#: src/xenia/app/emulator_window.cc:2319
+#: src/xenia/app/emulator_window.cc:2324
+#: src/xenia/app/emulator_window.cc:2328
+#: src/xenia/app/emulator_window.cc:2333
+msgid "Install System Files"
+msgstr "安裝系統檔案"
+
+#: src/xenia/app/emulator_window.cc:1127
+msgid "Install System Files..."
+msgstr "安裝系統檔案…"
+
+#: src/xenia/app/emulator_window.cc:2297
+msgid "Installing the system files..."
+msgstr "正在安裝系統檔案…"
+
+#: src/xenia/app/emulator_window.cc:2282
+msgid "Select a USB System Update"
+msgstr "選取 USB 系統更新"
+
+#: src/xenia/app/emulator_window.cc:2310
+msgid "System files installed"
+msgstr "系統檔案已安裝"
+
+#: src/xenia/app/emulator_window.cc:2335
+msgid ""
+"The previous system files couldn't be put back in place. Move their folders back or delete them to install again. They are in:\n"
+"%s"
+msgstr ""
+"無法還原先前的系統檔案。若要再次安裝，請將其資料夾移回原位置或予以刪除。這些資料夾位於：\n"
+"%s"
+
+#: src/xenia/app/emulator_window.cc:2311
+msgid ""
+"The system files are installed in:\n"
+"%s"
+msgstr ""
+"系統檔案已安裝到下列位置：\n"
+"%s"
+
+#: src/xenia/app/emulator_window.cc:2320
+msgid "This file isn't a USB system update."
+msgstr "此檔案不是 USB 系統更新。"
+
+#: src/xenia/app/emulator_window.cc:1035
+msgid "Start Dashboard"
+msgstr "啟動 Xbox 設定畫面"

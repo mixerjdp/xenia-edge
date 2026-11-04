@@ -11,13 +11,13 @@
 #define XENIA_KERNEL_XFILE_H_
 
 #include <atomic>
+#include <deque>
 #include <functional>
 #include <mutex>
 #include <string>
 #include <vector>
 
 #include "xenia/kernel/guest_scheduler.h"
-#include "xenia/kernel/xevent.h"
 #include "xenia/kernel/xiocompletion.h"
 #include "xenia/vfs/device.h"
 #include "xenia/vfs/entry.h"
@@ -137,13 +137,10 @@ class XFile : public XObject {
  public:
   static const XObject::Type kObjectType = XObject::Type::File;
 
-  // Wake boost for a completed file request, NT's IO_DISK_INCREMENT.
-  static constexpr uint32_t kIoDiskIncrement = 1;
-
   // |alertable| is FILE_SYNCHRONOUS_IO_ALERT: a user APC can interrupt the
-  // wait.
+  // wait. |buffered| is the absence of FILE_NO_INTERMEDIATE_BUFFERING.
   XFile(KernelState* kernel_state, vfs::File* file, bool synchronous,
-        bool alertable);
+        bool alertable, bool buffered);
   ~XFile() override;
 
   vfs::Device* device() const { return file_->entry()->device(); }
@@ -171,20 +168,36 @@ class XFile : public XObject {
                        uint64_t byte_offset, uint32_t* out_bytes_read,
                        uint32_t apc_context, bool notify_completion = true);
 
-  // Runs |fn| on an I/O worker without waiting.
-  void PostIo(std::function<void()> fn);
-  // Signals the completion ports and this file's wait handle.
+  // Clears the handle's wait state, as every new request does.
+  void ResetWaitState() { async_event_->Reset(); }
+  // Runs |fn| on an I/O worker without waiting, after every request posted
+  // before it. |thread| issued the request. |fn| is told whether it was
+  // cancelled instead.
+  void PostIo(XThread* thread, std::function<void(bool cancelled)> fn);
+  // Cancels the requests |thread| posted that have yet to start.
+  void CancelPostedIo(XThread* thread);
+  // True while a request |thread| posted has yet to complete.
+  bool HasPostedIo(XThread* thread);
+  // Signals this file's wait handle. Posts to its completion port only for a
+  // request with an APC context.
   void NotifyCompletion(X_STATUS status, uint32_t num_bytes,
                         uint32_t apc_context);
 
+  // Write() appends when given this offset.
+  static constexpr uint64_t kEndOfFile = uint64_t(1) << 63;
   X_STATUS Write(uint32_t buffer_guess_address, uint32_t buffer_length,
                  uint64_t byte_offset, uint32_t* out_bytes_written,
-                 uint32_t apc_context);
+                 uint32_t apc_context, bool notify_completion = true);
 
   X_STATUS SetLength(size_t length);
-  X_STATUS Rename(const std::filesystem::path file_path);
+  // Sets the FILETIMEs that aren't 0.
+  X_STATUS SetTimes(uint64_t create_timestamp, uint64_t access_timestamp,
+                    uint64_t write_timestamp);
+  X_STATUS Rename(const std::filesystem::path file_path, bool replace_existing);
 
-  void RegisterIOCompletionPort(uint32_t key, object_ref<XIOCompletion> port);
+  // False when the handle already has a port.
+  bool RegisterIOCompletionPort(uint32_t key, object_ref<XIOCompletion> port);
+  bool HasCompletionPort();
   void RemoveIOCompletionPort(uint32_t key);
 
   bool Save(ByteStream* stream) override;
@@ -192,6 +205,7 @@ class XFile : public XObject {
                                    ByteStream* stream);
 
   bool is_synchronous() const { return is_synchronous_; }
+  bool is_buffered() const { return is_buffered_; }
 
  protected:
   void NotifyIOCompletionPorts(XIOCompletion::IONotification& notification);
@@ -206,11 +220,12 @@ class XFile : public XObject {
   // Concurrency class this file's device allows for its offloaded calls.
   GuestScheduler::BlockingCallClass io_call_class() const;
 
-  // Runs |fn| as a synchronous request: on a fiber it goes to an I/O worker and
-  // the caller waits on an event the completion signals, else it runs inline.
+  // Runs |fn| as a synchronous request on this file's device. See
+  // KernelState::RunBlockingIo.
   void RunSynchronousIo(const std::function<void()>& fn);
-  object_ref<XEvent> AcquireIoEvent();
-  void ReleaseIoEvent(object_ref<XEvent> event);
+
+  // Runs the requests PostIo queued until none are left.
+  void RunPostedIo();
 
   // Books this read on the medium and returns when it would be delivered, or
   // 0 for a read this does not model.
@@ -233,12 +248,21 @@ class XFile : public XObject {
                                uint32_t apc_context, bool notify_completion);
   X_STATUS WriteInternal(uint32_t buffer_guest_address, uint32_t buffer_length,
                          uint64_t byte_offset, uint32_t* out_bytes_written,
-                         uint32_t apc_context);
+                         uint32_t apc_context, bool notify_completion);
 
   vfs::File* file_ = nullptr;
+  // The handle's wait state. Manual reset like NT's file object event, so every
+  // wait after a completion returns until the next request clears it.
   std::unique_ptr<threading::Event> async_event_ = nullptr;
 
   mutable std::mutex file_lock_;
+  // Requests PostIo queued, with the thread that issued each. One worker at a
+  // time runs them in order.
+  std::mutex posted_lock_;
+  std::deque<std::pair<XThread*, std::function<void(bool)>>> posted_;
+  bool posted_running_ = false;
+  // The thread that issued the request running now.
+  XThread* posted_running_thread_ = nullptr;
   std::mutex completion_port_lock_;
   std::vector<std::pair<uint32_t, object_ref<XIOCompletion>>> completion_ports_;
 
@@ -251,12 +275,9 @@ class XFile : public XObject {
   xe::filesystem::WildcardEngine find_engine_;
   size_t find_index_ = 0;
 
-  // Pooled completion events, so a request creates no kernel object.
-  std::mutex io_event_lock_;
-  std::vector<object_ref<XEvent>> idle_io_events_;
-
   bool is_synchronous_ = false;
   bool is_alertable_ = false;
+  bool is_buffered_ = false;
 };
 
 }  // namespace kernel

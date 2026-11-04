@@ -19,6 +19,26 @@ namespace xboxkrnl {
 dword_result_t XexGetModuleHandle(std::string module_name,
                                   xe::be<uint32_t>* hmodule_ptr);
 
+// Takes a reference to the module at |module_name|, loading it first when it
+// isn't loaded. Returns its hmodule, or 0 when it can't be loaded.
+uint32_t xeXexLoadImage(const std::string_view module_name);
+
+// Drops a reference xeXexLoadImage or XexLoadImage took, unloading the module
+// with the last one.
+X_STATUS xeXexUnloadImage(uint32_t hmodule);
+
+enum X_MODULE_FLAGS : uint32_t {
+  TITLE_PROCESS = 0x00000001,
+  TITLE_IMPORT = 0x00000002,
+  DEBUGGER = 0x00000004,
+  LOAD_DLL = 0x00000008,
+  LOAD_PATCH = 0x00000010,
+  LOAD_FULL_PATCH = 0x00000020,
+  LOAD_DELTA_PATCH = 0x00000040,
+  BOUND_PATH = 0x40000000,
+  SILENT_LOAD = 0x80000000,
+};
+
 }  // namespace xboxkrnl
 }  // namespace kernel
 }  // namespace xe

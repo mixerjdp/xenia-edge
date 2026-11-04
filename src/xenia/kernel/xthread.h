@@ -436,10 +436,10 @@ class XThread : public XObject, public cpu::Thread {
   bool main_thread() const { return main_thread_; }
   bool is_running() const { return running_; }
 
-  // True for threads that run a host C++ routine (XHostThread) rather than
-  // guest PPC code. These always use a real host thread, never a cooperative
-  // fiber, since they run host loops/blocking and other code dereferences their
-  // thread().
+  // True for threads that run a host C++ routine (XHostThread) on a real host
+  // thread rather than a cooperative fiber, since they run host loops/blocking
+  // and other code dereferences their thread(). An XHostThread created on a
+  // fiber is not one.
   virtual bool is_host_thread() const { return false; }
 
   uint32_t thread_id() const { return thread_id_; }
@@ -458,8 +458,9 @@ class XThread : public XObject, public cpu::Thread {
   void EnterCriticalRegion();
   void LeaveCriticalRegion();
 
+  // |apc_mode| 1 queues a user APC, 0 a kernel APC.
   void EnqueueApc(uint32_t normal_routine, uint32_t normal_context,
-                  uint32_t arg1, uint32_t arg2);
+                  uint32_t arg1, uint32_t arg2, uint32_t apc_mode = 1);
   // Queues an owned APC initialized for this thread, unless already queued.
   bool InsertOwnedApc(uint32_t apc_ptr, uint32_t arg1, uint32_t arg2);
   void RemoveOwnedApc(uint32_t apc_ptr);
@@ -468,6 +469,9 @@ class XThread : public XObject, public cpu::Thread {
   // cooperative scheduler's alertable waits to return USER_APC, the same way a
   // host alertable wait wakes on a queued APC.
   bool HasPendingUserApc();
+  // True if a kernel APC is queued that this thread can run now, below
+  // APC_LEVEL, outside a critical region and outside another kernel APC.
+  bool HasDeliverableKernelApc();
 
   int32_t priority() const { return priority_; }
   int32_t QueryPriority();
@@ -577,10 +581,30 @@ class XThread : public XObject, public cpu::Thread {
     cpu::Function* handler_function = nullptr;
     // Guest buffer the handler receives as the trapped register frame.
     uint32_t kframes = 0;
+    // Guest buffer for the exception record a fault hands the handler.
+    uint32_t exception_record = 0;
     uint32_t leave_value = 0;
+    // The trap frame its KTHREAD names, where the console saves interrupted
+    // user code. Code running while it is interrupted sets and clears CR bits
+    // in the frame, which it resumes with.
+    uint32_t interrupt_frame = 0;
+    // Laid out as the trap frame the user mode trap handler receives. XeFu
+    // changes the CR in it.
+    static constexpr uint32_t kInterruptFrameSize = 0x1C0;
+    static constexpr uint32_t kInterruptFrameCr = 0x1B0;
+    // The CR saved in the frame, to tell what was changed there.
+    uint32_t interrupted_cr = 0;
+    // Where KeEnterUserMode restarts the fiber after a dispatched fault.
+    bool restart_pending = false;
+    uint32_t restart_address = 0;
     bool in_user_code = false;
   };
   UserMode* user_mode() const { return user_mode_.get(); }
+  // Saves the CR of the user code being interrupted in its trap frame.
+  void SaveInterruptedUserCr();
+  // Applies the CR bits changed in the trap frame since SaveInterruptedUserCr
+  // to the context, as returning to user code reloads CR from the frame.
+  void RestoreInterruptedUserCr();
   void set_user_mode(std::unique_ptr<UserMode> user_mode) {
     user_mode_ = std::move(user_mode);
   }
@@ -677,8 +701,6 @@ class XThread : public XObject, public cpu::Thread {
     // between. A spinning fiber has no other exit, so this separates one from
     // a thread that is merely running long.
     uint32_t unyielded_quanta = 0;
-    bool forced_preempt_logged =
-        false;                        // one forced-preempt warning per thread
     bool starved_out_logged = false;  // one starvation warning per thread
     // Set by an external Terminate, exits the fiber at its next
     // ExitIfTerminated check.
@@ -695,6 +717,8 @@ class XThread : public XObject, public cpu::Thread {
     bool wait_alertable = false;    // also re-poll on a pending user APC
     uint32_t wait_epoch = 0;        // object epoch sampled before the last poll
     uint64_t wait_deadline_ms = 0;  // absolute host uptime, 0 = none
+    // Also re-poll on a deliverable kernel APC.
+    bool wait_interruptible = true;
     // What this fiber parked in and the guest handles it named. Handles, not
     // XObject pointers: safe to print if the object is released mid-dump, and
     // they key the signal ring. Without it a multi-object wait dumps obj=0x0.
@@ -708,12 +732,13 @@ class XThread : public XObject, public cpu::Thread {
     XObject* wait_gate_objects[8] = {};
     uint8_t wait_gate_count = 0;
 
-    // Consecutive safepoints that declined to preempt because the guest was at
-    // IRQL >= 2. Bounds the defer so a guest spinning at DISPATCH_LEVEL on a
-    // co-resident holder cannot livelock its dispatch CPU forever.
+    // Safepoints since the last preemption that declined to preempt because the
+    // guest was at IRQL >= 2, as the console defers the dispatch. Diagnostic
+    // only.
     uint32_t preempt_defers_irql = 0;
-    // Same, for holding the global critical region. Diagnostic only - yielding
-    // there would let a co-resident fiber re-enter the recursive lock.
+    // Consecutive safepoints that declined to preempt while holding the global
+    // critical region. Diagnostic only - yielding there would let a co-resident
+    // fiber re-enter the recursive lock.
     uint32_t preempt_defers_lock = 0;
   };
   SchedulerLinks& scheduler_links() { return scheduler_links_; }
@@ -814,16 +839,19 @@ class XThread : public XObject, public cpu::Thread {
 
 class XHostThread : public XThread {
  public:
+  // |on_fiber| runs |host_fn| on a scheduler fiber instead, for a routine that
+  // only blocks in guest waits.
   XHostThread(KernelState* kernel_state, uint32_t stack_size,
               uint32_t creation_flags, std::function<int()> host_fn,
-              uint32_t guest_process = 0);
+              uint32_t guest_process = 0, bool on_fiber = false);
 
-  bool is_host_thread() const override { return true; }
+  bool is_host_thread() const override { return !on_fiber_; }
 
   void Execute() override;
 
  private:
   std::function<int()> host_fn_;
+  bool on_fiber_;
 };
 
 }  // namespace kernel

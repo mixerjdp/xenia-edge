@@ -13,6 +13,8 @@
 #include <atomic>
 #include <memory>
 #include <string>
+#include <unordered_set>
+#include <vector>
 
 #include "xenia/app/game_library.h"
 #include "xenia/emulator.h"
@@ -33,6 +35,8 @@
 #include "xenia/ui/window_listener.h"
 #include "xenia/ui/windowed_app_context.h"
 #include "xenia/xbox.h"
+
+class wxTimer;
 
 namespace xe {
 namespace app {
@@ -86,13 +90,21 @@ class EmulatorWindow {
 
   void OnEmulatorInitialized();
 
-  void LaunchTitleInNewProcess(const std::filesystem::path& path_to_file);
-  xe::X_STATUS RunTitle(const std::filesystem::path& path_to_file);
+  // Starts a new xenia process continuing this session with |args|, then
+  // |target| (UTF-8, empty for the game list). Returns whether it started.
+  bool SpawnEmulatorProcess(const std::vector<std::string>& args,
+                            const std::string& target);
+  // With |boot_animation| the boot animation plays before the title starts.
+  void LaunchTitleInNewProcess(const std::filesystem::path& path_to_file,
+                               bool boot_animation = false);
+  xe::X_STATUS RunTitle(const std::filesystem::path& path_to_file,
+                        bool boot_animation = false);
   void UpdateTitle();
 
   void SetFullscreen(bool fullscreen);
   void ToggleFullscreen();
   void SetInitializingShaderStorage(bool initializing);
+  void SetCompilingShaders(bool compiling);
 
   void TakeScreenshot();
   void ExportScreenshot(const xe::ui::RawImage& image);
@@ -105,7 +117,17 @@ class EmulatorWindow {
   void OpenConfigDialog(const std::string& category = "");
   void ToggleControllerVibration();
   void FileOpen();
+  // Asks for a title or disc image to run, or returns an empty path.
+  std::filesystem::path PickTitleFile();
   void FileAddGames();
+  // Starts the installed dashboard after the boot animation.
+  void StartDashboard();
+  std::filesystem::path GetInstalledDashboardPath() const;
+  // Whether a title leaves for the dashboard rather than the game list.
+  bool DashboardIsHome() const;
+  // Tells the user which XeFu file an original Xbox game was missing and where
+  // to put it.
+  void ShowMissingXeFuFile(const std::string& file);
 
   // Helper methods for updating cvars from config dialogs.
   void UpdateAntiAliasingCvar(gpu::CommandProcessor::SwapPostEffect effect);
@@ -163,10 +185,17 @@ class EmulatorWindow {
   // Builds game_library_, running the one-time GPD->library migration if
   // needed.
   void InitializeGameLibrary();
+  // Gives the core the library releases the dashboard lists as its games.
+  void PublishLibraryTitles();
 
   // Registers a just-launched title in the library so games opened outside the
   // import flow still appear in the list.
   void AddLaunchedTitleToLibrary(uint32_t title_id, const std::string& name);
+  // Records the disc a title was launched from as its release's default and
+  // stamps the release as played. Empty when the library declined the disc.
+  std::optional<LibraryKey> RecordLaunchedDisc(
+      uint32_t title_id, const std::string& name,
+      const std::filesystem::path& path);
 
   void OnKeyDown(ui::KeyEvent& e);
   void OnMouseDown(const ui::MouseEvent& e);
@@ -175,7 +204,9 @@ class EmulatorWindow {
   void OnMouseUp(const ui::MouseEvent& e);
   void FileClose();
   void UpdateAddGamesMenuState();
+  void UpdateStartDashboardMenuState();
   void InstallContent();
+  void InstallSystemFiles();
   void ShowContentDirectory();
   void CpuTimeScalarReset();
   void CpuTimeScalarSetHalf();
@@ -217,6 +248,8 @@ class EmulatorWindow {
 
   std::string base_title_;
   bool initializing_shader_storage_ = false;
+  bool compiling_shaders_ = false;
+  std::unique_ptr<wxTimer> compiling_shaders_hide_timer_;
 
   ui::ImGuiPostProcessingDialog* postprocessing_dialog_ = nullptr;
   ui::ImGuiPerformanceDialog* performance_dialog_ = nullptr;
@@ -224,9 +257,14 @@ class EmulatorWindow {
   ProfileConfigDialog* profile_dialog_ = nullptr;
   ui::ImGuiAudioDialog* audio_dialog_ = nullptr;
   ui::ImGuiContextMenu* context_menu_ = nullptr;
+  std::unordered_set<ui::VirtualKey> hotkeys_down_;
 
   GameListPanel* game_list_panel_ = nullptr;
   std::unique_ptr<GameLibrary> game_library_;
+  // Cleared when this window goes, which drops what the library fill thread
+  // still has queued for it.
+  std::shared_ptr<std::atomic<bool>> library_fill_alive_ =
+      std::make_shared<std::atomic<bool>>(true);
   std::unique_ptr<WxToolbarState> wx_toolbar_state_;
   // True when the app was started with --target and the title hasn't been
   // explicitly stopped yet — keeps the render pane visible during the gap
@@ -236,6 +274,7 @@ class EmulatorWindow {
   uint32_t default_logical_width_ = 0;
   uint32_t default_logical_height_ = 0;
   ui::MenuItem* file_open_menu_item_ = nullptr;
+  ui::MenuItem* file_start_dashboard_menu_item_ = nullptr;
   ui::MenuItem* file_add_games_menu_item_ = nullptr;
   ui::MenuItem* file_stop_menu_item_ = nullptr;
   ui::MenuItem* profile_menu_ = nullptr;
@@ -270,11 +309,19 @@ class EmulatorWindow {
   // Reapply the "render visible iff title open or fullscreen, game list
   // otherwise" invariant. Called on every relevant state change.
   void ApplyContentVisibility();
+  // Shows the game list, windowed at the default size, after a title stops or
+  // fails to launch.
+  void RestoreListWindow();
+  // Puts the game list back and says why a launch failed.
+  void OnLaunchFailed();
   // Tear down the running title on a non-guest thread and refresh the UI to
   // show the game list. Skips the user prompt — caller is responsible for
   // confirmation. Returns true if the title is being reset in-process, false
   // if a process swap was scheduled (or no title is open).
   bool StopTitleAndReturnToList();
+  // StopTitleAndReturnToList, or with DashboardIsHome, starts the dashboard in
+  // place of the title. Returns true when the dashboard is on its way.
+  bool StopTitleAndReturnHome();
 };
 
 }  // namespace app

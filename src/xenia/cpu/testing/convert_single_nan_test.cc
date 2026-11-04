@@ -14,8 +14,6 @@
 #include <utility>
 #include <vector>
 
-#include "xenia/cpu/ppc/ppc_emit.h"
-
 using namespace xe::cpu::hir;
 using namespace xe::cpu;
 using namespace xe::cpu::testing;
@@ -40,7 +38,7 @@ static bool IsDoubleNaN(uint64_t bits) {
 // which matches Xenon's stfs.
 TEST_CASE("PACK_SINGLE_KEEP_NAN", "[instr]") {
   TestFunction test([](HIRBuilder& b) {
-    Value* sbits = ppc::PackSingleKeepNaN(b, LoadFPR(b, 1));
+    Value* sbits = b.PackSingle(LoadFPR(b, 1));
     StoreGPR(b, 3, b.ZeroExtend(sbits, INT64_TYPE));
     b.Return();
   });
@@ -49,6 +47,13 @@ TEST_CASE("PACK_SINGLE_KEEP_NAN", "[instr]") {
   const std::vector<std::pair<uint64_t, uint32_t>> cases = {
       {0x3FF0000000000000ull, 0x3F800000u},  // 1.0
       {0xC000000000000000ull, 0xC0000000u},  // -2.0
+      // Rounding carries into or out of the single's bit 22. A finite input
+      // must not take the NaN fixup, which would restore that bit from the
+      // unrounded double.
+      {0x3FF7FFFFF0000000ull, 0x3FC00000u},  // tie rounds to +1.5
+      {0xBFF7FFFFF0000000ull, 0xBFC00000u},  // tie rounds to -1.5
+      {0x3FFFFFFFF0000000ull, 0x40000000u},  // tie rounds to +2.0
+      {0xBFFFFFFFF0000000ull, 0xC0000000u},  // tie rounds to -2.0
       {0x7FF0000000000000ull, 0x7F800000u},  // +inf
       {0xFFF0000000000000ull, 0xFF800000u},  // -inf
       {0x7FF8000000000000ull, 0x7FC00000u},  // qnan stays quiet
@@ -65,12 +70,26 @@ TEST_CASE("PACK_SINGLE_KEEP_NAN", "[instr]") {
   }
 }
 
+// A constant operand is materialised in a scratch register first.
+TEST_CASE("PACK_SINGLE_KEEP_NAN_CONSTANT", "[instr]") {
+  TestFunction test([](HIRBuilder& b) {
+    Value* sbits = b.PackSingle(
+        b.Cast(b.LoadConstantUint64(0x7FF4000000000000ull), FLOAT64_TYPE));
+    StoreGPR(b, 3, b.ZeroExtend(sbits, INT64_TYPE));
+    b.Return();
+  });
+  test.Run([](PPCContext* ctx) {},
+           [](PPCContext* ctx) {
+             REQUIRE(static_cast<uint32_t>(ctx->r[3]) == 0x7FA00000u);
+           });
+}
+
 // single -> double (lfs). Widening never drops NaN-ness, so the only fixup is
 // keeping the signaling bit the host convert would otherwise quiet.
 TEST_CASE("UNPACK_SINGLE_KEEP_NAN", "[instr]") {
   TestFunction test([](HIRBuilder& b) {
     Value* sbits = b.Truncate(LoadGPR(b, 1), INT32_TYPE);
-    StoreFPR(b, 3, ppc::UnpackSingleKeepNaN(b, sbits));
+    StoreFPR(b, 3, b.UnpackSingle(sbits));
     b.Return();
   });
 

@@ -34,9 +34,8 @@
 #include "xenia/kernel/util/xex2_util.h"
 #include "xenia/kernel/xmodule.h"
 
-#include "third_party/crypto/TinySHA1.hpp"
-#include "third_party/crypto/rijndael-alg-fst.c"
-#include "third_party/crypto/rijndael-alg-fst.h"
+#include "third_party/mbedtls/include/mbedtls/aes.h"
+#include "third_party/mbedtls/include/mbedtls/sha1.h"
 #include "xenia/cpu/ppc/ppc_decode_data.h"
 #include "xenia/cpu/ppc/ppc_instr.h"
 DEFINE_bool(disable_instruction_infocache, false,
@@ -74,27 +73,24 @@ static constexpr uint8_t xe_xex2_devkit_key[16] = {
 void aes_decrypt_buffer(const uint8_t* session_key, const uint8_t* input_buffer,
                         const size_t input_size, uint8_t* output_buffer,
                         const size_t output_size) {
-  uint32_t rk[4 * (MAXNR + 1)];
+  mbedtls_aes_context context;
+  mbedtls_aes_init(&context);
+  mbedtls_aes_setkey_dec(&context, session_key, 128);
   uint8_t ivec[16] = {0};
-  int32_t Nr = rijndaelKeySetupDec(rk, session_key, 128);
-  const uint8_t* ct = input_buffer;
-  uint8_t* pt = output_buffer;
-  for (size_t n = 0; n < input_size; n += 16, ct += 16, pt += 16) {
-    // Decrypt 16 uint8_ts from input -> output.
-    rijndaelDecrypt(rk, Nr, ct, pt);
-    for (size_t i = 0; i < 16; i++) {
-      // XOR with previous.
-      pt[i] ^= ivec[i];
-      // Set previous.
-      ivec[i] = ct[i];
-    }
-  }
+  mbedtls_aes_crypt_cbc(&context, MBEDTLS_AES_DECRYPT,
+                        std::min(input_size, output_size) & ~size_t(15), ivec,
+                        input_buffer, output_buffer);
+  mbedtls_aes_free(&context);
 }
 
 namespace xe {
 namespace cpu {
 
 using xe::kernel::KernelState;
+
+void DecryptXex2ImageKey(const uint8_t* encrypted_key, uint8_t* key) {
+  aes_decrypt_buffer(xe_xex2_retail_key, encrypted_key, 16, key, 16);
+}
 
 XexModule::XexModule(Processor* processor, KernelState* kernel_state)
     : Module(processor), kernel_state_(kernel_state) {}
@@ -214,7 +210,12 @@ int XexModule::ApplyPatch(XexModule* module) {
   xex2_opt_delta_patch_descriptor* patch_header = nullptr;
   GetOptHeader(XEX_HEADER_DELTA_PATCH_DESCRIPTOR,
                reinterpret_cast<void**>(&patch_header));
-  assert_not_null(patch_header);
+  if (!patch_header) {
+    // is_patch() only checks the module flags, so a malformed patch file can
+    // still lack the descriptor.
+    XELOGE("XEX patch has no delta patch descriptor");
+    return 1;
+  }
 
   uint32_t size = module->xex_header()->header_size;
   if (patch_header->delta_headers_source_offset > size) {
@@ -428,15 +429,12 @@ int XexModule::ApplyPatch(XexModule* module) {
   }
 
   uint8_t digest[0x14];
-  sha1::SHA1 s;
   // Now loop through each block and apply the delta patches inside
   while (cur_block->block_size) {
     const auto* next_block = (const xex2_compressed_block_info*)p;
 
     // Compare block hash, if no match we probably used wrong decrypt key
-    s.reset();
-    s.processBytes(p, cur_block->block_size);
-    s.finalize(digest);
+    mbedtls_sha1(p, cur_block->block_size, digest);
 
     if (memcmp(digest, cur_block->block_hash, 0x14) != 0) {
       result_code = 9;
@@ -497,6 +495,41 @@ int XexModule::ApplyPatch(XexModule* module) {
   return result_code;
 }
 
+// Also tells ReadImage whether its key was the right one. CLR native images
+// (.ni.dll) don't have the usual DOS stub after MZ. The PE header that e_lfanew
+// points at is checked instead.
+bool XexModule::is_valid_executable() const {
+  assert_not_zero(base_address_);
+  if (!base_address_) {
+    return false;
+  }
+  const uint8_t* image = memory()->TranslateVirtual(base_address_);
+  auto dos_header = reinterpret_cast<const XIMAGE_DOS_HEADER*>(image);
+  if (dos_header->e_magic != XIMAGE_DOS_SIGNATURE) {
+    return false;
+  }
+  const uint32_t nt_offset = uint32_t(dos_header->e_lfanew);
+  const uint32_t size = image_size();
+  if (size < sizeof(XIMAGE_NT_HEADERS32) ||
+      nt_offset > size - sizeof(XIMAGE_NT_HEADERS32)) {
+    return false;
+  }
+  auto nt_headers =
+      reinterpret_cast<const XIMAGE_NT_HEADERS32*>(image + nt_offset);
+  return nt_headers->Signature == XIMAGE_NT_SIGNATURE;
+}
+
+bool XexModule::has_code() const {
+  for (uint32_t i = 0; i < xex_security_info()->page_descriptor_count; i++) {
+    xex2_page_descriptor desc;
+    desc.value = xe::byte_swap(xex_security_info()->page_descriptors[i].value);
+    if (desc.info == XEX_SECTION_CODE) {
+      return true;
+    }
+  }
+  return false;
+}
+
 int XexModule::ReadImage(const void* xex_addr, size_t xex_length,
                          const uint8_t* key) {
   if (!opt_file_format_info()) {
@@ -515,7 +548,9 @@ int XexModule::ReadImage(const void* xex_addr, size_t xex_length,
     return 0;
   }
 
-  memory()->LookupHeap(base_address_)->Reset();
+  // Drop the image left by an attempt with a different key. Only release our
+  // own region: other modules may already live in this heap.
+  ReleaseImage();
 
   aes_decrypt_buffer(
       key, reinterpret_cast<const uint8_t*>(xex_security_info()->aes_key), 16,
@@ -541,12 +576,31 @@ int XexModule::ReadImage(const void* xex_addr, size_t xex_length,
     return result_code;
   }
 
-  if (is_patch() || is_valid_executable()) {
+  // Without code there's no PE header to tell the key by.
+  if (is_patch() || is_valid_executable() || !has_code()) {
     return 0;
   }
 
   // Not a patch and image doesn't have proper PE header, return 3
   return 3;
+}
+
+bool XexModule::AllocImage(uint32_t size) {
+  image_allocated_ =
+      memory()
+          ->LookupHeap(base_address_)
+          ->AllocFixed(
+              base_address_, size, 4096,
+              xe::kMemoryAllocationReserve | xe::kMemoryAllocationCommit,
+              xe::kMemoryProtectRead | xe::kMemoryProtectWrite);
+  return image_allocated_;
+}
+
+void XexModule::ReleaseImage() {
+  if (image_allocated_) {
+    memory()->LookupHeap(base_address_)->Release(base_address_);
+    image_allocated_ = false;
+  }
 }
 
 int XexModule::ReadImageUncompressed(const void* xex_addr, size_t xex_length) {
@@ -555,14 +609,7 @@ int XexModule::ReadImageUncompressed(const void* xex_addr, size_t xex_length) {
       static_cast<uint32_t>(xex_length - xex_header()->header_size);
 
   uint32_t uncompressed_size = exe_length;
-  bool alloc_result =
-      memory()
-          ->LookupHeap(base_address_)
-          ->AllocFixed(
-              base_address_, uncompressed_size, 4096,
-              xe::kMemoryAllocationReserve | xe::kMemoryAllocationCommit,
-              xe::kMemoryProtectRead | xe::kMemoryProtectWrite);
-  if (!alloc_result) {
+  if (!AllocImage(uncompressed_size)) {
     XELOGE("Unable to allocate XEX memory at {:08X}-{:08X}.", base_address_,
            uncompressed_size);
     return 2;
@@ -625,11 +672,7 @@ int XexModule::ReadImageBasicCompressed(const void* xex_addr,
   }
 
   // Allocate in-place the XEX memory.
-  bool alloc_result = heap->AllocFixed(
-      base_address_, total_size, 4096,
-      xe::kMemoryAllocationReserve | xe::kMemoryAllocationCommit,
-      xe::kMemoryProtectRead | xe::kMemoryProtectWrite);
-  if (!alloc_result) {
+  if (!AllocImage(total_size)) {
     XELOGE("Unable to allocate XEX memory at {:08X}-{:08X}.", base_address_,
            uncompressed_size);
     return 1;
@@ -639,36 +682,33 @@ int XexModule::ReadImageBasicCompressed(const void* xex_addr,
   std::memset(buffer, 0, total_size);  // Quickly zero the contents.
   uint8_t* d = buffer;
 
-  uint32_t rk[4 * (MAXNR + 1)];
+  mbedtls_aes_context context;
+  mbedtls_aes_init(&context);
+  mbedtls_aes_setkey_dec(&context, session_key_, 128);
   uint8_t ivec[16] = {0};
-  int32_t Nr = rijndaelKeySetupDec(rk, session_key_, 128);
 
   for (size_t n = 0; n < block_count; n++) {
     const uint32_t data_size = comp_info.blocks[n].data_size;
     const uint32_t zero_size = comp_info.blocks[n].zero_size;
 
+    // Block sizes come from the file. Decryption only covers whole 16-byte
+    // blocks within data_size.
+    const size_t source_offset = size_t(p - source_buffer);
+    const size_t dest_offset = size_t(d - buffer);
+    if (data_size > exe_length - source_offset || dest_offset > total_size ||
+        data_size > total_size - dest_offset) {
+      XELOGE("XEX basic compression block {} is out of bounds", n);
+      return 1;
+    }
+
     switch (opt_file_format_info()->encryption_type) {
       case XEX_ENCRYPTION_NONE:
-        if (data_size > uncompressed_size - (d - buffer)) {
-          // Overflow.
-          return 1;
-        }
         memcpy(d, p, data_size);
         break;
-      case XEX_ENCRYPTION_NORMAL: {
-        const uint8_t* ct = p;
-        uint8_t* pt = d;
-        for (size_t m = 0; m < data_size; m += 16, ct += 16, pt += 16) {
-          // Decrypt 16 uint8_ts from input -> output.
-          rijndaelDecrypt(rk, Nr, ct, pt);
-          for (size_t i = 0; i < 16; i++) {
-            // XOR with previous.
-            pt[i] ^= ivec[i];
-            // Set previous.
-            ivec[i] = ct[i];
-          }
-        }
-      } break;
+      case XEX_ENCRYPTION_NORMAL:
+        mbedtls_aes_crypt_cbc(&context, MBEDTLS_AES_DECRYPT, data_size & ~15u,
+                              ivec, p, d);
+        break;
       default:
         assert_always();
         return 1;
@@ -678,6 +718,7 @@ int XexModule::ReadImageBasicCompressed(const void* xex_addr,
     d += data_size + zero_size;
   }
 
+  mbedtls_aes_free(&context);
   return 0;
 }
 
@@ -698,7 +739,6 @@ int XexModule::ReadImageCompressed(const void* xex_addr, size_t xex_length) {
   uint8_t* compress_buffer = NULL;
   const uint8_t* p = NULL;
   uint8_t* d = NULL;
-  sha1::SHA1 s;
 
   // Decrypt (if needed).
   bool free_input = false;
@@ -739,9 +779,7 @@ int XexModule::ReadImageCompressed(const void* xex_addr, size_t xex_length) {
     const auto* next_block = (const xex2_compressed_block_info*)p;
 
     // Compare block hash, if no match we probably used wrong decrypt key
-    s.reset();
-    s.processBytes(p, cur_block->block_size);
-    s.finalize(block_calced_digest);
+    mbedtls_sha1(p, cur_block->block_size, block_calced_digest);
     if (memcmp(block_calced_digest, cur_block->block_hash, 0x14) != 0) {
       result_code = 2;
       break;
@@ -771,15 +809,7 @@ int XexModule::ReadImageCompressed(const void* xex_addr, size_t xex_length) {
     uint32_t uncompressed_size = image_size();
 
     // Allocate in-place the XEX memory.
-    bool alloc_result =
-        memory()
-            ->LookupHeap(base_address_)
-            ->AllocFixed(
-                base_address_, uncompressed_size, 4096,
-                xe::kMemoryAllocationReserve | xe::kMemoryAllocationCommit,
-                xe::kMemoryProtectRead | xe::kMemoryProtectWrite);
-
-    if (alloc_result) {
+    if (AllocImage(uncompressed_size)) {
       uint8_t* buffer = memory()->TranslateVirtual(base_address_);
       std::memset(buffer, 0, uncompressed_size);
 
@@ -940,10 +970,11 @@ bool XexModule::Load(const std::string_view name, const std::string_view path,
       break;
     case kXEX25Signature:
       xex_format_ = kFormatXex25;
-      XELOGE("Loading XEX%");
+      XELOGI("Loading XEX%");
       break;
     case kXEX1Signature:
       xex_format_ = kFormatXex1;
+      XELOGI("Loading XEX1");
       break;
     case kXEX2Signature:
       xex_format_ = kFormatXex2;
@@ -1001,6 +1032,7 @@ bool XexModule::Load(const std::string_view name, const std::string_view path,
         result_code = ReadImage(xex_addr, xex_length, xe_xex1_devkit_key);
         if (result_code) {
           XELOGE("XEX load failed with code {}", result_code);
+          ReleaseImage();
           return false;
         }
       }
@@ -1010,6 +1042,33 @@ bool XexModule::Load(const std::string_view name, const std::string_view path,
   // Note: caller will have to call LoadContinue once it's determined whether a
   // patch file exists or not!
   return true;
+}
+
+// The names to load an import library by, in order.
+static std::vector<std::string> ImportLibraryNames(
+    const std::string_view module_name, uint32_t title_id,
+    const std::string_view library_name) {
+  std::vector<std::string> names;
+  // xefu2019.xex and the xefu2021 builds all import xefutitle.xex. A folder
+  // holding several names each after its build, as xefutitle2019.xex, or
+  // without the build letter, as xefutitle2021.xex for xefu2021c.xex.
+  if (title_id == kXeFuTitleId &&
+      xe::utf8::equal_case(library_name, "xefutitle.xex") &&
+      module_name.size() > 4 &&
+      xe::utf8::starts_with_case(module_name, "xefu")) {
+    const std::string suffix(module_name.substr(4));
+    names.push_back("xefutitle" + suffix + ".xex");
+    std::string build = suffix;
+    while (!build.empty() && ((build.back() >= 'a' && build.back() <= 'z') ||
+                              (build.back() >= 'A' && build.back() <= 'Z'))) {
+      build.pop_back();
+    }
+    if (!build.empty() && build != suffix) {
+      names.push_back("xefutitle" + build + ".xex");
+    }
+  }
+  names.emplace_back(library_name);
+  return names;
 }
 
 bool XexModule::LoadContinue() {
@@ -1022,7 +1081,7 @@ bool XexModule::LoadContinue() {
 
   finished_load_ = true;
 
-  if (ReadPEHeaders()) {
+  if (has_code() && ReadPEHeaders()) {
     XELOGE("Failed to load XEX PE headers!");
     return false;
   }
@@ -1063,7 +1122,11 @@ bool XexModule::LoadContinue() {
   }
 
   // Notify backend that we have an executable range.
-  processor_->backend()->CommitExecutableRange(low_address_, high_address_);
+  if (has_code()) {
+    processor_->backend()->CommitExecutableRange(low_address_, high_address_);
+  } else {
+    low_address_ = 0;
+  }
 
   // Add all imports (variables/functions).
   xex2_opt_import_libraries* opt_import_libraries = nullptr;
@@ -1091,6 +1154,10 @@ bool XexModule::LoadContinue() {
       }
     }
 
+    const auto* execution_info = opt_execution_info();
+    const uint32_t title_id =
+        execution_info ? static_cast<uint32_t>(execution_info->title_id) : 0;
+
     auto library_data = reinterpret_cast<uint8_t*>(opt_import_libraries);
     uint32_t library_offset = opt_import_libraries->string_table.size + 12;
     while (library_offset < opt_import_libraries->size) {
@@ -1106,10 +1173,30 @@ bool XexModule::LoadContinue() {
       auto library_name = std::string(string_table[library_name_index]);
 
       if (!kernel_state_->IsModuleLoaded(library_name)) {
-        if (auto module = kernel_state_->LoadUserModule(library_name)) {
-          if (kernel_state_->FinishLoadingUserModule(module, false)) {
-            library_name = module->path();
+        kernel::object_ref<kernel::UserModule> module;
+        for (const auto& name :
+             ImportLibraryNames(name_, title_id, library_name)) {
+          // A name other than its own is only tried beside this module where
+          // it exists, so as not to log not finding it.
+          std::string load_path = name;
+          if (name != library_name) {
+            load_path = xe::utf8::join_guest_paths(
+                xe::utf8::find_base_guest_path(path_), name);
+            if (!kernel_state_->file_system()->ResolvePath(load_path)) {
+              continue;
+            }
           }
+          module = kernel_state_->LoadUserModule(load_path);
+          if (module) {
+            break;
+          }
+        }
+        if (module) {
+          kernel_state_->FinishLoadingUserModule(module, false);
+          // Its name can differ from the import's.
+          library_name = module->path();
+        } else {
+          missing_import_libs_.push_back(library_name);
         }
       }
 
@@ -1157,15 +1244,13 @@ bool XexModule::LoadContinue() {
 }
 
 void XexModule::Precompile() {
-  sha1::SHA1 final_image_sha_;
-
-  final_image_sha_.reset();
-
+  if (!has_code()) {
+    return;
+  }
   unsigned high_code = this->high_address_ - this->low_address_;
 
-  final_image_sha_.processBytes(memory()->TranslateVirtual(this->low_address_),
-                                high_code);
-  final_image_sha_.finalize(image_sha_bytes_);
+  mbedtls_sha1(memory()->TranslateVirtual(this->low_address_), high_code,
+               image_sha_bytes_);
 
   image_sha_str_.clear();
   for (unsigned i = 0; i < sizeof(image_sha_bytes_); ++i) {
@@ -1704,12 +1789,8 @@ std::vector<uint32_t> XexModule::PreanalyzeCode() {
     }
   }
   uint32_t high_8_aligned = highest_exec_addr & ~(8U - 1);
-  uint32_t n_possible_8byte_addresses = (high_8_aligned - low_8_aligned) / 8;
-  uint32_t* funcstart_candidate_stack =
-      new uint32_t[n_possible_8byte_addresses];
-  uint32_t* funcstart_candstack2 = new uint32_t[n_possible_8byte_addresses];
-
-  uint32_t stack_pos = 0;
+  std::vector<uint32_t> funcstarts;
+  funcstarts.reserve((high_8_aligned - low_8_aligned) / 8);
   {
     // all functions seem to start on 8 byte boundaries, except for obvious ones
     // like the save/rest funcs
@@ -1731,8 +1812,8 @@ std::vector<uint32_t> XexModule::PreanalyzeCode() {
     uint32_t mfspr_r12_lr32 =
         *reinterpret_cast<const uint32_t*>(&mfspr_r12_lr[0]);
 
-    auto add_new_func = [funcstart_candidate_stack, &stack_pos](uint32_t addr) {
-      funcstart_candidate_stack[stack_pos++] = addr;
+    auto add_new_func = [&funcstarts](uint32_t addr) {
+      funcstarts.push_back(addr);
     };
     /*
                 First pass: detect save of the link register at an eight byte
@@ -1786,6 +1867,95 @@ std::vector<uint32_t> XexModule::PreanalyzeCode() {
       }
     }
 
+    // Third pass: functions whose address is formed with lis + addi/ori, such
+    // as callbacks stored into a table. A leaf that is never the target of a bl
+    // has no .pdata entry and can follow the previous blr without padding, so
+    // none of the passes above find it and it compiles on first call.
+    auto in_code_section = [this](uint32_t address) {
+      for (auto& section : pe_sections_) {
+        if ((section.flags & kXEPESectionContainsCode) &&
+            address >= section.address &&
+            address - section.address < section.size) {
+          return true;
+        }
+      }
+      return false;
+    };
+    auto read = [this](uint32_t address) -> uint32_t {
+      return *memory()->TranslateVirtualBE<uint32_t>(address);
+    };
+    auto is_address_taken_function = [&](uint32_t address) {
+      if ((address & 3) || !in_code_section(address) ||
+          !in_code_section(address - 4)) {
+        return false;
+      }
+      uint32_t first = read(address);
+      // A table of code addresses (a jump table) rather than code.
+      if (!first || in_code_section(first)) {
+        return false;
+      }
+      uint32_t previous = read(address - 4);
+      bool previous_is_b =
+          (previous >> 26) == 18 && !ppc::PPCOpcodeBits{previous}.I.LK;
+      return !previous || previous == 0x4E800020 || previous_is_b;
+    };
+    // How far an addi/ori may follow the lis its value started from.
+    constexpr uint32_t kConstantWindowBytes = 64;
+    for (auto& section : pe_sections_) {
+      if (!(section.flags & kXEPESectionContainsCode)) {
+        continue;
+      }
+      std::array<uint32_t, 32> registers = {};
+      std::array<uint32_t, 32> lis_address = {};
+      auto clear = [&](uint32_t reg) { lis_address[reg] = 0; };
+      uint32_t section_end = section.address + (section.size & ~3u);
+      for (uint32_t address = section.address; address < section_end;
+           address += 4) {
+        uint32_t code = read(address);
+        ppc::PPCOpcodeBits bits{code};
+        uint32_t opcode = code >> 26;
+        if (opcode == 15 && !bits.D.RA) {
+          registers[bits.D.RT] = static_cast<uint32_t>(bits.D.DS) << 16;
+          lis_address[bits.D.RT] = address;
+          continue;
+        }
+        uint32_t source = 32, dest = 32, value = 0;
+        if (opcode == 14 && bits.D.RA) {
+          source = bits.D.RA;
+          dest = bits.D.RT;
+          value = registers[source] +
+                  static_cast<uint32_t>(ppc::XEEXTS16(bits.D.DS));
+        } else if (opcode == 24) {
+          source = bits.D.RT;
+          dest = bits.D.RA;
+          value = registers[source] | bits.D.DS;
+        }
+        if (source != 32 && lis_address[source] &&
+            address - lis_address[source] <= kConstantWindowBytes) {
+          registers[dest] = value;
+          lis_address[dest] = lis_address[source];
+          if (is_address_taken_function(value)) {
+            add_new_func(value);
+          }
+          continue;
+        }
+        // Anything else that may write a register ends its constant. Clearing
+        // too much only loses a candidate; a stale high half invents one.
+        bool is_branch = opcode == 16 || opcode == 18 || opcode == 19;
+        if (is_branch && (code & 1)) {
+          // A call clobbers the volatile registers.
+          clear(0);
+          for (uint32_t reg = 3; reg <= 12; ++reg) {
+            clear(reg);
+          }
+        } else if (!is_branch && opcode != 10 && opcode != 11) {
+          // Update forms and logical ops write RA, most others RT.
+          clear(bits.D.RT);
+          clear(bits.D.RA);
+        }
+      }
+    }
+
     auto pdata = this->GetPESection(".pdata");
 
     if (pdata) {
@@ -1808,34 +1978,10 @@ std::vector<uint32_t> XexModule::PreanalyzeCode() {
 
   // Sort the list of function starts and then ensure that all addresses are
   // unique
-  uint32_t n_known_funcaddrs = 0;
-  {
-    // make addresses unique
-
-    std::sort(funcstart_candidate_stack, funcstart_candidate_stack + stack_pos);
-
-    uint32_t read_pos = 0;
-    uint32_t write_pos = 0;
-    uint32_t previous_addr = ~0u;
-    while (read_pos < stack_pos) {
-      uint32_t current_addr = funcstart_candidate_stack[read_pos++];
-
-      if (current_addr != previous_addr) {
-        previous_addr = current_addr;
-        funcstart_candstack2[write_pos++] = current_addr;
-      }
-    }
-    n_known_funcaddrs = write_pos;
-  }
-
-  delete[] funcstart_candidate_stack;
-
-  std::vector<uint32_t> result;
-  result.resize(n_known_funcaddrs);
-  memcpy(&result[0], funcstart_candstack2,
-         sizeof(uint32_t) * n_known_funcaddrs);
-  delete[] funcstart_candstack2;
-  return result;
+  std::sort(funcstarts.begin(), funcstarts.end());
+  funcstarts.erase(std::unique(funcstarts.begin(), funcstarts.end()),
+                   funcstarts.end());
+  return funcstarts;
 }
 bool XexModule::FindSaveRest() {
   // Special stack save/restore functions.

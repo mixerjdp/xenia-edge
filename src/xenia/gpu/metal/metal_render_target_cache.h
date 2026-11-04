@@ -130,8 +130,8 @@ class MetalRenderTargetCache final : public gpu::RenderTargetCache {
 
   bool Update(bool is_rasterization_done,
               reg::RB_DEPTHCONTROL normalized_depth_control,
-              uint32_t normalized_color_mask,
-              const Shader& vertex_shader) override;
+              uint32_t normalized_color_mask, const Shader& vertex_shader,
+              int32_t window_offset_tiles) override;
 
   // Metal-specific methods
   // render_encoder_pending tells whether a render encoder is still to be
@@ -230,6 +230,9 @@ class MetalRenderTargetCache final : public gpu::RenderTargetCache {
   uint32_t GetMaxRenderTargetHeight() const override;
 
   RenderTarget* CreateRenderTarget(RenderTargetKey key) override;
+  bool CanReuseRenderTarget(const RenderTarget& render_target) const override;
+  void RenderTargetReused(RenderTarget& render_target,
+                          RenderTargetKey old_key) override;
 
   bool IsHostDepthEncodingDifferent(
       xenos::DepthRenderTargetFormat format) const override;

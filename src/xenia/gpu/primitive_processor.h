@@ -212,8 +212,8 @@ class PrimitiveProcessor {
   // Also include padding for co-alignment of the source and the destination for
   // SIMD.
   static constexpr uint32_t kMinRequiredConvertedIndexBufferSize =
-      sizeof(uint32_t) * (UINT16_MAX - 2) * 3 *
-      +XE_GPU_PRIMITIVE_PROCESSOR_SIMD_SIZE;
+      sizeof(uint32_t) * (UINT16_MAX - 2) * 3 +
+      XE_GPU_PRIMITIVE_PROCESSOR_SIMD_SIZE;
 
   PrimitiveProcessor(const RegisterFile& register_file, Memory& memory,
                      TraceWriter& trace_writer, SharedMemory& shared_memory)
@@ -924,7 +924,7 @@ class PrimitiveProcessor {
   // Modified by the processor, read by the invalidation callback.
   uint32_t cache_currently_processing_base_ = 0;
   // 0 if not in a cache transaction that hasn't found an existing entry
-  // currently.
+  // currently, or if the range was invalidated during the transaction.
   uint32_t cache_currently_processing_size_bytes_ = 0;
   // Modified by both the processor and the invalidation callback.
   size_t cache_bucket_free_first_entry_ = SIZE_MAX;

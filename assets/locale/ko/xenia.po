@@ -11,16 +11,6 @@ msgstr ""
 "Content-Transfer-Encoding: 8bit\n"
 "Plural-Forms: nplurals=1; plural=0;\n"
 
-#: src/xenia/ui/game_list_panel_wx.cc:596
-msgid ""
-"\n"
-"\n"
-"Browse for the file?"
-msgstr ""
-"\n"
-"\n"
-"파일을 찾아보시겠습니까?"
-
 #: src/xenia/ui/game_scan_progress_dialog_wx.cc:55
 msgid "   %zu already installed"
 msgstr "   %zu개 이미 설치됨"
@@ -1658,3 +1648,139 @@ msgstr "Xenia는 %s에 따라 배포됩니다"
 #: src/xenia/ui/game_info_panel_wx.cc:212
 msgid "Content"
 msgstr "콘텐츠"
+
+#: src/xenia/app/emulator_window.cc:405
+msgid "Alternate Guitar"
+msgstr "대체 기타"
+
+#: src/xenia/app/emulator_window.cc:407
+msgid "Bass Guitar"
+msgstr "베이스 기타"
+
+#: src/xenia/app/emulator_window.cc:2027
+msgid ""
+"Original Xbox games run through XeFu, the Xbox 360's backward compatibility emulator, and %s is missing from its folder:\n"
+"\n"
+"%s\n"
+"\n"
+"Copy xbox.xex and the xefu*.xex files there from the Compatibility folder of an Xbox 360 hard drive."
+msgstr ""
+"초대 Xbox 게임은 Xbox 360의 하위 호환성 에뮬레이터인 XeFu로 실행되지만, XeFu 폴더에 %s 파일이 없습니다:\n"
+"\n"
+"%s\n"
+"\n"
+"Xbox 360 하드 드라이브의 Compatibility 폴더에서 xbox.xex와 xefu*.xex 파일을 이 폴더로 복사하세요."
+
+#: src/xenia/app/emulator_window.cc:2034
+msgid "XeFu not found"
+msgstr "XeFu를 찾을 수 없음"
+
+#: src/xenia/app/emulator_window.cc:3665
+msgid ""
+"Failed to launch title.\n"
+"\n"
+"Check xenia.log for technical details."
+msgstr ""
+"게임을 실행하지 못했습니다.\n"
+"\n"
+"기술적인 세부 정보는 xenia.log를 확인하세요."
+
+#: src/xenia/app/emulator_window.cc:3664
+msgid "Title Launch Failed!"
+msgstr "게임 실행 실패!"
+
+#: src/xenia/app/emulator_window.cc:2891
+msgid "Data migration"
+msgstr "데이터 마이그레이션"
+
+#: src/xenia/app/emulator_window.cc:2891
+msgid ""
+"Some of your existing data couldn't be migrated to the new profile. Items that failed: %u\n"
+"\n"
+"Check xenia.log for technical details."
+msgstr ""
+"기존 데이터 일부를 새 프로필로 마이그레이션하지 못했습니다. 실패한 항목: %u\n"
+"\n"
+"기술적인 세부 정보는 xenia.log를 확인하세요."
+
+#: src/xenia/app/emulator_window.cc:2897
+msgid "Your existing data was migrated to the new profile."
+msgstr "기존 데이터를 새 프로필로 마이그레이션했습니다."
+
+#: src/xenia/ui/game_list_panel_wx.cc:441
+msgid ""
+"No file path is set for this title.\n"
+"\n"
+"Browse for the file?"
+msgstr ""
+"이 게임에 대한 파일 경로가 설정되지 않았습니다.\n"
+"\n"
+"파일을 찾아보시겠습니까?"
+
+#: src/xenia/ui/game_list_panel_wx.cc:442
+msgid ""
+"File not found:\n"
+"%s\n"
+"\n"
+"Browse for the file?"
+msgstr ""
+"파일을 찾을 수 없음:\n"
+"%s\n"
+"\n"
+"파일을 찾아보시겠습니까?"
+
+#: src/xenia/app/emulator_window.cc:2325
+msgid "Failed to read the system update."
+msgstr "시스템 업데이트를 읽지 못했습니다."
+
+#: src/xenia/app/emulator_window.cc:2329
+msgid "Failed to write the system files."
+msgstr "시스템 파일을 쓰지 못했습니다."
+
+#: src/xenia/app/emulator_window.cc:2296
+#: src/xenia/app/emulator_window.cc:2319
+#: src/xenia/app/emulator_window.cc:2324
+#: src/xenia/app/emulator_window.cc:2328
+#: src/xenia/app/emulator_window.cc:2333
+msgid "Install System Files"
+msgstr "시스템 파일 설치"
+
+#: src/xenia/app/emulator_window.cc:1127
+msgid "Install System Files..."
+msgstr "시스템 파일 설치…"
+
+#: src/xenia/app/emulator_window.cc:2297
+msgid "Installing the system files..."
+msgstr "시스템 파일 설치 중…"
+
+#: src/xenia/app/emulator_window.cc:2282
+msgid "Select a USB System Update"
+msgstr "USB 시스템 업데이트 선택"
+
+#: src/xenia/app/emulator_window.cc:2310
+msgid "System files installed"
+msgstr "시스템 파일 설치 완료"
+
+#: src/xenia/app/emulator_window.cc:2335
+msgid ""
+"The previous system files couldn't be put back in place. Move their folders back or delete them to install again. They are in:\n"
+"%s"
+msgstr ""
+"이전 시스템 파일을 복원하지 못했습니다. 다시 설치하려면 해당 폴더를 원래 위치로 옮기거나 삭제하세요. 폴더는 다음 위치에 있습니다:\n"
+"%s"
+
+#: src/xenia/app/emulator_window.cc:2311
+msgid ""
+"The system files are installed in:\n"
+"%s"
+msgstr ""
+"시스템 파일이 다음 위치에 설치되었습니다:\n"
+"%s"
+
+#: src/xenia/app/emulator_window.cc:2320
+msgid "This file isn't a USB system update."
+msgstr "이 파일은 USB 시스템 업데이트가 아닙니다."
+
+#: src/xenia/app/emulator_window.cc:1035
+msgid "Start Dashboard"
+msgstr "대시보드 시작"

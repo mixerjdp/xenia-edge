@@ -1405,6 +1405,18 @@ Value* HIRBuilder::Max(Value* value1, Value* value2) {
   return i->dest;
 }
 
+// quirk = (any operand denormal) && (all operands finite), as i8 0/1. Unused
+// slots repeat an operand.
+Value* HIRBuilder::DenormalQuirk(Value* value1, Value* value2, Value* value3) {
+  assert_true(value1->type == FLOAT64_TYPE && value2->type == FLOAT64_TYPE &&
+              value3->type == FLOAT64_TYPE);
+  Instr* i = AppendInstr(OPCODE_DENORMAL_QUIRK_info, 0, AllocValue(INT8_TYPE));
+  i->set_src1(value1);
+  i->set_src2(value2);
+  i->set_src3(value3);
+  return i->dest;
+}
+
 Value* HIRBuilder::VectorMax(Value* value1, Value* value2, TypeName part_type,
                              uint32_t arithmetic_flags) {
   ASSERT_TYPES_EQUAL(value1, value2);
@@ -1627,6 +1639,23 @@ Value* HIRBuilder::VectorDenormFlush(Value* value1) {
 Value* HIRBuilder::ToSingle(Value* value) {
   assert_true(value->type == FLOAT64_TYPE);
   Instr* i = AppendInstr(OPCODE_TO_SINGLE_info, 0, AllocValue(FLOAT64_TYPE));
+  i->set_src1(value);
+  i->src2.value = nullptr;
+  i->src3.value = nullptr;
+  return i->dest;
+}
+Value* HIRBuilder::UnpackSingle(Value* single_bits) {
+  assert_true(single_bits->type == INT32_TYPE);
+  Instr* i =
+      AppendInstr(OPCODE_UNPACK_SINGLE_info, 0, AllocValue(FLOAT64_TYPE));
+  i->set_src1(single_bits);
+  i->src2.value = nullptr;
+  i->src3.value = nullptr;
+  return i->dest;
+}
+Value* HIRBuilder::PackSingle(Value* value) {
+  assert_true(value->type == FLOAT64_TYPE);
+  Instr* i = AppendInstr(OPCODE_PACK_SINGLE_info, 0, AllocValue(INT32_TYPE));
   i->set_src1(value);
   i->src2.value = nullptr;
   i->src3.value = nullptr;

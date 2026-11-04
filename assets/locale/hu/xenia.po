@@ -11,16 +11,6 @@ msgstr ""
 "Content-Transfer-Encoding: 8bit\n"
 "Plural-Forms: nplurals=2; plural=(n != 1);\n"
 
-#: src/xenia/ui/game_list_panel_wx.cc:596
-msgid ""
-"\n"
-"\n"
-"Browse for the file?"
-msgstr ""
-"\n"
-"\n"
-"Kíván tallózni a fájl után?"
-
 #: src/xenia/ui/game_scan_progress_dialog_wx.cc:55
 msgid "   %zu already installed"
 msgstr "   %zu már telepítve"
@@ -1662,3 +1652,139 @@ msgstr "A Xenia a %s alatt kerül terjesztésre"
 #: src/xenia/ui/game_info_panel_wx.cc:212
 msgid "Content"
 msgstr "Tartalom"
+
+#: src/xenia/app/emulator_window.cc:405
+msgid "Alternate Guitar"
+msgstr "Alternatív gitár"
+
+#: src/xenia/app/emulator_window.cc:407
+msgid "Bass Guitar"
+msgstr "Basszusgitár"
+
+#: src/xenia/app/emulator_window.cc:2027
+msgid ""
+"Original Xbox games run through XeFu, the Xbox 360's backward compatibility emulator, and %s is missing from its folder:\n"
+"\n"
+"%s\n"
+"\n"
+"Copy xbox.xex and the xefu*.xex files there from the Compatibility folder of an Xbox 360 hard drive."
+msgstr ""
+"Az eredeti Xbox játékai a XeFu nevű emulátorral futnak, amely az Xbox 360 visszamenőleges kompatibilitását adja, de a mappájából hiányzik a(z) %s fájl:\n"
+"\n"
+"%s\n"
+"\n"
+"Másolja oda az xbox.xex és az xefu*.xex fájlokat egy Xbox 360 merevlemezének Compatibility mappájából."
+
+#: src/xenia/app/emulator_window.cc:2034
+msgid "XeFu not found"
+msgstr "A XeFu nem található"
+
+#: src/xenia/app/emulator_window.cc:3665
+msgid ""
+"Failed to launch title.\n"
+"\n"
+"Check xenia.log for technical details."
+msgstr ""
+"A cím elindítása sikertelen.\n"
+"\n"
+"A technikai részleteket az xenia.log fájlban találja."
+
+#: src/xenia/app/emulator_window.cc:3664
+msgid "Title Launch Failed!"
+msgstr "A cím indítása sikertelen!"
+
+#: src/xenia/app/emulator_window.cc:2891
+msgid "Data migration"
+msgstr "Adatok áthelyezése"
+
+#: src/xenia/app/emulator_window.cc:2891
+msgid ""
+"Some of your existing data couldn't be migrated to the new profile. Items that failed: %u\n"
+"\n"
+"Check xenia.log for technical details."
+msgstr ""
+"Néhány meglévő adatát nem sikerült áthelyezni az új profilba. Sikertelen elemek: %u\n"
+"\n"
+"A technikai részleteket az xenia.log fájlban találja."
+
+#: src/xenia/app/emulator_window.cc:2897
+msgid "Your existing data was migrated to the new profile."
+msgstr "A meglévő adatai át lettek helyezve az új profilba."
+
+#: src/xenia/ui/game_list_panel_wx.cc:441
+msgid ""
+"No file path is set for this title.\n"
+"\n"
+"Browse for the file?"
+msgstr ""
+"Ehhez a címhez nincs fájl elérési útvonala beállítva.\n"
+"\n"
+"Kíván tallózni a fájl után?"
+
+#: src/xenia/ui/game_list_panel_wx.cc:442
+msgid ""
+"File not found:\n"
+"%s\n"
+"\n"
+"Browse for the file?"
+msgstr ""
+"A fájl nem található:\n"
+"%s\n"
+"\n"
+"Kíván tallózni a fájl után?"
+
+#: src/xenia/app/emulator_window.cc:2325
+msgid "Failed to read the system update."
+msgstr "A rendszerfrissítés beolvasása sikertelen."
+
+#: src/xenia/app/emulator_window.cc:2329
+msgid "Failed to write the system files."
+msgstr "A rendszerfájlok írása sikertelen."
+
+#: src/xenia/app/emulator_window.cc:2296
+#: src/xenia/app/emulator_window.cc:2319
+#: src/xenia/app/emulator_window.cc:2324
+#: src/xenia/app/emulator_window.cc:2328
+#: src/xenia/app/emulator_window.cc:2333
+msgid "Install System Files"
+msgstr "Rendszerfájlok telepítése"
+
+#: src/xenia/app/emulator_window.cc:1127
+msgid "Install System Files..."
+msgstr "Rendszerfájlok telepítése…"
+
+#: src/xenia/app/emulator_window.cc:2297
+msgid "Installing the system files..."
+msgstr "A rendszerfájlok telepítése folyamatban…"
+
+#: src/xenia/app/emulator_window.cc:2282
+msgid "Select a USB System Update"
+msgstr "USB-s rendszerfrissítés kiválasztása"
+
+#: src/xenia/app/emulator_window.cc:2310
+msgid "System files installed"
+msgstr "A rendszerfájlok telepítve"
+
+#: src/xenia/app/emulator_window.cc:2335
+msgid ""
+"The previous system files couldn't be put back in place. Move their folders back or delete them to install again. They are in:\n"
+"%s"
+msgstr ""
+"A korábbi rendszerfájlokat nem sikerült visszaállítani a helyükre. Az újbóli telepítéshez helyezze vissza vagy törölje a mappáikat. A következő mappában találhatók:\n"
+"%s"
+
+#: src/xenia/app/emulator_window.cc:2311
+msgid ""
+"The system files are installed in:\n"
+"%s"
+msgstr ""
+"A rendszerfájlok telepítési helye:\n"
+"%s"
+
+#: src/xenia/app/emulator_window.cc:2320
+msgid "This file isn't a USB system update."
+msgstr "Ez a fájl nem USB-s rendszerfrissítés."
+
+#: src/xenia/app/emulator_window.cc:1035
+msgid "Start Dashboard"
+msgstr "Xbox vezérlőpult indítása"

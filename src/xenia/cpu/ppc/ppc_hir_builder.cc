@@ -10,7 +10,10 @@
 #include "xenia/cpu/ppc/ppc_hir_builder.h"
 
 #include <stddef.h>
+#include <algorithm>
 #include <cstring>
+#include <string>
+#include <vector>
 
 #include "third_party/fmt/include/fmt/format.h"
 
@@ -74,6 +77,7 @@ PPCBuiltins* PPCHIRBuilder::builtins() const { return frontend_->builtins(); }
 
 void PPCHIRBuilder::Reset() {
   function_ = nullptr;
+  dynamic_code_ = false;
   start_address_ = 0;
   instr_count_ = 0;
   instr_offset_list_ = NULL;
@@ -86,8 +90,12 @@ bool PPCHIRBuilder::Emit(GuestFunction* function, uint32_t flags) {
   SCOPE_profile_cpu_f("cpu");
 
   Module* module = function->module();
+  if (frontend_->processor()->KeepsContextStores(module)) {
+    set_attributes(attributes() | FUNCTION_ATTRIB_KEEP_CONTEXT_STORES);
+  }
 
   function_ = function;
+  dynamic_code_ = frontend_->processor()->IsDynamicCode(module);
   start_address_ = function_->address();
   // chrispy: i've seen this one happen, not sure why but i think from trying to
   // precompile twice i've also seen ones with a start and end address that are
@@ -121,7 +129,6 @@ bool PPCHIRBuilder::Emit(GuestFunction* function, uint32_t flags) {
   uint32_t end_address = function_->end_address();
   for (uint32_t address = start_address, offset = 0; address <= end_address;
        address += 4, offset++) {
-    trace_info_.dest_count = 0;
     uint32_t code = xe::load_and_swap<uint32_t>(module->TranslateCode(address));
     auto opcode = LookupOpcode(code);
     auto& opcode_info = GetOpcodeInfo(opcode);
@@ -194,6 +201,17 @@ bool PPCHIRBuilder::Emit(GuestFunction* function, uint32_t flags) {
     }
   }
 
+  // Dynamic code can end at a bl taken never to return, where what follows is
+  // another function or no code at all. If the bl returns after all, the
+  // instruction after it runs next. A branch there from deeper frames returns
+  // into this frame the same way, as the address maps to the branch.
+  if (dynamic_code_ &&
+      (xe::load_and_swap<uint32_t>(module->TranslateCode(end_address)) &
+       0xFC000001) == 0x48000001) {
+    SourceOffset(end_address + 4);
+    CallIndirect(LoadConstantUint64(end_address + 4), CALL_TAIL);
+  }
+
   if (false) {
     DumpAllOpcodeCounts();
   }
@@ -201,7 +219,37 @@ bool PPCHIRBuilder::Emit(GuestFunction* function, uint32_t flags) {
   return Finalize();
 }
 
+static const std::vector<uint32_t>& LogLrAddresses() {
+  static const std::vector<uint32_t> addresses = []() {
+    std::vector<uint32_t> out;
+    const std::string& spec = cvars::log_lr_at_instruction;
+    size_t pos = 0;
+    while (pos < spec.size()) {
+      size_t end = spec.find(',', pos);
+      if (end == std::string::npos) {
+        end = spec.size();
+      }
+      std::string token = spec.substr(pos, end - pos);
+      try {
+        out.push_back(uint32_t(std::stoull(token, nullptr, 0)));
+      } catch (const std::exception&) {
+        XELOGW("log_lr_at_instruction: ignoring '{}'", token);
+      }
+      pos = end + 1;
+    }
+    return out;
+  }();
+  return addresses;
+}
+
 void PPCHIRBuilder::MaybeBreakOnInstruction(uint32_t address) {
+  const auto& log_lr_addresses = LogLrAddresses();
+  if (std::find(log_lr_addresses.begin(), log_lr_addresses.end(), address) !=
+      log_lr_addresses.end()) {
+    Comment("--log-lr-at-instruction target");
+    CallExtern(builtins()->log_lr_handler);
+  }
+
   if (address != cvars::break_on_instruction) {
     return;
   }
@@ -309,10 +357,6 @@ Value* PPCHIRBuilder::LoadLR() {
 void PPCHIRBuilder::StoreLR(Value* value) {
   assert_true(value->type == INT64_TYPE);
   StoreContext(offsetof(PPCContext, lr), value);
-
-  auto& trace_reg = trace_info_.dests[trace_info_.dest_count++];
-  trace_reg.reg = 64;
-  trace_reg.value = value;
 }
 
 Value* PPCHIRBuilder::LoadCTR() {
@@ -322,10 +366,6 @@ Value* PPCHIRBuilder::LoadCTR() {
 void PPCHIRBuilder::StoreCTR(Value* value) {
   assert_true(value->type == INT64_TYPE);
   StoreContext(offsetof(PPCContext, ctr), value);
-
-  auto& trace_reg = trace_info_.dests[trace_info_.dest_count++];
-  trace_reg.reg = 65;
-  trace_reg.value = value;
 }
 
 Value* PPCHIRBuilder::LoadCR() {
@@ -447,10 +487,6 @@ Value* PPCHIRBuilder::LoadFPSCR() {
 void PPCHIRBuilder::StoreFPSCR(Value* value) {
   assert_true(value->type == INT32_TYPE);
   StoreContext(offsetof(PPCContext, fpscr), value);
-
-  auto& trace_reg = trace_info_.dests[trace_info_.dest_count++];
-  trace_reg.reg = 67;
-  trace_reg.value = value;
 }
 
 // Writes FX, FEX, VX and OX, the four bits CR1 mirrors. FEX needs the exception
@@ -517,8 +553,7 @@ static Value* FpIsSignalingNan(PPCHIRBuilder& f, Value* value) {
 }
 
 // VXSNAN is unconditional on PPC, and the host cannot be relied on for it: the
-// a64 sequences branch around the arithmetic when an operand is a NaN, so a
-// signalling operand may never reach an instruction that would signal.
+// a64 NaN walks quiet a signalling operand without a host exception.
 Value* PPCHIRBuilder::FpInvalidFromOperands(
     std::initializer_list<Value*> operands) {
   Value* any_snan = nullptr;
@@ -550,21 +585,16 @@ void PPCHIRBuilder::UpdateFPSCR(std::initializer_list<Value*> operands,
 // operand finite and at least one of them denormal.
 Value* PPCHIRBuilder::SingleDenormalOperand(
     std::initializer_list<Value*> operands) {
-  Value* any_denormal = nullptr;
-  Value* any_nonfinite = nullptr;
+  Value* ops[3] = {nullptr, nullptr, nullptr};
+  int count = 0;
   for (Value* operand : operands) {
-    Value* magnitude = FpMagnitude(*this, operand);
-    // Subtracting one wraps a zero operand up to the top, which is what keeps
-    // zero from reading as denormal.
-    Value* is_denormal = CompareULT(Sub(magnitude, LoadConstantUint64(1)),
-                                    LoadConstantUint64(0x000FFFFFFFFFFFFFull));
-    Value* is_nonfinite =
-        CompareUGE(magnitude, LoadConstantUint64(0x7FF0000000000000ull));
-    any_denormal = any_denormal ? Or(any_denormal, is_denormal) : is_denormal;
-    any_nonfinite =
-        any_nonfinite ? Or(any_nonfinite, is_nonfinite) : is_nonfinite;
+    ops[count++] = operand;
   }
-  return And(any_denormal, IsFalse(any_nonfinite));
+  assert_true(count >= 1 && count <= 3);
+  for (; count < 3; ++count) {
+    ops[count] = ops[count - 1];
+  }
+  return DenormalQuirk(ops[0], ops[1], ops[2]);
 }
 
 Value* PPCHIRBuilder::ApplySingleDenormalOperand(Value* quirk, Value* result) {
@@ -731,10 +761,6 @@ Value* PPCHIRBuilder::LoadCA() {
 void PPCHIRBuilder::StoreCA(Value* value) {
   assert_true(value->type == INT8_TYPE);
   StoreContext(offsetof(PPCContext, xer_ca), value);
-
-  auto& trace_reg = trace_info_.dests[trace_info_.dest_count++];
-  trace_reg.reg = 66;
-  trace_reg.value = value;
 }
 
 Value* PPCHIRBuilder::LoadSAT() {
@@ -744,10 +770,6 @@ Value* PPCHIRBuilder::LoadSAT() {
 void PPCHIRBuilder::StoreSAT(Value* value) {
   value = Truncate(value, INT8_TYPE);
   StoreContext(offsetof(PPCContext, vscr_sat), value);
-
-  auto& trace_reg = trace_info_.dests[trace_info_.dest_count++];
-  trace_reg.reg = 44;
-  trace_reg.value = value;
 }
 
 Value* PPCHIRBuilder::LoadGPR(uint32_t reg) {
@@ -757,10 +779,6 @@ Value* PPCHIRBuilder::LoadGPR(uint32_t reg) {
 void PPCHIRBuilder::StoreGPR(uint32_t reg, Value* value) {
   assert_true(value->type == INT64_TYPE);
   StoreContext(offsetof(PPCContext, r) + reg * 8, value);
-
-  auto& trace_reg = trace_info_.dests[trace_info_.dest_count++];
-  trace_reg.reg = reg;
-  trace_reg.value = value;
 }
 
 Value* PPCHIRBuilder::LoadFPR(uint32_t reg) {
@@ -770,10 +788,6 @@ Value* PPCHIRBuilder::LoadFPR(uint32_t reg) {
 void PPCHIRBuilder::StoreFPR(uint32_t reg, Value* value) {
   assert_true(value->type == FLOAT64_TYPE);
   StoreContext(offsetof(PPCContext, f) + reg * 8, value);
-
-  auto& trace_reg = trace_info_.dests[trace_info_.dest_count++];
-  trace_reg.reg = reg + 32;
-  trace_reg.value = value;
 }
 
 Value* PPCHIRBuilder::LoadVR(uint32_t reg) {
@@ -783,10 +797,6 @@ Value* PPCHIRBuilder::LoadVR(uint32_t reg) {
 void PPCHIRBuilder::StoreVR(uint32_t reg, Value* value) {
   assert_true(value->type == VEC128_TYPE);
   StoreContext(offsetof(PPCContext, v) + reg * 16, value);
-
-  auto& trace_reg = trace_info_.dests[trace_info_.dest_count++];
-  trace_reg.reg = 128 + reg;
-  trace_reg.value = value;
 }
 
 void PPCHIRBuilder::SetReturnAddress(Value* value) {

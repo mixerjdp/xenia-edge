@@ -10,6 +10,7 @@
 #include "xenia/vfs/devices/xcontent_devices/svod_container_device.h"
 #include "xenia/base/logging.h"
 #include "xenia/vfs/devices/xcontent_devices/svod_container_entry.h"
+#include "xenia/vfs/gdfx_util.h"
 
 namespace xe {
 namespace vfs {
@@ -37,7 +38,7 @@ SvodContainerDevice::Result SvodContainerDevice::LoadHostFiles() {
   data_fragment_path += ".data";
   if (!std::filesystem::exists(data_fragment_path)) {
     XELOGE("STFS container is multi-file, but path {} does not exist.",
-           data_fragment_path);
+           xe::strip_pii(xe::path_to_utf8(data_fragment_path)));
     return Result::kFileMismatch;
   }
 
@@ -55,14 +56,16 @@ SvodContainerDevice::Result SvodContainerDevice::LoadHostFiles() {
     // A handle opens on a directory too, so reject one here rather than let it
     // sit in the map and fail every read routed to its fragment index.
     if (fragment.type != xe::filesystem::FileInfo::Type::kFile) {
-      XELOGE("SVOD data fragment {} is not a file.", fragment.name);
+      XELOGE("SVOD data fragment {} is not a file.",
+             xe::strip_pii(xe::path_to_utf8(fragment.name)));
       return Result::kFileMismatch;
     }
     auto path = fragment.path / fragment.name;
     auto file = xe::filesystem::FileHandle::OpenExisting(
         path, xe::filesystem::FileAccess::kGenericRead);
     if (!file) {
-      XELOGI("Failed to map SVOD file {}.", path);
+      XELOGI("Failed to map SVOD file {}.",
+             xe::strip_pii(xe::path_to_utf8(path)));
       return Result::kReadError;
     }
 
@@ -71,7 +74,8 @@ SvodContainerDevice::Result SvodContainerDevice::LoadHostFiles() {
     std::error_code ec;
     const uintmax_t fragment_size = std::filesystem::file_size(path, ec);
     if (ec) {
-      XELOGI("Failed to size SVOD file {}.", path);
+      XELOGI("Failed to size SVOD file {}.",
+             xe::strip_pii(xe::path_to_utf8(path)));
       return Result::kReadError;
     }
 
@@ -88,8 +92,11 @@ XContentContainerDevice::Result SvodContainerDevice::Read() {
   // the first "actual" data fragment of the system.
   auto* svod_header = files_.at(0).get();
 
-  size_t magic_offset;
-  SetLayout(svod_header, magic_offset);
+  size_t magic_offset = 0;
+  if (const Result result = SetLayout(svod_header, magic_offset);
+      result != Result::kSuccess) {
+    return result;
+  }
 
   // Parse the root directory
   struct {
@@ -153,6 +160,12 @@ SvodContainerDevice::Result SvodContainerDevice::ReadEntry(
     XELOGE("ReadEntrySVOD failed to read directory entry at {:016X}",
            entry_address);
     return Result::kReadError;
+  }
+
+  if (dir_entry.node_l == kGdfxPaddingOffset) {
+    const uint32_t padded_ordinal = GdfxPaddedEntryOrdinal(ordinal);
+    return padded_ordinal ? ReadEntry(block, padded_ordinal, parent)
+                          : Result::kSuccess;
   }
 
   auto name_buffer = std::make_unique<char[]>(dir_entry.name_length);
@@ -336,33 +349,33 @@ XContentContainerDevice::Result SvodContainerDevice::SetNormalLayout(
     xe::filesystem::FileHandle* header, size_t& magic_offset) {
   uint8_t magic_buf[20];
 
-  const uint32_t magic_pos =
-      header_->content_metadata.data_file_count == 1 ? 0xD000 : 0x2000;
-  if (!ReadAt(header, magic_pos, magic_buf, countof(magic_buf))) {
-    XELOGE("ReadSVOD failed to read SVOD magic at 0x{:04X}", magic_pos);
-    return Result::kReadError;
-  }
-
-  if (std::memcmp(magic_buf, MEDIA_MAGIC, 20) != 0) {
-    XELOGE("Could not locate SVOD magic block.");
-    return Result::kReadError;
-  }
-
-  // If the SVOD's magic block is at 0xD000, it most likely means that it
-  // is a single-file system. The STFS Header is 0xB000 bytes and the
-  // remaining 0x2000 is from hash tables. In most cases, these will be
-  // STFS, not SVOD.
-  if (header_->content_metadata.data_file_count == 1) {
+  // A single-file system usually has its magic block at 0xD000: the STFS
+  // header is 0xB000 bytes and the remaining 0x2000 is from hash tables. In
+  // most cases, these will be STFS, not SVOD. Some single-file packages are
+  // laid out like multiple-file ones instead, with it at 0x2000.
+  if (header_->content_metadata.data_file_count == 1 &&
+      ReadAt(header, 0xD000, magic_buf, countof(magic_buf)) &&
+      std::memcmp(magic_buf, MEDIA_MAGIC, countof(magic_buf)) == 0) {
     svod_base_offset_ = 0xB000;
     svod_layout_ = SvodLayoutType::kSingleFile;
     XELOGI("SVOD is a single file. Magic block present at 0xD000.");
     magic_offset = 0xD000;
-  } else {
-    svod_base_offset_ = 0x0000;
-    svod_layout_ = SvodLayoutType::kMultipleFiles;
-    XELOGI("SVOD is a multiple files. Magic block present at 0x2000.");
-    magic_offset = 0x2000;
+    return Result::kSuccess;
   }
+
+  if (!ReadAt(header, 0x2000, magic_buf, countof(magic_buf))) {
+    XELOGE("ReadSVOD failed to read SVOD magic at 0x2000");
+    return Result::kReadError;
+  }
+  if (std::memcmp(magic_buf, MEDIA_MAGIC, countof(magic_buf)) != 0) {
+    XELOGE("Could not locate SVOD magic block.");
+    return Result::kReadError;
+  }
+
+  svod_base_offset_ = 0x0000;
+  svod_layout_ = SvodLayoutType::kMultipleFiles;
+  XELOGI("SVOD uses a multiple-file layout. Magic block present at 0x2000.");
+  magic_offset = 0x2000;
   return Result::kSuccess;
 }
 

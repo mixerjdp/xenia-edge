@@ -43,6 +43,8 @@ class PPCHIRBuilder : public hir::HIRBuilder {
   bool Emit(GuestFunction* function, uint32_t flags);
 
   GuestFunction* function() const { return function_; }
+  // Whether the function is code the guest wrote at runtime.
+  bool dynamic_code() const { return dynamic_code_; }
   Function* LookupFunction(uint32_t address);
   Label* LookupLabel(uint32_t address);
 
@@ -129,19 +131,11 @@ class PPCHIRBuilder : public hir::HIRBuilder {
   // Reset each Emit:
   bool with_debug_info_;
   GuestFunction* function_;
+  bool dynamic_code_;
   uint64_t start_address_;
   uint64_t instr_count_;
   Instr** instr_offset_list_;
   Label** label_list_;
-
-  // Reset each instruction.
-  struct {
-    uint32_t dest_count;
-    struct {
-      uint8_t reg;
-      Value* value;
-    } dests[4];
-  } trace_info_;
 };
 
 }  // namespace ppc

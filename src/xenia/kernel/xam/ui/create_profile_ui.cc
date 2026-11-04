@@ -9,6 +9,7 @@
 
 #include "xenia/kernel/xam/ui/create_profile_ui.h"
 #include "xenia/emulator.h"
+#include "xenia/kernel/xam/xam_state.h"
 
 namespace xe {
 namespace kernel {
@@ -72,10 +73,7 @@ void CreateProfileUI::OnDraw(ImGuiIO& io) {
     ImGui::BeginDisabled(!valid);
     if (ImGui::Button("Create") || (enter_pressed && valid)) {
       bool autologin = (profile_manager->GetAccountCount() == 0);
-      if (profile_manager->CreateProfile(gt, autologin, migration_) &&
-          migration_) {
-        emulator_->DataMigration(0xB13EBABEBABEBABE);
-      }
+      profile_manager->CreateProfile(gt, autologin);
       ImGui::CloseCurrentPopup();
       Close();
     }

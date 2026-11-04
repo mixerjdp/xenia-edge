@@ -34,6 +34,7 @@ struct PPCBuiltins {
   Function* enter_global_lock;
   Function* leave_global_lock;
   Function* syscall_handler;
+  Function* log_lr_handler;
 };
 
 class PPCFrontend {

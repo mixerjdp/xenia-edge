@@ -21,6 +21,7 @@
 #include <wx/bitmap.h>
 #include <wx/panel.h>
 #include <wx/srchctrl.h>
+#include <wx/timer.h>
 
 #include "xenia/app/game_compat_db.h"
 #include "xenia/app/game_library.h"
@@ -42,16 +43,14 @@ class GameListPanel : public wxPanel {
   enum class SortKey { kLastPlayed, kTitle, kStatus };
 
   using LaunchCallback = std::function<void(const std::filesystem::path&)>;
-  using SelectionChangedCallback = std::function<void()>;
 
   GameListPanel(wxWindow* parent, EmulatorWindow* emulator_window);
   ~GameListPanel() override = default;
 
   void Reload();
+  // Shows what changed in one release since the list read it.
+  void RefreshEntry(const LibraryKey& key);
   void SetLaunchCallback(LaunchCallback cb) { launch_cb_ = std::move(cb); }
-  void SetSelectionChangedCallback(SelectionChangedCallback cb) {
-    selection_changed_cb_ = std::move(cb);
-  }
   // Returns the selected title's path, or empty if nothing selected.
   std::filesystem::path GetSelectedPath() const;
 
@@ -107,7 +106,7 @@ class GameListPanel : public wxPanel {
 
   void OnSearch(wxCommandEvent& event);
   void OnItemActivated(int index);
-  void OnSelectionChanged();
+  void OnSelectionChanged(bool clicked);
   void OnSortChanged();
   // Compat DB state for `e`, optimistically upgraded by the user's local
   // achievement progress (10%+ promotes Unknown to Gameplay; 80%+ promotes
@@ -146,12 +145,12 @@ class GameListPanel : public wxPanel {
   // Set by the pane's close button. Sorting and filtering leave it shut;
   // picking a game clears it.
   bool info_pane_closed_ = false;
+  wxTimer pane_open_timer_;
   // Survives the entries_ rebuild so sort/filter/reload can restore the row.
   LibraryKey selected_key_;
   std::vector<Entry> entries_;
   std::vector<size_t> visible_indices_;
   LaunchCallback launch_cb_;
-  SelectionChangedCallback selection_changed_cb_;
   std::string filter_lower_;
   // Bumped on each Reload so in-flight icon-load chunks abort.
   int icon_load_generation_ = 0;

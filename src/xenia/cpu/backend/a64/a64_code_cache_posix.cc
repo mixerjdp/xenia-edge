@@ -303,7 +303,7 @@ void PosixA64CodeCache::InitializeUnwindEntry(
     if (func_info.is_host_to_guest_thunk) {
       // HostToGuest thunk: encode all callee-saved register save locations.
       // See a64_stack_layout.h for the layout.
-      size_t cfa = func_info.stack_size;  // 224
+      size_t cfa = func_info.stack_size;
 
       // GPRs: x19-x28 saved as stp pairs at sp+0x00..0x48
       *p++ = 0x80 | kDwarfRegX19;

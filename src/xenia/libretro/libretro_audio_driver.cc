@@ -199,13 +199,5 @@ apu::AudioDriver* LibretroAudioSystem::CreateDriver(
   return driver;
 }
 
-void LibretroAudioSystem::DestroyDriver(apu::AudioDriver* driver) {
-  if (!driver) {
-    return;
-  }
-  driver->Shutdown();
-  delete driver;
-}
-
 }  // namespace libretro
 }  // namespace xe

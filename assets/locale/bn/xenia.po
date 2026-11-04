@@ -11,16 +11,6 @@ msgstr ""
 "Content-Transfer-Encoding: 8bit\n"
 "Plural-Forms: nplurals=2; plural=(n != 1);\n"
 
-#: src/xenia/ui/game_list_panel_wx.cc:596
-msgid ""
-"\n"
-"\n"
-"Browse for the file?"
-msgstr ""
-"\n"
-"\n"
-"ফাইলটি খুঁজে দেখবেন?"
-
 #: src/xenia/ui/game_scan_progress_dialog_wx.cc:55
 msgid "   %zu already installed"
 msgstr "   %zuটি ইতিমধ্যে ইনস্টল করা"
@@ -1657,3 +1647,139 @@ msgstr "Xenia %s-এর অধীনে বিতরণ করা হয়"
 #: src/xenia/ui/game_info_panel_wx.cc:212
 msgid "Content"
 msgstr "কনটেন্ট"
+
+#: src/xenia/app/emulator_window.cc:405
+msgid "Alternate Guitar"
+msgstr "বিকল্প গিটার"
+
+#: src/xenia/app/emulator_window.cc:407
+msgid "Bass Guitar"
+msgstr "বেস গিটার"
+
+#: src/xenia/app/emulator_window.cc:2027
+msgid ""
+"Original Xbox games run through XeFu, the Xbox 360's backward compatibility emulator, and %s is missing from its folder:\n"
+"\n"
+"%s\n"
+"\n"
+"Copy xbox.xex and the xefu*.xex files there from the Compatibility folder of an Xbox 360 hard drive."
+msgstr ""
+"আসল Xbox-এর গেমগুলো XeFu-এর মাধ্যমে চলে, যা Xbox 360-এর ব্যাকওয়ার্ড কম্প্যাটিবিলিটি এমুলেটর, কিন্তু এর ফোল্ডারে %s নেই:\n"
+"\n"
+"%s\n"
+"\n"
+"অনুগ্রহ করে একটি Xbox 360 হার্ড ড্রাইভের Compatibility ফোল্ডার থেকে xbox.xex এবং xefu*.xex ফাইলগুলো এই ফোল্ডারে কপি করুন।"
+
+#: src/xenia/app/emulator_window.cc:2034
+msgid "XeFu not found"
+msgstr "XeFu পাওয়া যায়নি"
+
+#: src/xenia/app/emulator_window.cc:3665
+msgid ""
+"Failed to launch title.\n"
+"\n"
+"Check xenia.log for technical details."
+msgstr ""
+"টাইটেল চালু করা যায়নি।\n"
+"\n"
+"কারিগরি বিস্তারিত জানতে xenia.log দেখুন।"
+
+#: src/xenia/app/emulator_window.cc:3664
+msgid "Title Launch Failed!"
+msgstr "টাইটেল চালু করা যায়নি!"
+
+#: src/xenia/app/emulator_window.cc:2891
+msgid "Data migration"
+msgstr "ডেটা স্থানান্তর"
+
+#: src/xenia/app/emulator_window.cc:2891
+msgid ""
+"Some of your existing data couldn't be migrated to the new profile. Items that failed: %u\n"
+"\n"
+"Check xenia.log for technical details."
+msgstr ""
+"আপনার বিদ্যমান কিছু ডেটা নতুন প্রোফাইলে স্থানান্তর করা যায়নি। ব্যর্থ আইটেম: %u\n"
+"\n"
+"কারিগরি বিস্তারিত জানতে xenia.log দেখুন।"
+
+#: src/xenia/app/emulator_window.cc:2897
+msgid "Your existing data was migrated to the new profile."
+msgstr "আপনার বিদ্যমান ডেটা নতুন প্রোফাইলে স্থানান্তর করা হয়েছে।"
+
+#: src/xenia/ui/game_list_panel_wx.cc:441
+msgid ""
+"No file path is set for this title.\n"
+"\n"
+"Browse for the file?"
+msgstr ""
+"এই টাইটেলের জন্য কোনো ফাইল পাথ সেট করা নেই।\n"
+"\n"
+"ফাইলটি খুঁজে দেখবেন?"
+
+#: src/xenia/ui/game_list_panel_wx.cc:442
+msgid ""
+"File not found:\n"
+"%s\n"
+"\n"
+"Browse for the file?"
+msgstr ""
+"ফাইল পাওয়া যায়নি:\n"
+"%s\n"
+"\n"
+"ফাইলটি খুঁজে দেখবেন?"
+
+#: src/xenia/app/emulator_window.cc:2325
+msgid "Failed to read the system update."
+msgstr "সিস্টেম আপডেট পড়া যায়নি।"
+
+#: src/xenia/app/emulator_window.cc:2329
+msgid "Failed to write the system files."
+msgstr "সিস্টেম ফাইলগুলি লেখা যায়নি।"
+
+#: src/xenia/app/emulator_window.cc:2296
+#: src/xenia/app/emulator_window.cc:2319
+#: src/xenia/app/emulator_window.cc:2324
+#: src/xenia/app/emulator_window.cc:2328
+#: src/xenia/app/emulator_window.cc:2333
+msgid "Install System Files"
+msgstr "সিস্টেম ফাইল ইনস্টল করুন"
+
+#: src/xenia/app/emulator_window.cc:1127
+msgid "Install System Files..."
+msgstr "সিস্টেম ফাইল ইনস্টল করুন…"
+
+#: src/xenia/app/emulator_window.cc:2297
+msgid "Installing the system files..."
+msgstr "সিস্টেম ফাইলগুলি ইনস্টল করা হচ্ছে…"
+
+#: src/xenia/app/emulator_window.cc:2282
+msgid "Select a USB System Update"
+msgstr "USB সিস্টেম আপডেট নির্বাচন করুন"
+
+#: src/xenia/app/emulator_window.cc:2310
+msgid "System files installed"
+msgstr "সিস্টেম ফাইলগুলি ইনস্টল হয়েছে"
+
+#: src/xenia/app/emulator_window.cc:2335
+msgid ""
+"The previous system files couldn't be put back in place. Move their folders back or delete them to install again. They are in:\n"
+"%s"
+msgstr ""
+"আগের সিস্টেম ফাইলগুলি যথাস্থানে ফিরিয়ে আনা যায়নি। আবার ইনস্টল করতে সেগুলির ফোল্ডার আগের জায়গায় স্থানান্তর করুন বা মুছে দিন। সেগুলি এখানে আছে:\n"
+"%s"
+
+#: src/xenia/app/emulator_window.cc:2311
+msgid ""
+"The system files are installed in:\n"
+"%s"
+msgstr ""
+"সিস্টেম ফাইলগুলি এখানে ইনস্টল করা আছে:\n"
+"%s"
+
+#: src/xenia/app/emulator_window.cc:2320
+msgid "This file isn't a USB system update."
+msgstr "এই ফাইলটি USB সিস্টেম আপডেট নয়।"
+
+#: src/xenia/app/emulator_window.cc:1035
+msgid "Start Dashboard"
+msgstr "ড্যাশবোর্ড চালু করুন"

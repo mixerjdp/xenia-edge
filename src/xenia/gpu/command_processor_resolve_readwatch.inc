@@ -7,26 +7,40 @@
  ******************************************************************************
  */
 
-// Resolve-to-guest-RAM copy decisions and read-watch consumption tracking,
-// shared by the D3D12 and Vulkan command processors. Like
-// command_processor_memexport.inc, this is #included into each backend's class
-// body so each gets its own inlinable copy with no inheritance or virtual
+// Delivers resolve output into guest RAM when the CPU accesses it, shared by
+// the D3D12 and Vulkan command processors. A resolve leaves its output in the
+// shared memory buffer, where the GPU reads it, and arms a read watch over its
+// destination. The first CPU access of a watched page copies the output of the
+// resolve that last wrote it into guest RAM, from the faulting thread, before
+// the access proceeds.
+//
+// Like command_processor_memexport.inc, this is #included into each backend's
+// class body so each gets its own inlinable copy with no inheritance or virtual
 // dispatch. The include site must already provide SharedMemory, the base
 // memory_ (Memory*), texture_cache_, xenia/memory.h (VirtualHeap,
 // IsWritableProtect), xenia/base/assert.h, xenia/base/logging.h,
-// xenia/gpu/draw_util.h, xenia/gpu/registers.h, and <atomic> <deque> <memory>
-// <unordered_map> <unordered_set> <algorithm>. No include guard: injected into
-// a class body.
+// xenia/gpu/draw_util.h, xenia/gpu/registers.h, and <algorithm> <atomic>
+// <cstring> <memory> <mutex> <unordered_map> <unordered_set> <vector>. No
+// include guard: injected into a class body.
 //
 // It must also define, before including this:
-//   struct ResolveHoldSnapshotBuffer
-//     Whatever the backend needs to hold one downscaled capture.
-//   bool CreateResolveHoldSnapshotBuffer(ResolveHoldSnapshotBuffer&, uint32_t)
-//   void DestroyResolveHoldSnapshotBuffer(ResolveHoldSnapshotBuffer&)
-//   void PrepareResolveHoldSnapshotEviction()
-//     Called once before the first destroy of an acquire, for backends that
-//     have to drain rather than defer.
-//   void FlushResolveRangeToGuestRam(uint32_t, uint32_t, bool from_snapshot)
+//   bool EndResolveSubmission()
+//     Submits what has been recorded, without waiting for it.
+// And call OnResolveSubmissionEnded on the GPU thread whenever a submission is
+// handed to the GPU, and SubmitRequestedResolve once IssueCopy is done.
+//   uint64_t GetResolveSubmittedThrough() const
+//     The last submission handed to the GPU, from any thread.
+//   bool FaultCopyResolveToGuestRam(
+//       const std::vector<std::pair<uint32_t, uint32_t>>& ranges)
+//     Copies ranges of the shared memory buffer into guest RAM from the
+//     faulting thread and waits for it. Without the guest RAM host buffer the
+//     copy lands in a CPU-readable buffer, for CopyPackedRangesToGuestRam. With
+//     zero-copy the resolve wrote guest RAM itself, so it only waits. Called
+//     under resolve_read_mutex_, so it may neither take the global lock nor
+//     need the GPU thread.
+//   bool EnsureMemexportRangeInDeviceBuffer(uint32_t base, uint32_t size)
+//     Copies memexport output in the host buffer into the shared memory buffer.
+// And include command_processor_readback_staging.inc.
 
 // How much of a guest range is committed and writable, so copying GPU output
 // back into it is safe. Writing past that corrupts memory the guest never
@@ -37,13 +51,18 @@ uint32_t WritableGuestRangeLength(uint32_t address, uint32_t length) const {
     return 0;
   }
   HeapAllocationInfo alloc_info;
-  if (!physical_heap->QueryRegionInfo(address, &alloc_info) ||
+  // The region is counted in whole pages from the one the address is in, and
+  // only as far as the range, not to the end of a region that may be a large
+  // pool, as this runs for every resolve.
+  uint32_t page_offset = address & (physical_heap->page_size() - 1);
+  if (!physical_heap->QueryRegionInfo(address, &alloc_info,
+                                      length + page_offset) ||
       !(alloc_info.state & kMemoryAllocationCommit) ||
       !IsWritableProtect(alloc_info.protect)) {
     return 0;
   }
   uint64_t region_end =
-      uint64_t(alloc_info.base_address) + alloc_info.region_size;
+      uint64_t(address - page_offset) + alloc_info.region_size;
   if (uint64_t(address) >= region_end) {
     return 0;
   }
@@ -57,10 +76,11 @@ bool IsResolveDestinationResident(uint32_t address, uint32_t length) const {
                 : WritableGuestRangeLength(address, 1) != 0;
 }
 
-// Marks the guest pages the CPU has read since a resolve wrote them, from the
-// memory read callback on the guest thread. Read on the GPU thread, so atomic.
+// From the read callback on the faulting thread, with or without the global
+// lock: records which resolves' output the CPU read, for the next resolve of
+// the same destinations, and provides it.
 void MarkResolvePagesRead(uint32_t physical_address, uint32_t length) {
-  if (!resolve_read_pages_ || !length) {
+  if (!resolve_page_owners_ || !length) {
     return;
   }
   const uint32_t page_count = SharedMemory::kBufferSize >> 12;
@@ -70,196 +90,390 @@ void MarkResolvePagesRead(uint32_t physical_address, uint32_t length) {
   }
   uint32_t last_page =
       std::min((physical_address + length - 1) >> 12, page_count - 1);
+  uint64_t last_owner = 0;
   for (uint32_t page = first_page; page <= last_page; ++page) {
-    resolve_read_pages_[page >> 6].fetch_or(uint64_t(1) << (page & 63),
-                                            std::memory_order_relaxed);
+    uint64_t owner = resolve_page_owners_[page].load(std::memory_order_relaxed);
+    if (owner && owner != last_owner) {
+      std::lock_guard<std::mutex> lock(resolve_read_mutex_);
+      resolve_read_keys_.insert(owner);
+      last_owner = owner;
+    }
+  }
+  ProvideResolveOutput(physical_address, length, false);
+}
+
+// Before a write drops the read watch: the write has to land over what the GPU
+// wrote there, not under it.
+void PrepareResolvePagesForWrite(uint32_t address, uint32_t length) {
+  ProvideResolveOutput(address, length, true);
+}
+
+// Before recording a draw that writes guest RAM directly, so a later fault copy
+// of older resolve output can't land over it. May wait for the GPU.
+void ProvideResolveOutputForGpuWrite(uint32_t address, uint32_t length) {
+  if (!resolve_page_owners_ || !length ||
+      address >= SharedMemory::kBufferSize) {
+    return;
+  }
+  length = std::min(length, SharedMemory::kBufferSize - address);
+  // Only submitted resolves can be copied.
+  if (resolve_unsubmitted_owner_ &&
+      HasUnsubmittedResolveOutput(address, length)) {
+    EndResolveSubmission();
+  }
+  ProvideResolveOutput(address, length, false);
+}
+
+// Whether an unsubmitted resolve owns uncopied output in these pages.
+bool HasUnsubmittedResolveOutput(uint32_t address, uint32_t length) {
+  const uint32_t page_count = SharedMemory::kBufferSize >> 12;
+  uint32_t first_page = address >> 12;
+  uint32_t last_page = std::min((address + length - 1) >> 12, page_count - 1);
+  uint64_t submitted = GetResolveSubmittedThrough();
+  std::lock_guard<std::mutex> lock(resolve_read_mutex_);
+  uint64_t last_owner_key = 0;
+  for (uint32_t page = first_page; page <= last_page; ++page) {
+    uint64_t owner_key =
+        resolve_page_owners_[page].load(std::memory_order_relaxed);
+    if (!owner_key || owner_key == last_owner_key) {
+      continue;
+    }
+    last_owner_key = owner_key;
+    auto owner_it = resolve_owners_.find(owner_key);
+    if (owner_it != resolve_owners_.end() && owner_it->second.copyable &&
+        !owner_it->second.in_guest_ram &&
+        owner_it->second.submission > submitted) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// When the host is about to make these pages' contents irrelevant, or already
+// has: nothing a resolve wrote there needs copying, and later accesses are of
+// something else.
+void DiscardResolvePages(uint32_t address, uint32_t length) {
+  // Waits out a copy a fault is making without the global lock, which would
+  // otherwise land over what the pages hold next.
+  std::lock_guard<std::mutex> lock(resolve_read_mutex_);
+  SetResolvePageOwner(address, length, 0);
+}
+
+// Copies into guest RAM the output of the resolves owning these pages that
+// nothing has copied yet, so the access sees what the GPU wrote. Only the pages
+// each resolve still owns, as the CPU may have written pages a later resolve
+// took over since. The resolve has to be submitted already, as a fault can't
+// make the GPU thread submit without deadlocking, holding the global lock or
+// resolve_read_mutex_, so a read racing its submission gets the previous
+// contents, as it would on the console, and the watch this access used up is
+// armed again once it is. A write the copy can't precede lands in guest RAM, so
+// the later copy of an edge page it hit takes only the resolve's own bytes.
+void ProvideResolveOutput(uint32_t address, uint32_t length, bool write) {
+  if (!resolve_page_owners_ || !length) {
+    return;
+  }
+  const uint32_t page_count = SharedMemory::kBufferSize >> 12;
+  uint32_t first_page = address >> 12;
+  if (first_page >= page_count) {
+    return;
+  }
+  uint32_t last_page = std::min((address + length - 1) >> 12, page_count - 1);
+  std::lock_guard<std::mutex> lock(resolve_read_mutex_);
+  uint64_t submitted = GetResolveSubmittedThrough();
+  uint64_t last_owner_key = 0;
+  for (uint32_t page = first_page; page <= last_page; ++page) {
+    uint64_t owner_key =
+        resolve_page_owners_[page].load(std::memory_order_relaxed);
+    if (!owner_key || owner_key == last_owner_key) {
+      continue;
+    }
+    last_owner_key = owner_key;
+    auto owner_it = resolve_owners_.find(owner_key);
+    if (owner_it == resolve_owners_.end()) {
+      continue;
+    }
+    ResolveOwner& owner = owner_it->second;
+    if (owner.in_guest_ram || !owner.copyable) {
+      continue;
+    }
+    uint32_t owner_end = owner.address + owner.length;
+    uint32_t owner_first_page = owner.address >> 12;
+    uint32_t owner_last_page = std::min((owner_end - 1) >> 12, page_count - 1);
+    if (owner.submission > submitted) {
+      if (write) {
+        ClipResolveEdgePagesWritten(owner, owner_first_page, owner_last_page,
+                                    first_page, last_page);
+      }
+      RearmResolveAfterSubmission(owner);
+      continue;
+    }
+    resolve_fault_copy_ranges_.clear();
+    for (uint32_t owner_page = owner_first_page; owner_page <= owner_last_page;
+         ++owner_page) {
+      if (resolve_page_owners_[owner_page].load(std::memory_order_relaxed) !=
+          owner_key) {
+        continue;
+      }
+      uint32_t page_address = owner_page << 12;
+      if (!resolve_fault_copy_ranges_.empty() &&
+          resolve_fault_copy_ranges_.back().first +
+                  resolve_fault_copy_ranges_.back().second ==
+              page_address) {
+        resolve_fault_copy_ranges_.back().second += 4096;
+      } else {
+        resolve_fault_copy_ranges_.emplace_back(page_address, 4096);
+      }
+    }
+    // The first and last pages may be partly someone else's, but the shared
+    // memory buffer holds the latest GPU data for all of them, unless the CPU
+    // wrote them before this could copy it.
+    if (!resolve_fault_copy_ranges_.empty()) {
+      uint32_t first_page_base = owner_first_page << 12;
+      uint32_t last_page_end = (owner_last_page + 1) << 12;
+      auto& first_range = resolve_fault_copy_ranges_.front();
+      if (owner.clip_first_page && first_range.first == first_page_base) {
+        first_range.second -= owner.address - first_page_base;
+        first_range.first = owner.address;
+      }
+      auto& last_range = resolve_fault_copy_ranges_.back();
+      if (owner.clip_last_page &&
+          last_range.first + last_range.second == last_page_end) {
+        last_range.second -= last_page_end - owner_end;
+      }
+    }
+    if (FaultCopyResolveToGuestRam(resolve_fault_copy_ranges_)) {
+      owner.in_guest_ram = true;
+    } else {
+      if (write) {
+        ClipResolveEdgePagesWritten(owner, owner_first_page, owner_last_page,
+                                    first_page, last_page);
+      }
+      RearmResolveAfterSubmission(owner);
+    }
   }
 }
 
-// Returns whether the CPU has read any guest page in the range since a resolve
-// last wrote it.
-bool AnyResolvePageRead(uint32_t base, uint32_t length) const {
-  if (!resolve_read_pages_ || !length) {
+// Copies ranges packed back to back in source into guest RAM, through the
+// physical view, which the read watch does not protect.
+void CopyPackedRangesToGuestRam(
+    const void* source,
+    const std::vector<std::pair<uint32_t, uint32_t>>& ranges) {
+  const uint8_t* source_bytes = static_cast<const uint8_t*>(source);
+  for (const auto& range : ranges) {
+    std::memcpy(memory_->TranslatePhysical(range.first), source_bytes,
+                range.second);
+    source_bytes += range.second;
+  }
+}
+
+// Records a resolve of [address, length), already recorded into the current
+// submission, for ProvideResolveOutput. is_scaled means its output is not in
+// the shared memory buffer, so it can't be copied.
+void NoteResolveForReadback(uint32_t address, uint32_t length, bool is_scaled) {
+  if (!is_scaled) {
+    DropStagedMemexportOutput(address, length);
+    // Before this resolve takes the pages over.
+    uint32_t first_page_base = address & ~uint32_t(4095);
+    uint32_t end = address + length;
+    uint32_t last_page_end = (end + 4095) & ~uint32_t(4095);
+    bool first_pulled = PullMemexportEdgeBytes(first_page_base, address);
+    bool last_pulled = PullMemexportEdgeBytes(end, last_page_end);
+    // Pulled pages are current in the shared memory buffer, not the host one.
+    if (first_pulled) {
+      ClearMemexportPages(first_page_base, 4096);
+    }
+    if (last_pulled) {
+      ClearMemexportPages(last_page_end - 4096, 4096);
+    }
+  }
+  uint64_t resolve_key = MakeReadbackResolveKey(address, length);
+  bool read_before = TakeResolveRead(resolve_key);
+  // A later read is of this resolve's output, not what it replaces.
+  SetResolvePageOwner(address, length, resolve_key);
+  {
+    std::lock_guard<std::mutex> lock(resolve_read_mutex_);
+    if (resolve_owners_.size() >= kMaxResolveOwners) {
+      PruneResolveOwners();
+    }
+    ResolveOwner& owner = resolve_owners_[resolve_key];
+    owner.address = address;
+    owner.length = length;
+    owner.submission = GetCurrentSubmission();
+    owner.frame = resolve_frame_index_;
+    owner.copyable = !is_scaled;
+    owner.in_guest_ram = false;
+    owner.rearm_pending = false;
+    owner.clip_first_page = false;
+    owner.clip_last_page = false;
+  }
+  // The watch is one-shot, so it is re-armed on every resolve. Only once the
+  // owner is published: a fault still on the previous arm would otherwise see
+  // the previous output as copied and drop the watch.
+  memory_->EnablePhysicalMemoryAccessCallbacks(address, length, false, true);
+  if (is_scaled) {
+    return;
+  }
+  resolve_unsubmitted_owner_ = true;
+  // A destination the CPU has read recently will likely be read again, and
+  // possibly before the next guest sync point submits it, so it is submitted as
+  // soon as IssueCopy is done, outside its debug marker scope.
+  if (ResolveReadRecently(resolve_key, read_before)) {
+    resolve_submit_requested_ = true;
+  }
+}
+
+// A fault copy takes whole pages from the shared memory buffer, so export
+// output in the host buffer sharing a resolve's edge page is copied there
+// first, unless an uncopied resolve owns the page and that buffer is current.
+// Returns whether it copied.
+bool PullMemexportEdgeBytes(uint32_t start, uint32_t end) {
+  if (start >= end || !IsMemexportRange(start, end - start)) {
     return false;
   }
+  if (resolve_page_owners_) {
+    uint64_t owner_key =
+        resolve_page_owners_[start >> 12].load(std::memory_order_relaxed);
+    if (owner_key) {
+      std::lock_guard<std::mutex> lock(resolve_read_mutex_);
+      auto owner_it = resolve_owners_.find(owner_key);
+      if (owner_it != resolve_owners_.end() && owner_it->second.copyable &&
+          !owner_it->second.in_guest_ram) {
+        return false;
+      }
+    }
+  }
+  return EnsureMemexportRangeInDeviceBuffer(start, end - start);
+}
+
+// Under resolve_read_mutex_, with the table full. Output already copied, or
+// overwritten by later resolves at both ends, goes first. What is still full of
+// output nothing has copied loses its oldest quarter, whose later reads get
+// what guest RAM has.
+void PruneResolveOwners() {
+  for (auto it = resolve_owners_.begin(); it != resolve_owners_.end();) {
+    const ResolveOwner& owner = it->second;
+    uint32_t last_page = std::min((owner.address + owner.length - 1) >> 12,
+                                  (SharedMemory::kBufferSize >> 12) - 1);
+    bool owns_first = resolve_page_owners_[owner.address >> 12].load(
+                          std::memory_order_relaxed) == it->first;
+    bool owns_last = resolve_page_owners_[last_page].load(
+                         std::memory_order_relaxed) == it->first;
+    if (owner.in_guest_ram || (!owns_first && !owns_last)) {
+      it = resolve_owners_.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  if (resolve_owners_.size() < kMaxResolveOwners) {
+    return;
+  }
+  std::vector<uint32_t> ages;
+  ages.reserve(resolve_owners_.size());
+  for (const auto& owner : resolve_owners_) {
+    ages.push_back(resolve_frame_index_ - owner.second.frame);
+  }
+  auto oldest = ages.begin() + ages.size() * 3 / 4;
+  std::nth_element(ages.begin(), oldest, ages.end());
+  uint32_t min_age = *oldest;
+  for (auto it = resolve_owners_.begin(); it != resolve_owners_.end();) {
+    if (resolve_frame_index_ - it->second.frame >= min_age) {
+      it = resolve_owners_.erase(it);
+    } else {
+      ++it;
+    }
+  }
+}
+
+// On the GPU thread, once IssueCopy is done.
+void SubmitRequestedResolve() {
+  if (!resolve_submit_requested_) {
+    return;
+  }
+  resolve_submit_requested_ = false;
+  EndResolveSubmission();
+}
+
+// On the GPU thread when a submission has been handed to the GPU: resolves
+// recorded into it can now be copied from a fault, so the watches reads racing
+// them used up are armed again.
+void OnResolveSubmissionEnded() {
+  resolve_unsubmitted_owner_ = false;
+  {
+    std::lock_guard<std::mutex> lock(resolve_read_mutex_);
+    if (resolve_rearm_ranges_.empty()) {
+      return;
+    }
+    resolve_rearm_ranges_.swap(resolve_rearming_ranges_);
+    for (auto& owner : resolve_owners_) {
+      owner.second.rearm_pending = false;
+    }
+  }
+  // Outside resolve_read_mutex_, as this takes the global lock.
+  for (const auto& range : resolve_rearming_ranges_) {
+    memory_->EnablePhysicalMemoryAccessCallbacks(range.first, range.second,
+                                                 false, true);
+  }
+  resolve_rearming_ranges_.clear();
+}
+
+// Before the guest can learn the GPU got past a resolve, the resolve has to be
+// submitted, so ProvideResolveOutput can copy its output from the fault.
+void SubmitResolvesForGuestSync() override {
+  if (resolve_unsubmitted_owner_) {
+    EndResolveSubmission();
+  }
+}
+
+// Whether the CPU has read the output of the last resolve of this destination,
+// consuming that. Only pages no later resolve has overwritten count, so a read
+// of a smaller resolve landing inside it is not a read of it.
+bool TakeResolveRead(uint64_t resolve_key) {
+  std::lock_guard<std::mutex> lock(resolve_read_mutex_);
+  return resolve_read_keys_.erase(resolve_key) != 0;
+}
+
+// Whether the CPU has read this destination's output within the last
+// kResolveReadRecentFrames. Not only since its last resolve: one resolved twice
+// between two reads would have its second output unread by then.
+bool ResolveReadRecently(uint64_t resolve_key, bool read_before) {
+  if (read_before) {
+    if (resolve_read_frames_.size() >= kMaxResolveReadFrames) {
+      for (auto it = resolve_read_frames_.begin();
+           it != resolve_read_frames_.end();) {
+        if (resolve_frame_index_ - it->second > kResolveReadRecentFrames) {
+          it = resolve_read_frames_.erase(it);
+        } else {
+          ++it;
+        }
+      }
+      if (resolve_read_frames_.size() >= kMaxResolveReadFrames) {
+        resolve_read_frames_.clear();
+      }
+    }
+    resolve_read_frames_[resolve_key] = resolve_frame_index_;
+    return true;
+  }
+  auto it = resolve_read_frames_.find(resolve_key);
+  return it != resolve_read_frames_.end() &&
+         resolve_frame_index_ - it->second <= kResolveReadRecentFrames;
+}
+
+// Makes a resolve the owner of the pages it writes, so later reads of them are
+// attributed to it.
+void SetResolvePageOwner(uint32_t base, uint32_t length, uint64_t resolve_key) {
   const uint32_t page_count = SharedMemory::kBufferSize >> 12;
   uint32_t first_page = base >> 12;
-  if (first_page >= page_count) {
-    return false;
+  if (!resolve_page_owners_ || !length || first_page >= page_count) {
+    return;
   }
   uint32_t last_page = std::min((base + length - 1) >> 12, page_count - 1);
   for (uint32_t page = first_page; page <= last_page; ++page) {
-    if (resolve_read_pages_[page >> 6].load(std::memory_order_relaxed) &
-        (uint64_t(1) << (page & 63))) {
-      return true;
-    }
-  }
-  return false;
-}
-
-// The watch is one-shot, so it is re-armed on every resolve.
-void ArmResolveReadWatch(uint32_t address, uint32_t length) {
-  memory_->EnablePhysicalMemoryAccessCallbacks(address, length, false, true);
-}
-
-// Ends the resolve frame, and records the presented frontbuffer so scanout
-// targets can be excluded from ring detection.
-void NoteResolveFrame(uint32_t frontbuffer_ptr) {
-  resolve_occurrences_.clear();
-  ++resolve_frame_index_;
-  uint32_t address = frontbuffer_ptr & 0x1FFFFFFF;
-  if (!address) {
-    return;
-  }
-  for (uint32_t frontbuffer : resolve_frontbuffers_) {
-    if (frontbuffer == address) {
-      return;
-    }
-  }
-  resolve_frontbuffers_[resolve_frontbuffer_next_] = address;
-  resolve_frontbuffer_next_ =
-      (resolve_frontbuffer_next_ + 1) % kResolveFrontbufferCount;
-}
-
-bool IsScanoutResolveTarget(uint32_t address) const {
-  for (uint32_t frontbuffer : resolve_frontbuffers_) {
-    if (frontbuffer && frontbuffer == address) {
-      return true;
-    }
-  }
-  return false;
-}
-
-// Whether this resolve is one draw cycling a ring of destinations it owns
-// exclusively, meaning something consumes the output a frame or more later.
-// Slots are keyed by (extent length, occurrence of it this frame) so unrelated
-// draws coming and going do not shift the key. Slots sharing an address are a
-// transient pool instead, so any sharing disqualifies both forever.
-bool IsPrivateRingResolve(uint32_t address, uint32_t length) {
-  uint32_t occurrence = resolve_occurrences_[length]++;
-  uint64_t slot_key = (uint64_t(length) << 32) | occurrence;
-  auto slot = resolve_slots_.find(slot_key);
-  if (slot == resolve_slots_.end()) {
-    if (resolve_slots_.size() >= kMaxResolveSlots) {
-      return false;
-    }
-    slot = resolve_slots_.emplace(slot_key, ResolveSlot()).first;
-  }
-  auto owner = resolve_slot_owners_.find(address);
-  if (owner == resolve_slot_owners_.end()) {
-    if (resolve_slot_owners_.size() < kMaxResolveSlotOwners) {
-      resolve_slot_owners_.emplace(address, slot_key);
-    }
-  } else if (owner->second != slot_key) {
-    slot->second.shared = true;
-    auto other = resolve_slots_.find(owner->second);
-    if (other != resolve_slots_.end()) {
-      other->second.shared = true;
-    }
-  }
-  if (slot->second.shared) {
-    return false;
-  }
-  if (slot->second.address_count < ResolveSlot::kMaxAddresses) {
-    bool known = false;
-    for (uint32_t i = 0; i < slot->second.address_count; ++i) {
-      if (slot->second.addresses[i] == address) {
-        known = true;
-        break;
-      }
-    }
-    if (!known) {
-      slot->second.addresses[slot->second.address_count++] = address;
-    }
-  }
-  // Two distinct destinations for one slot is the ring, and nothing is written
-  // before that, since guessing early and stopping later leaves a stale copy.
-  return slot->second.address_count >= 2 && !IsScanoutResolveTarget(address);
-}
-
-// A coherency request the guest made while a destination is held back. The two
-// kinds mean opposite things.
-void NoteResolveCoherency(uint32_t base, uint32_t size, uint32_t status) {
-  constexpr uint32_t kVcActionEna = uint32_t(1) << 24;
-  constexpr uint32_t kTcActionEna = uint32_t(1) << 25;
-  if (status & kVcActionEna) {
-    // The driver's post-resolve flush, identified by the vertex cache action
-    // rather than rb_copy_dest_base_ena, which only some titles set. It lands
-    // on the same frame as the resolve, the only timing that helps. Matched by
-    // base since the request carries the rect and not the tiled extent, which
-    // is also what keeps titles that never name a destination from firing it.
-    auto held = resolve_held_by_base_.find(base);
-    if (held == resolve_held_by_base_.end()) {
-      return;
-    }
-    ResolveHold hold = held->second;
-    resolve_held_by_base_.erase(held);
-    FlushResolveRangeToGuestRam(base, hold.length, hold.snapshot);
-    return;
-  }
-  if (status & kTcActionEna) {
-    // Texture cache invalidate alone is the opposite direction, the guest
-    // saying it wrote this memory itself. Copying over it would destroy what
-    // the guest produced, so only record the range as one it works with.
-    uint64_t resolve_key = MakeReadbackResolveKey(base, size);
-    if (resolve_destination_keys_.count(resolve_key)) {
-      resolve_coherency_keys_.insert(resolve_key);
-    }
+    resolve_page_owners_[page].store(resolve_key, std::memory_order_relaxed);
   }
 }
 
-void NoteResolveDestination(uint64_t resolve_key) {
-  if (!resolve_destination_keys_.insert(resolve_key).second) {
-    return;
-  }
-  resolve_destination_key_order_.push_back(resolve_key);
-  if (resolve_destination_key_order_.size() > kMaxResolveDestinationKeys) {
-    resolve_destination_keys_.erase(resolve_destination_key_order_.front());
-    resolve_destination_key_order_.pop_front();
-  }
-}
-
-// snapshot means the bytes are in the backend's hold snapshot rather than the
-// shared memory buffer.
-void HoldResolveOutput(uint32_t address, uint32_t length, bool snapshot) {
-  ResolveHold hold;
-  hold.length = length;
-  hold.snapshot = snapshot;
-  auto held = resolve_held_by_base_.emplace(address, hold);
-  if (!held.second) {
-    // Same base at a different extent, the newest resolve is what a coherency
-    // request would be about.
-    held.first->second = hold;
-    return;
-  }
-  resolve_held_base_order_.push_back(address);
-  if (resolve_held_base_order_.size() > kMaxResolveHeldKeys) {
-    resolve_held_by_base_.erase(resolve_held_base_order_.front());
-    resolve_held_base_order_.pop_front();
-  }
-}
-
-// Frames since this destination was last resolved, and records this resolve.
-// A destination touched now and then is a capture rather than a render target,
-// and captures are what gets read back. An unseen one reports a large gap, so
-// a first resolve counts as intermittent.
-uint32_t ResolveFrameGap(uint64_t resolve_key) {
-  auto last = resolve_last_frame_.find(resolve_key);
-  if (last != resolve_last_frame_.end()) {
-    uint32_t gap = resolve_frame_index_ - last->second;
-    last->second = resolve_frame_index_;
-    return gap;
-  }
-  if (resolve_last_frame_.size() < kMaxResolveHeldKeys) {
-    resolve_last_frame_.emplace(resolve_key, resolve_frame_index_);
-    resolve_last_frame_order_.push_back(resolve_key);
-    if (resolve_last_frame_order_.size() > kMaxResolveHeldKeys) {
-      resolve_last_frame_.erase(resolve_last_frame_order_.front());
-      resolve_last_frame_order_.pop_front();
-    }
-  }
-  return UINT32_MAX;
-}
+// Ends the resolve frame.
+void NoteResolveFrame() { ++resolve_frame_index_; }
 
 // What a scaled resolve's readback needs before it can touch the GPU. False
 // means it cannot be read back at all, with the reason already logged.
@@ -340,129 +554,11 @@ bool GetScaledResolveReadbackInfo(uint32_t address, uint32_t length,
   return true;
 }
 
-void DestroyResolveHoldSnapshot(uint32_t base) {
-  auto snapshot = resolve_hold_snapshots_.find(base);
-  if (snapshot == resolve_hold_snapshots_.end()) {
-    return;
-  }
-  resolve_hold_snapshot_bytes_ -= snapshot->second.size;
-  DestroyResolveHoldSnapshotBuffer(snapshot->second.buffer);
-  resolve_hold_snapshots_.erase(snapshot);
-}
-
-// The buffer a held scaled resolve is downscaled into, null meaning not held.
-ResolveHoldSnapshotBuffer* AcquireResolveHoldSnapshot(uint32_t base,
-                                                      uint32_t length) {
-  auto existing = resolve_hold_snapshots_.find(base);
-  if (existing != resolve_hold_snapshots_.end() &&
-      existing->second.size >= length) {
-    // Repeat captures of one destination reuse its buffer.
-    existing->second.last_frame = resolve_frame_index_;
-    return &existing->second.buffer;
-  }
-  uint32_t size = AlignReadbackBufferSize(length);
-  bool eviction_prepared = false;
-  auto drop = [this, &eviction_prepared](uint32_t drop_base) {
-    if (!eviction_prepared) {
-      PrepareResolveHoldSnapshotEviction();
-      eviction_prepared = true;
-    }
-    DestroyResolveHoldSnapshot(drop_base);
-  };
-  if (existing != resolve_hold_snapshots_.end()) {
-    drop(base);
-  }
-  // Evicting rather than refusing, since every destination looks intermittent
-  // on its first resolve and would otherwise fill the pool for good.
-  while (resolve_hold_snapshot_bytes_ + size > kMaxResolveHoldSnapshotBytes &&
-         !resolve_hold_snapshots_.empty()) {
-    auto oldest = resolve_hold_snapshots_.begin();
-    for (auto it = resolve_hold_snapshots_.begin();
-         it != resolve_hold_snapshots_.end(); ++it) {
-      if (it->second.last_frame < oldest->second.last_frame) {
-        oldest = it;
-      }
-    }
-    drop(oldest->first);
-  }
-  if (resolve_hold_snapshot_bytes_ + size > kMaxResolveHoldSnapshotBytes) {
-    // One snapshot larger than the whole budget.
-    return nullptr;
-  }
-  ResolveHoldSnapshot& snapshot = resolve_hold_snapshots_[base];
-  if (!CreateResolveHoldSnapshotBuffer(snapshot.buffer, size)) {
-    resolve_hold_snapshots_.erase(base);
-    return nullptr;
-  }
-  snapshot.size = size;
-  snapshot.last_frame = resolve_frame_index_;
-  resolve_hold_snapshot_bytes_ += size;
-  return &snapshot.buffer;
-}
-
-ResolveHoldSnapshotBuffer* FindResolveHoldSnapshot(uint32_t base) {
-  auto snapshot = resolve_hold_snapshots_.find(base);
-  return snapshot != resolve_hold_snapshots_.end() ? &snapshot->second.buffer
-                                                   : nullptr;
-}
-
-// Only safe where teardown is, the backend hook does not defer past shutdown.
-void ClearResolveHoldSnapshots() {
-  for (auto& snapshot : resolve_hold_snapshots_) {
-    DestroyResolveHoldSnapshotBuffer(snapshot.second.buffer);
-  }
-  resolve_hold_snapshots_.clear();
-  resolve_hold_snapshot_bytes_ = 0;
-}
-
-// Decides what a resolve of [address, length) should do with its output, and
-// whether a copy must stall the GPU afterwards. all copies every resolve. The
-// default mode copies only what some signal says the guest will read back: a
-// CPU read caught by the watch, a destination cycling a private ring, or an
-// explicit coherency request for the range. Anything else stays where the
-// resolve put it, which for GPU-side consumers is where they read it anyway.
-// is_scaled is this resolve's own destination class, not the global scale.
-ResolveHostCopyAction DecideResolveHostCopy(ReadbackResolveMode mode,
-                                            uint32_t address, uint32_t length,
-                                            bool sync, bool is_scaled,
-                                            bool& stall_after_copy) {
-  stall_after_copy = sync;
-  if (mode != ReadbackResolveMode::kFast) {
-    return ResolveHostCopyAction::kToGuestRam;
-  }
-  uint64_t resolve_key = MakeReadbackResolveKey(address, length);
-  NoteResolveDestination(resolve_key);
-  ArmResolveReadWatch(address, length);
-  bool cpu_read = AnyResolvePageRead(address, length);
-  bool private_ring = IsPrivateRingResolve(address, length);
-  bool coherency = resolve_coherency_keys_.count(resolve_key) != 0;
-  if (cpu_read || private_ring || coherency) {
-    resolve_held_by_base_.erase(address);
-    stall_after_copy = sync || coherency;
-    return ResolveHostCopyAction::kToGuestRam;
-  }
-  // Hold the output, so the driver's post-resolve coherency request can release
-  // it later this same frame. Only for a destination the guest has left alone
-  // for a while: one it redraws every frame is a render target, and holding
-  // those would hand over every resolve of them.
-  if (ResolveFrameGap(resolve_key) < kResolveIntermittentFrames) {
-    return ResolveHostCopyAction::kSkip;
-  }
-  if (!is_scaled) {
-    // Already in the shared memory buffer, so a release is just a copy out.
-    HoldResolveOutput(address, length, false);
-    return ResolveHostCopyAction::kSkip;
-  }
-  // A scaled resolve has to be downscaled into a snapshot instead, and the
-  // backend records that hold once the snapshot succeeds.
-  return ResolveHostCopyAction::kToHoldSnapshot;
-}
-
-// Allocates the read-page bitset. Called from each backend's SetupContext,
-// which then registers the per-backend read callback thunk.
+// Allocates the page owners. Called from each backend's SetupContext, which
+// then registers the per-backend read callback thunk.
 void InitResolveReadWatch() {
-  resolve_read_pages_ = std::make_unique<std::atomic<uint64_t>[]>(
-      (SharedMemory::kBufferSize >> 12) / 64);
+  resolve_page_owners_ = std::make_unique<std::atomic<uint64_t>[]>(
+      SharedMemory::kBufferSize >> 12);
 }
 
 // Unregisters the read callback and drops all tracking. Called from each
@@ -472,83 +568,84 @@ void ResetResolveReadWatch() {
     memory_->UnregisterPhysicalMemoryReadCallback(resolve_read_callback_);
     resolve_read_callback_ = nullptr;
   }
-  resolve_read_pages_.reset();
-  resolve_slots_.clear();
-  resolve_slot_owners_.clear();
-  resolve_occurrences_.clear();
-  resolve_coherency_keys_.clear();
-  resolve_held_by_base_.clear();
-  resolve_held_base_order_.clear();
-  resolve_last_frame_.clear();
-  resolve_last_frame_order_.clear();
-  resolve_destination_keys_.clear();
-  resolve_destination_key_order_.clear();
+  resolve_page_owners_.reset();
+  {
+    std::lock_guard<std::mutex> lock(resolve_read_mutex_);
+    resolve_read_keys_.clear();
+    resolve_owners_.clear();
+  }
+  resolve_unsubmitted_owner_ = false;
+  resolve_submit_requested_ = false;
+  resolve_rearm_ranges_.clear();
+  resolve_read_frames_.clear();
 }
 
-// Guest-page bitset of pages the CPU read since a resolve wrote them. Set on
-// the guest thread from the read callback, read on the GPU thread, so atomic.
-std::unique_ptr<std::atomic<uint64_t>[]> resolve_read_pages_;
-
-// One per (extent length, occurrence within the frame).
-struct ResolveSlot {
-  static constexpr uint32_t kMaxAddresses = 8;
-  uint32_t addresses[kMaxAddresses] = {};
-  uint32_t address_count = 0;
-  // Another slot writes one of these addresses, so this is a shared pool.
-  bool shared = false;
-};
-std::unordered_map<uint64_t, ResolveSlot> resolve_slots_;
-// Destination address to the slot that owns it, for the sharing test.
-std::unordered_map<uint32_t, uint64_t> resolve_slot_owners_;
-// Extent length to how many resolves of it have happened this frame. Cleared
-// by NoteResolveFrame.
-std::unordered_map<uint32_t, uint32_t> resolve_occurrences_;
-static constexpr size_t kMaxResolveSlots = 1024;
-static constexpr size_t kMaxResolveSlotOwners = 8192;
-// Ranges an exact-extent coherency request has asked for. Sticky, so once the
-// guest has shown it reads a range back, later resolves of it are written
-// without waiting to be asked again.
-std::unordered_set<uint64_t> resolve_coherency_keys_;
-// A resolve's output held back from guest RAM, still flushable if the guest
-// asks. snapshot tells the backend which buffer to flush out of.
-struct ResolveHold {
+// Per guest page, the key of the resolve that last wrote it, or 0. Written on
+// the GPU thread and by discards, read on faulting threads, so atomic.
+std::unique_ptr<std::atomic<uint64_t>[]> resolve_page_owners_;
+// Destinations whose last output the CPU has read, until resolved again. Taken
+// by the fault handler both with and without the global lock, and held across
+// FaultCopyResolveToGuestRam, so nothing may take the global lock while holding
+// it.
+std::mutex resolve_read_mutex_;
+std::unordered_set<uint64_t> resolve_read_keys_;
+// Resolve output by destination key, for ProvideResolveOutput. Under
+// resolve_read_mutex_.
+struct ResolveOwner {
+  uint32_t address = 0;
   uint32_t length = 0;
-  bool snapshot = false;
+  // Submission the resolve was recorded in.
+  uint64_t submission = 0;
+  uint32_t frame = 0;
+  bool copyable = false;
+  bool in_guest_ram = false;
+  // In resolve_rearm_ranges_ already.
+  bool rearm_pending = false;
+  // The CPU wrote this edge page before the output could be copied, so only
+  // the resolve's bytes in it are copied.
+  bool clip_first_page = false;
+  bool clip_last_page = false;
 };
-// Downscaled output of a held scaled resolve, taken at resolve time because
-// the scaled resolve buffer cannot be downscaled from once the release comes.
-struct ResolveHoldSnapshot {
-  ResolveHoldSnapshotBuffer buffer;
-  uint32_t size = 0;
-  // Resolve frame this was last taken in, for eviction.
-  uint32_t last_frame = 0;
-};
-std::unordered_map<uint32_t, ResolveHoldSnapshot> resolve_hold_snapshots_;
-uint64_t resolve_hold_snapshot_bytes_ = 0;
-// Only intermittent destinations are ever held, so a few at a time is enough.
-static constexpr uint64_t kMaxResolveHoldSnapshotBytes = 64 * 1024 * 1024;
-// Held ranges by destination base. Bounded via the FIFO below.
-std::unordered_map<uint32_t, ResolveHold> resolve_held_by_base_;
-std::deque<uint32_t> resolve_held_base_order_;
-// Frame index of each destination's last resolve, for the intermittency test.
-std::unordered_map<uint64_t, uint32_t> resolve_last_frame_;
-std::deque<uint64_t> resolve_last_frame_order_;
-static constexpr size_t kMaxResolveHeldKeys = 4096;
-// How many frames a destination must go untouched to count as a capture
-// rather than a render target. BG&E redraws its render targets every frame and
-// resolves its screenshot buffer once per capture, so anything well above 1
-// separates them.
-static constexpr uint32_t kResolveIntermittentFrames = 8;
+std::unordered_map<uint64_t, ResolveOwner> resolve_owners_;
+static constexpr size_t kMaxResolveOwners = 4096;
+// Under resolve_read_mutex_.
+void RearmResolveAfterSubmission(ResolveOwner& owner) {
+  if (!owner.rearm_pending) {
+    owner.rearm_pending = true;
+    resolve_rearm_ranges_.emplace_back(owner.address, owner.length);
+  }
+}
+// Under resolve_read_mutex_, when a write to pages [first_page, last_page] goes
+// ahead of the copy of this resolve's output: an edge page it hits partly holds
+// what the CPU writes there, not only what the GPU wrote.
+void ClipResolveEdgePagesWritten(ResolveOwner& owner, uint32_t owner_first_page,
+                                 uint32_t owner_last_page, uint32_t first_page,
+                                 uint32_t last_page) {
+  if ((owner.address & 4095) && first_page <= owner_first_page &&
+      last_page >= owner_first_page) {
+    owner.clip_first_page = true;
+  }
+  if (((owner.address + owner.length) & 4095) &&
+      first_page <= owner_last_page && last_page >= owner_last_page) {
+    owner.clip_last_page = true;
+  }
+}
+std::vector<std::pair<uint32_t, uint32_t>> resolve_fault_copy_ranges_;
+// Owners whose watch a read used up before they could be copied, to arm again
+// when the next submission ends. Under resolve_read_mutex_, and the GPU
+// thread's copy of them.
+std::vector<std::pair<uint32_t, uint32_t>> resolve_rearm_ranges_;
+std::vector<std::pair<uint32_t, uint32_t>> resolve_rearming_ranges_;
+// Frame the CPU last read each destination's output, by resolve key. GPU thread
+// only.
+std::unordered_map<uint64_t, uint32_t> resolve_read_frames_;
+static constexpr size_t kMaxResolveReadFrames = 4096;
+// About a second, chosen, not measured.
+static constexpr uint32_t kResolveReadRecentFrames = 60;
+// A resolve not copied into guest RAM is recorded since the last submission,
+// and one is to be submitted after IssueCopy. GPU thread only.
+bool resolve_unsubmitted_owner_ = false;
+bool resolve_submit_requested_ = false;
 uint32_t resolve_frame_index_ = 0;
-// Every range some resolve has written, held or not. A coherency request is
-// only honoured for one of these, so a request naming unrelated memory cannot
-// make us copy whatever happens to be in the buffer there.
-std::unordered_set<uint64_t> resolve_destination_keys_;
-std::deque<uint64_t> resolve_destination_key_order_;
-static constexpr size_t kMaxResolveDestinationKeys = 4096;
-// Recently presented frontbuffers, excluded from ring detection.
-static constexpr uint32_t kResolveFrontbufferCount = 4;
-uint32_t resolve_frontbuffers_[kResolveFrontbufferCount] = {};
-uint32_t resolve_frontbuffer_next_ = 0;
 // Handle from RegisterPhysicalMemoryReadCallback, or null when not armed.
 void* resolve_read_callback_ = nullptr;

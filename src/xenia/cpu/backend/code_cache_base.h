@@ -223,7 +223,7 @@ class CodeCacheBase : public CodeCache {
           reinterpret_cast<uint8_t*>(xe::memory::AllocFixed(
               reinterpret_cast<void*>(kIndirectionTableBase),
               kIndirectionTableSize, xe::memory::AllocationType::kReserve,
-              xe::memory::PageAccess::kReadWrite));
+              xe::memory::PageAccess::kNoAccess));
       if (indirection_table_base_) {
         uint8_t* exec = reinterpret_cast<uint8_t*>(xe::memory::MapFileView(
             mapping_, reinterpret_cast<void*>(kGeneratedCodeExecuteBase),
@@ -233,9 +233,9 @@ class CodeCacheBase : public CodeCache {
             0));
         uint8_t* write = exec;
         if (exec && !wx_preferred) {
-          write = reinterpret_cast<uint8_t*>(xe::memory::MapFileView(
-              mapping_, reinterpret_cast<void*>(kGeneratedCodeWriteBase),
-              kGeneratedCodeSize, xe::memory::PageAccess::kReadWrite, 0));
+          write = reinterpret_cast<uint8_t*>(
+              xe::memory::MapFileView(mapping_, nullptr, kGeneratedCodeSize,
+                                      xe::memory::PageAccess::kReadWrite, 0));
           if (!write) {
             xe::memory::UnmapFileView(mapping_, exec, kGeneratedCodeSize);
             exec = nullptr;
@@ -260,7 +260,7 @@ class CodeCacheBase : public CodeCache {
     encoded_indirection_ = true;
     indirection_table_base_ = reinterpret_cast<uint8_t*>(xe::memory::AllocFixed(
         nullptr, kIndirectionTableSize, xe::memory::AllocationType::kReserve,
-        xe::memory::PageAccess::kReadWrite));
+        xe::memory::PageAccess::kNoAccess));
     if (!indirection_table_base_) {
       XELOGE("Unable to reserve indirection table at any address (size=0x{:X})",
              static_cast<uint64_t>(kIndirectionTableSize));
@@ -285,7 +285,7 @@ class CodeCacheBase : public CodeCache {
     if (wx_preferred) {
 #if XE_PLATFORM_MAC
       // macOS allows RWX only on anonymous MAP_JIT regions; the W^X gate
-      // happens via pthread_jit_write_protect_np in PlaceGuestCode/PlaceData.
+      // happens via pthread_jit_write_protect_np in PlaceGuestCode/PatchCode.
       generated_code_execute_base_ = reinterpret_cast<uint8_t*>(
           xe::memory::AllocFixed(nullptr, kGeneratedCodeSize,
                                  xe::memory::AllocationType::kReserveCommit,
@@ -319,15 +319,9 @@ class CodeCacheBase : public CodeCache {
                 mapping_, nullptr, kGeneratedCodeSize,
                 xe::memory::PageAccess::kExecuteReadOnly, 0));
       }
-      generated_code_write_base_ =
-          reinterpret_cast<uint8_t*>(xe::memory::MapFileView(
-              mapping_, reinterpret_cast<void*>(kGeneratedCodeWriteBase),
-              kGeneratedCodeSize, xe::memory::PageAccess::kReadWrite, 0));
-      if (!generated_code_write_base_) {
-        generated_code_write_base_ = reinterpret_cast<uint8_t*>(
-            xe::memory::MapFileView(mapping_, nullptr, kGeneratedCodeSize,
-                                    xe::memory::PageAccess::kReadWrite, 0));
-      }
+      generated_code_write_base_ = reinterpret_cast<uint8_t*>(
+          xe::memory::MapFileView(mapping_, nullptr, kGeneratedCodeSize,
+                                  xe::memory::PageAccess::kReadWrite, 0));
     }
     if (!generated_code_execute_base_ || !generated_code_write_base_) {
       XELOGE("Unable to allocate code cache generated code storage");
@@ -346,9 +340,7 @@ class CodeCacheBase : public CodeCache {
     const uintptr_t code_base = execute_base_address();
     const uintptr_t code_end = code_base + kGeneratedCodeSize;
     if (host_address >= code_base && host_address < code_end) {
-      // Bit 31 of the offset is always clear because kGeneratedCodeSize
-      // (0x0FFFFFFF) is less than 0x80000000 — that's what keeps the tag
-      // bit free for the external-table case below.
+      // The size cap keeps bit 31 clear for the external tag below.
       return static_cast<uint32_t>(host_address - code_base);
     }
 
@@ -402,6 +394,9 @@ class CodeCacheBase : public CodeCache {
     if (slot_offset + 4 > kIndirectionTableSize) {
       return;
     }
+    if (!CommitIndirectionChunks(slot_offset, 4)) {
+      return;
+    }
     uint32_t* slot =
         reinterpret_cast<uint32_t*>(indirection_table_base_ + slot_offset);
     if (encoded_indirection_) {
@@ -420,6 +415,9 @@ class CodeCacheBase : public CodeCache {
     const uint64_t guest_delta = guest_address - kIndirectionTableBase;
     const uint64_t slot_offset = (guest_delta / 4) * 4;
     if (slot_offset + 4 > kIndirectionTableSize) {
+      return;
+    }
+    if (!CommitIndirectionChunks(slot_offset, 4)) {
       return;
     }
     uint32_t* slot =
@@ -452,9 +450,9 @@ class CodeCacheBase : public CodeCache {
       return;
     }
 
-    xe::memory::AllocFixed(indirection_table_base_ + start_offset, size,
-                           xe::memory::AllocationType::kCommit,
-                           xe::memory::PageAccess::kReadWrite);
+    if (!CommitIndirectionChunks(start_offset, size)) {
+      return;
+    }
 
     uint32_t* p =
         reinterpret_cast<uint32_t*>(indirection_table_base_ + start_offset);
@@ -462,6 +460,18 @@ class CodeCacheBase : public CodeCache {
     for (size_t i = 0; i < entry_count; i++) {
       p[i] = indirection_default_value_;
     }
+  }
+
+  // Commits the chunk of the table a fault landed in. Code no module commits a
+  // range for, like code the guest writes at runtime, reaches its slots this
+  // way. Returns whether the access can run again.
+  bool CommitIndirectionFault(uint64_t fault_address) {
+    const uint64_t base = reinterpret_cast<uint64_t>(indirection_table_base_);
+    if (!indirection_table_base_ || fault_address < base ||
+        fault_address - base >= kIndirectionTableSize) {
+      return false;
+    }
+    return CommitIndirectionChunks(size_t(fault_address - base), 1);
   }
 
   void PlaceHostCode(uint32_t guest_address, void* machine_code,
@@ -501,6 +511,7 @@ class CodeCacheBase : public CodeCache {
           generated_code_write_base_ + generated_code_offset_;
 
       size_t high_mark = generated_code_offset_;
+      CheckCapacity(high_mark);
 
       generated_code_map_.emplace_back(
           (uint64_t(code_execute_address - generated_code_execute_base_)
@@ -560,32 +571,6 @@ class CodeCacheBase : public CodeCache {
     }
   }
 
-  uint32_t PlaceData(const void* data, size_t length) {
-    size_t high_mark;
-    uint8_t* data_address = nullptr;
-    {
-      auto global_lock = global_critical_region_.Acquire();
-      data_address = generated_code_write_base_ + generated_code_offset_;
-      generated_code_offset_ += xe::round_up(length, 16);
-      high_mark = generated_code_offset_;
-    }
-    EnsureCommitted(high_mark);
-#if XE_PLATFORM_MAC && XE_ARCH_ARM64
-    const bool jit_write_toggle =
-        generated_code_execute_base_ == generated_code_write_base_;
-    if (jit_write_toggle) {
-      pthread_jit_write_protect_np(0);
-    }
-#endif
-    std::memcpy(data_address, data, length);
-#if XE_PLATFORM_MAC && XE_ARCH_ARM64
-    if (jit_write_toggle) {
-      pthread_jit_write_protect_np(1);
-    }
-#endif
-    return uint32_t(uintptr_t(data_address));
-  }
-
   GuestFunction* LookupFunction(uint64_t host_pc) override {
     if (generated_code_map_.empty()) {
       return nullptr;
@@ -624,10 +609,19 @@ class CodeCacheBase : public CodeCache {
  protected:
   static constexpr size_t kIndirectionTableSize = 0x1FFFFFFF;
   static constexpr uintptr_t kIndirectionTableBase = 0x80000000;
-  static constexpr size_t kGeneratedCodeSize = 0x0FFFFFFF;
+  // The table is reserved and committed a chunk at a time, since most of it
+  // never holds a slot.
+  static constexpr size_t kIndirectionChunkSize = 0x10000;
+  static constexpr size_t kIndirectionChunkCount =
+      (kIndirectionTableSize + kIndirectionChunkSize - 1) /
+      kIndirectionChunkSize;
+  // Encoded slots and x64 rel32 need offsets below 2GB, fast-path slots need
+  // the cache below 4GB.
+  static constexpr size_t kGeneratedCodeSize = 0x3FFFFFFF;
   static constexpr uintptr_t kGeneratedCodeExecuteBase = 0xA0000000;
-  static const uintptr_t kGeneratedCodeWriteBase =
-      kGeneratedCodeExecuteBase + kGeneratedCodeSize + 1;
+  static_assert(kGeneratedCodeSize < 0x80000000);
+  static_assert(kGeneratedCodeExecuteBase + kGeneratedCodeSize <
+                0x100000000ull);
   static constexpr size_t kMaximumFunctionCount = 1000000;
 
   struct UnwindReservation {
@@ -648,6 +642,8 @@ class CodeCacheBase : public CodeCache {
   xe::global_critical_region global_critical_region_;
   uint32_t indirection_default_value_ = 0xFEEDF00D;
   uint8_t* indirection_table_base_ = nullptr;
+  // One bit per committed chunk of the table, under the global lock.
+  std::vector<uint64_t> indirection_committed_;
   uint8_t* generated_code_execute_base_ = nullptr;
   uint8_t* generated_code_write_base_ = nullptr;
   size_t generated_code_offset_ = 0;
@@ -664,6 +660,59 @@ class CodeCacheBase : public CodeCache {
 
  private:
   Derived& self() { return static_cast<Derived&>(*this); }
+
+  static void CheckCapacity(size_t high_mark) {
+    if (high_mark > kGeneratedCodeSize) {
+      xe::FatalError(fmt::format(
+          "JIT code cache is full ({} MiB). Please report this game to Xenia "
+          "developers.",
+          (kGeneratedCodeSize + 1) >> 20));
+    }
+  }
+
+  // Commits the chunks covering a range of the table, filling each newly
+  // committed one with the default target. Chunks already committed keep their
+  // slots. With an encoded default of 0 there is nothing to fill. Otherwise a
+  // call can read a slot before the fill reaches it, which the backend's
+  // exception handler sends to the resolve thunk.
+  bool CommitIndirectionChunks(size_t start_offset, size_t size) {
+    if (!indirection_table_base_ || !size) {
+      return false;
+    }
+    auto global_lock = global_critical_region_.Acquire();
+    if (indirection_committed_.empty()) {
+      indirection_committed_.assign((kIndirectionChunkCount + 63) / 64, 0);
+    }
+    const size_t last_chunk = (start_offset + size - 1) / kIndirectionChunkSize;
+    for (size_t chunk = start_offset / kIndirectionChunkSize;
+         chunk <= last_chunk; chunk++) {
+      uint64_t& word = indirection_committed_[chunk / 64];
+      const uint64_t bit = uint64_t(1) << (chunk % 64);
+      if (word & bit) {
+        continue;
+      }
+      const size_t offset = chunk * kIndirectionChunkSize;
+      const size_t length =
+          std::min(kIndirectionChunkSize, kIndirectionTableSize - offset);
+      if (!xe::memory::AllocFixed(indirection_table_base_ + offset, length,
+                                  xe::memory::AllocationType::kCommit,
+                                  xe::memory::PageAccess::kReadWrite)) {
+        XELOGE("Unable to commit the indirection table chunk at 0x{:X}",
+               offset);
+        return false;
+      }
+      // An encoded default of 0 is what a committed chunk already holds.
+      if (indirection_default_value_) {
+        uint32_t* slots =
+            reinterpret_cast<uint32_t*>(indirection_table_base_ + offset);
+        for (size_t i = 0; i < length / 4; i++) {
+          slots[i] = indirection_default_value_;
+        }
+      }
+      word |= bit;
+    }
+    return true;
+  }
 
   void EnsureCommitted(size_t high_mark) {
     using namespace xe::literals;

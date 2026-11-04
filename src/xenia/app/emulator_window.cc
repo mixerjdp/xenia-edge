@@ -17,8 +17,11 @@
 #include "xenia/ui/install_progress_dialog_wx.h"
 #include "xenia/ui/profile_editor_dialog_wx.h"
 #include "xenia/ui/quick_settings_dialog_wx.h"
+#include "xenia/ui/system_files_installer_wx.h"
 #include "xenia/ui/windowed_app_wx.h"
 
+#include <algorithm>
+#include <array>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -26,6 +29,8 @@
 #include <span>
 #include <sstream>
 #include <thread>
+
+#include <wx/timer.h>
 
 #include "third_party/imgui/imgui.h"
 #include "third_party/stb/stb_image_write.h"
@@ -155,6 +160,7 @@
 #include <wx/msgdlg.h>
 #include <wx/mstream.h>
 #include <wx/panel.h>
+#include <wx/progdlg.h>
 #include <wx/settings.h>
 #include <wx/slider.h>
 #include <wx/statbmp.h>
@@ -182,6 +188,12 @@ DEFINE_transient_bool(return_to_ui, false,
                       "Return to UI process when game exits. Set automatically "
                       "when launching from UI.",
                       "General");
+
+DEFINE_bool(boot_to_dashboard, false,
+            "Start the installed dashboard after the boot animation instead of "
+            "showing the game list, and go back to the dashboard when a title "
+            "exits.",
+            "General");
 
 DEFINE_bool(fullscreen, false, "Whether to launch the emulator in fullscreen.",
             "Display");
@@ -322,12 +334,49 @@ struct WxToolbarState {
 
 namespace {
 
+// Arguments that describe only the launch they were passed to, which a launch
+// spawned from it doesn't inherit.
+bool IsLaunchOnlyArg(std::string_view arg) {
+  for (const std::string_view name :
+       {"--target=", "--launch_module=", "--launch_flags=", "--launch_data=",
+        "--launch_xbox_disc=", "--launch_package=",
+        "--slot_bindings_passthrough=", "--boot_animation="}) {
+    if (xe::utf8::starts_with(arg, name)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+#if XE_PLATFORM_WIN32
+// Quotes one argument the way CommandLineToArgvW reads it back, where
+// backslashes before a quote escape it.
+std::u16string QuoteCommandLineArg(std::u16string_view arg) {
+  std::u16string quoted = u"\"";
+  size_t backslashes = 0;
+  for (char16_t c : arg) {
+    if (c == u'\\') {
+      ++backslashes;
+      continue;
+    }
+    quoted.append(c == u'"' ? backslashes * 2 + 1 : backslashes, u'\\');
+    backslashes = 0;
+    quoted += c;
+  }
+  quoted.append(backslashes * 2, u'\\');
+  quoted += u'"';
+  return quoted;
+}
+#endif
+
 #if XE_PLATFORM_MAC
 // execv of a universal binary inherits the parent's arch; arch(1) is the
 // only way to switch (e.g. Rosetta-running game spawning the native arm64
 // UI back). Returns "-arm64" / "-x86_64" when a switch is needed, or null
 // when default exec already picks the right slice.
 const char* RosettaArchFlagIfSwitchNeeded(bool want_rosetta) {
+  // arch -x86_64 fails outright on an arm64-only bundle.
+  want_rosetta = want_rosetta && ExecutableHasX86_64Slice();
   int translated = 0;
   size_t sz = sizeof(translated);
   // Missing sysctl => assume native; only Rosetta children set this to 1.
@@ -380,11 +429,10 @@ constexpr int kToolbarIconSize = 32;
 // Smaller than the tool buttons — informative-only, paired with the slider.
 constexpr int kAudioIconSize = 24;
 
-// XINPUT_DEVSUBTYPE_* values offered as override choices. The alternate
-// guitar (0x07) and bass guitar (0x0B) variants collapse onto the single
-// "Guitar" entry (0x06) since the guest treats them equivalently.
-constexpr uint8_t kSelectableSubtypes[] = {0x01, 0x02, 0x03, 0x04,
-                                           0x05, 0x06, 0x08, 0x13};
+// XINPUT_DEVSUBTYPE_* values offered as override choices. Games may check for a
+// specific guitar variant, so all three are listed.
+constexpr uint8_t kSelectableSubtypes[] = {0x01, 0x02, 0x03, 0x04, 0x05,
+                                           0x06, 0x07, 0x0B, 0x08, 0x13};
 
 wxString SubtypeName(uint8_t subtype) {
   switch (subtype) {
@@ -399,9 +447,11 @@ wxString SubtypeName(uint8_t subtype) {
     case 0x05:
       return _("Dance Pad");
     case 0x06:
-    case 0x07:
-    case 0x0B:
       return _("Guitar");
+    case 0x07:
+      return _("Alternate Guitar");
+    case 0x0B:
+      return _("Bass Guitar");
     case 0x08:
       return _("Drum Kit");
     case 0x13:
@@ -409,6 +459,31 @@ wxString SubtypeName(uint8_t subtype) {
     default:
       return _("Gamepad");
   }
+}
+
+// Subtype the guest sees for a bound device.
+uint8_t EffectiveSubtype(uint8_t detected, uint8_t native_subtype,
+                         const hid::InputSystem::SlotBinding& binding) {
+  if (binding.subtype_override) {
+    return binding.subtype_override;
+  }
+  return native_subtype ? native_subtype : detected;
+}
+
+// The connected devices in a slot, as "A + B".
+wxString SlotDeviceNames(
+    const std::vector<hid::InputSystem::SlotBinding>& bindings) {
+  wxString names;
+  for (const auto& binding : bindings) {
+    if (!binding.driver) {
+      continue;
+    }
+    if (!names.empty()) {
+      names += wxT(" + ");
+    }
+    names += wxString::FromUTF8(binding.display_name);
+  }
+  return names;
 }
 
 // About dialog with clickable links, which the stock wxAboutBox
@@ -463,6 +538,15 @@ class AboutDialog : public wxGenericAboutDialog {
     AddControl(row);
   }
 };
+
+// Shows a message over whatever the window holds. ImGui dialogs draw in the
+// render pane, which the game list hides.
+void ShowWindowMessage(ui::Window* window, const wxString& caption,
+                       const wxString& message, long icon) {
+  auto* wx_window = dynamic_cast<ui::WxWindow*>(window);
+  wxMessageBox(message, caption, wxOK | icon,
+               wx_window ? wx_window->frame() : nullptr);
+}
 }  // namespace
 
 using xe::ui::FileDropEvent;
@@ -514,6 +598,8 @@ std::unique_ptr<EmulatorWindow> EmulatorWindow::Create(
 }
 
 EmulatorWindow::~EmulatorWindow() {
+  library_fill_alive_->store(false);
+
   // Stop the gamepad poll thread and wait for it to exit; it touches members of
   // this window and Thread::reset() does not join.
   gamepad_poll_running_ = false;
@@ -574,11 +660,49 @@ void EmulatorWindow::ShutdownGraphicsSystemPresenterPainting() {
   presenter_painting_ = nullptr;
 }
 
+void EmulatorWindow::PublishLibraryTitles() {
+  std::vector<Emulator::LibraryTitle> titles;
+  for (const auto& entry : game_library_->entries()) {
+    if (entry.paths.empty()) {
+      continue;
+    }
+    titles.push_back(
+        {entry.title_id, entry.version, entry.name, entry.default_path().path,
+         game_library_->IconPath(entry.key()), entry.content_type});
+  }
+  emulator_->SetLibraryTitles(std::move(titles));
+}
+
 void EmulatorWindow::InitializeGameLibrary() {
   const auto library_root = emulator_->storage_root() / "library";
 
   game_library_ = std::make_unique<GameLibrary>(library_root);
+  game_library_->set_changed_callback([this]() { PublishLibraryTitles(); });
   game_library_->Load();
+
+  // The files are read off the UI thread, and each result is recorded back on
+  // it so the library is only ever changed from there.
+  if (auto missing = game_library_->FindMissingFields(); !missing.empty()) {
+    std::thread([missing = std::move(missing), alive = library_fill_alive_,
+                 app_context = &app_context_, this]() {
+      for (const auto& release : missing) {
+        if (!alive->load(std::memory_order_relaxed)) {
+          return;
+        }
+        auto info = GameLibrary::ReadMissingFields(release);
+        if (!info) {
+          continue;
+        }
+        app_context->CallInUIThread([alive, this, key = release.key,
+                                     info = std::move(*info)]() {
+          if (alive->load(std::memory_order_relaxed) &&
+              game_library_->FillMissingFields(key, info) && game_list_panel_) {
+            game_list_panel_->RefreshEntry(key);
+          }
+        });
+      }
+    }).detach();
+  }
 
   // Load() identifies releases the library recorded before media ids were
   // kept, which separates any title that turned out to hold more than one.
@@ -597,9 +721,8 @@ void EmulatorWindow::InitializeGameLibrary() {
     // Deferred: this runs partway through OnEmulatorInitialized, and a modal
     // would hold the rest of startup behind it.
     app_context_.CallInUIThreadDeferred([this, message]() {
-      auto* wx_window = dynamic_cast<ui::WxWindow*>(window_.get());
-      wxMessageBox(message, _("Library updated"), wxOK | wxICON_INFORMATION,
-                   wx_window ? wx_window->frame() : nullptr);
+      ShowWindowMessage(window_.get(), _("Library updated"), message,
+                        wxICON_INFORMATION);
     });
   }
 }
@@ -609,25 +732,37 @@ void EmulatorWindow::AddLaunchedTitleToLibrary(uint32_t title_id,
   if (!game_library_) {
     return;
   }
-  const auto& launched = emulator_->last_launch_path();
-  game_library_->AddDisc(title_id, name, launched);
-
-  // AddDisc placed it, so ask the library which release holds it rather than
-  // guessing. Nothing to point art or a default at if it declined the file,
-  // and a made-up key would have us write a folder no entry lives in.
-  const auto* entry = game_library_->FindByPath(title_id, launched);
-  if (!entry) {
+  // XeFu runs an original Xbox game, which is listed as itself, from the file
+  // it was opened from, with its executable's title image.
+  if (title_id == kXeFuTitleId) {
+    const auto& game = emulator_->xbox_game();
+    if (!game) {
+      return;
+    }
+    const auto key = RecordLaunchedDisc(game->title_id, game->title_name,
+                                        emulator_->xbox_disc_path());
+    std::error_code ec;
+    if (key && !game->icon_png.empty() &&
+        !std::filesystem::exists(game_library_->IconPath(*key), ec)) {
+      game_library_->SetIcon(*key, game->icon_png);
+    }
     return;
   }
-  const LibraryKey key = entry->key();
-  // The disc we just booted becomes the default for next launch.
-  game_library_->SetDefaultPath(key, launched);
+  // The disc's path belongs to the disc's own title, not the package's.
+  if (!emulator_->last_launch_package().empty()) {
+    return;
+  }
+  const auto key =
+      RecordLaunchedDisc(title_id, name, emulator_->last_launch_path());
+  if (!key) {
+    return;
+  }
 
   // Adopt the running title's icon if we have no art yet. The SPA writes it to
   // the per-title GPD on boot, so a signed-in profile has it by now.
   std::error_code ec;
   if (title_id == 0 ||
-      std::filesystem::exists(game_library_->IconPath(key), ec)) {
+      std::filesystem::exists(game_library_->IconPath(*key), ec)) {
     return;
   }
   auto* xam_state = emulator_->kernel_state()
@@ -644,10 +779,31 @@ void EmulatorWindow::AddLaunchedTitleToLibrary(uint32_t title_id,
     }
     auto icon = profile->GetTitleIcon(title_id);
     if (!icon.empty()) {
-      game_library_->SetIcon(key, icon);
+      game_library_->SetIcon(*key, icon);
       break;
     }
   }
+}
+
+std::optional<LibraryKey> EmulatorWindow::RecordLaunchedDisc(
+    uint32_t title_id, const std::string& name,
+    const std::filesystem::path& path) {
+  game_library_->AddDisc(title_id, name, path);
+
+  // AddDisc placed it, so ask the library which release holds it rather than
+  // guessing. Nothing to point art or a default at if it declined the file,
+  // and a made-up key would have us write a folder no entry lives in.
+  const auto* entry = game_library_->FindByPath(title_id, path);
+  if (!entry) {
+    return std::nullopt;
+  }
+  const LibraryKey key = entry->key();
+  // The disc we just booted becomes the default for next launch.
+  game_library_->SetDefaultPath(key, path);
+  // A launch from outside the list is a play all the same, which the profile
+  // can't record for a title with several releases or for one XeFu runs.
+  game_library_->MarkPlayed(key, std::time(nullptr));
+  return key;
 }
 
 void EmulatorWindow::OnEmulatorInitialized() {
@@ -675,6 +831,26 @@ void EmulatorWindow::OnEmulatorInitialized() {
               ApplyContentVisibility();
             });
       });
+  emulator_->on_relaunch_failed.AddListener([this]() {
+    app_context_.CallInUIThread([this]() { OnLaunchFailed(); });
+  });
+  // The title's dialogs close while the threads waiting on them still run.
+  emulator_->on_title_closing.AddListener([this]() {
+    app_context_.CallInUIThreadSynchronous([this]() { ClearDialogs(); });
+  });
+  // The title's threads are gone, so it queues no notifications after this.
+  // Its GPU is stopped too, which drops any shader report still to come.
+  emulator_->on_before_shutdown.AddListener([this]() {
+    app_context_.CallInUIThreadSynchronous([this]() {
+      imgui_drawer_->ClearNotifications();
+      initializing_shader_storage_ = false;
+      compiling_shaders_ = false;
+      if (compiling_shaders_hide_timer_) {
+        compiling_shaders_hide_timer_->Stop();
+      }
+      UpdateTitle();
+    });
+  });
 
   window_->SetCursorVisibility(ui::Window::CursorVisibility::kAutoHidden);
 
@@ -741,205 +917,80 @@ void EmulatorWindow::OnEmulatorInitialized() {
   }
 
   // Register callback for title-to-title launches from the kernel
-  emulator_->set_on_launch_new_title([this](const std::string& host_path,
-                                            const std::string& launch_module,
-                                            uint32_t launch_flags,
-                                            const std::string& launch_data) {
-    XELOGI(
-        "Launching new title: host_path={}, launch_module={}, flags={}, "
-        "data_len={}",
-        host_path, launch_module, launch_flags, launch_data.length());
+  emulator_->set_on_launch_new_title(
+      [this](const std::string& host_path, const std::string& launch_module,
+             uint32_t launch_flags, const std::string& launch_data,
+             const std::string& xbox_disc, const std::string& package) {
+        XELOGI(
+            "Launching new title: host_path={}, launch_module={}, flags={}, "
+            "data_len={}, xbox_disc={}, package={}",
+            xe::strip_pii(host_path), launch_module, launch_flags,
+            launch_data.length(), xe::strip_pii(xbox_disc), package);
 
-    std::filesystem::path executable_path = xe::filesystem::GetExecutablePath();
-
-    std::string slot_bindings_arg;
-    if (auto* is = emulator_ ? emulator_->input_system() : nullptr) {
-      auto l = is->lock();
-      slot_bindings_arg = is->SerializeSlotBindingsForPassthrough();
-    }
-
-#if XE_PLATFORM_WIN32
-    auto exe_path_u16 = xe::path_to_utf16(executable_path);
-    std::u16string cmd_line = u"\"" + exe_path_u16 + u"\"";
-
-    // Forward parent's CLI args.
-    int parent_argc = 0;
-    wchar_t** parent_argv = CommandLineToArgvW(GetCommandLineW(), &parent_argc);
-    if (parent_argv) {
-      for (int i = 1; i < parent_argc; ++i) {
-        std::u16string a(reinterpret_cast<const char16_t*>(parent_argv[i]));
-        if (a.empty() || a[0] != u'-') {
-          continue;  // positional game file — replaced below
+        std::vector<std::string> args;
+        // Preserve return_to_ui through the title-to-title chain. The game list
+        // gets it too, which keeps boot_to_dashboard from starting the
+        // dashboard in its place.
+        if (cvars::return_to_ui || host_path.empty()) {
+          args.push_back("--return_to_ui=true");
         }
-        cmd_line += u" \"" + a + u"\"";
-      }
-      LocalFree(parent_argv);
-    }
-
-    // Append to log file instead of overwriting
-    cmd_line += u" --log_append=true";
-    // Preserve return_to_ui through the title-to-title chain
-    if (cvars::return_to_ui) {
-      cmd_line += u" --return_to_ui=true";
-    }
-    // Preserve fullscreen state, except when returning to UI (no game).
-    if (window_->IsFullscreen() && !host_path.empty()) {
-      cmd_line += u" --fullscreen=true";
-    }
-    if (!launch_module.empty()) {
-      cmd_line += u" --launch_module=\"" + xe::to_utf16(launch_module) + u"\"";
-    }
-    if (launch_flags != 0) {
-      cmd_line +=
-          u" --launch_flags=" + xe::to_utf16(fmt::format("{}", launch_flags));
-    }
-    if (!launch_data.empty()) {
-      cmd_line += u" --launch_data=" + xe::to_utf16(launch_data);
-    }
-    if (!slot_bindings_arg.empty()) {
-      cmd_line += u" --slot_bindings_passthrough=\"" +
-                  xe::to_utf16(slot_bindings_arg) + u"\"";
-    }
-    if (!host_path.empty()) {
-      cmd_line += u" \"" + xe::to_utf16(host_path) + u"\"";
-    }
-
-    STARTUPINFOW si = {};
-    si.cb = sizeof(si);
-    PROCESS_INFORMATION pi = {};
-
-    if (!CreateProcessW(nullptr,
-                        const_cast<wchar_t*>(
-                            reinterpret_cast<const wchar_t*>(cmd_line.c_str())),
-                        nullptr, nullptr, FALSE, CREATE_NEW_CONSOLE, nullptr,
-                        nullptr, &si, &pi)) {
-      XELOGE("Failed to launch new process: {}", GetLastError());
-      return;
-    }
-    // Allow the new process to bring itself to the foreground
-    AllowSetForegroundWindow(pi.dwProcessId);
-    CloseHandle(pi.hProcess);
-    CloseHandle(pi.hThread);
-#else
-    setenv("XENIA_WAIT_FOR_PID",
-           std::to_string(static_cast<long>(getpid())).c_str(), 1);
-    pid_t pid = fork();
-    if (pid == 0) {
-      // Child process
-      std::vector<std::string> arg_storage;
-      std::string gamemode_cmd;
-
-#if XE_PLATFORM_LINUX
-      // unsetenv on the false branch: the env var is inherited across the
-      // UI <-> title spawn chain, so a stale "1" from a previous launch
-      // would otherwise outlive the unchecked cvar.
-      if (cvars::use_mangohud) {
-        setenv("MANGOHUD", "1", 1);
-      } else {
-        unsetenv("MANGOHUD");
-      }
-      if (cvars::use_gamemode) {
-        gamemode_cmd = "gamemoderun";
-      }
-#endif
-#if XE_PLATFORM_MAC
-      if (cvars::use_metal_hud) {
-        setenv("MTL_HUD_ENABLED", "1", 1);
-      } else {
-        unsetenv("MTL_HUD_ENABLED");
-      }
-      // Empty host_path = returning to the UI/game list; the per-title
-      // rosetta override shouldn't follow us back, so use native there.
-      const bool want_rosetta = !host_path.empty() && cvars::use_rosetta;
-      const char* arch_flag = RosettaArchFlagIfSwitchNeeded(want_rosetta);
-#else
-      const char* arch_flag = nullptr;
-#endif
-      const bool use_arch_wrapper = (arch_flag != nullptr);
-
-      arg_storage.push_back(executable_path.string());
-
-      // Forward parent's CLI args.
-      for (int i = 1; i < xe::ui::g_argc; ++i) {
-        std::string_view a = xe::ui::g_argv[i];
-        if (a.empty() || a[0] != '-') {
-          continue;  // positional game file — replaced below
+        // Preserve fullscreen state, except when returning to UI (no game).
+        if (window_->IsFullscreen() && !host_path.empty()) {
+          args.push_back("--fullscreen=true");
         }
-        arg_storage.emplace_back(a);
-      }
-
-      // Append to log file instead of overwriting
-      arg_storage.push_back("--log_append=true");
-      // Preserve return_to_ui through the title-to-title chain
-      if (cvars::return_to_ui) {
-        arg_storage.push_back("--return_to_ui=true");
-      }
-      // Preserve fullscreen state, except when returning to UI (no game).
-      if (window_->IsFullscreen() && !host_path.empty()) {
-        arg_storage.push_back("--fullscreen=true");
-      }
-      if (!launch_module.empty()) {
-        arg_storage.push_back("--launch_module=" + launch_module);
-      }
-      if (launch_flags != 0) {
-        arg_storage.push_back(fmt::format("--launch_flags={}", launch_flags));
-      }
-      if (!launch_data.empty()) {
-        arg_storage.push_back("--launch_data=" + launch_data);
-      }
-      if (!slot_bindings_arg.empty()) {
-        arg_storage.push_back("--slot_bindings_passthrough=" +
-                              slot_bindings_arg);
-      }
-      if (!host_path.empty()) {
-        arg_storage.push_back(host_path);
-      }
-
-      // arg_storage is fully populated now — take c_str() pointers only after
-      // the last push_back, otherwise a reallocation leaves them dangling.
-      std::vector<const char*> argv;
-      if (!gamemode_cmd.empty()) {
-        argv.push_back(gamemode_cmd.c_str());
-      }
-      if (use_arch_wrapper) {
-        argv.push_back("arch");
-        argv.push_back(arch_flag);
-      }
-      for (const std::string& arg : arg_storage) {
-        argv.push_back(arg.c_str());
-      }
-      argv.push_back(nullptr);
-
-      if (!gamemode_cmd.empty()) {
-        execvp(gamemode_cmd.c_str(), const_cast<char**>(argv.data()));
-      } else if (use_arch_wrapper) {
-        execvp("arch", const_cast<char**>(argv.data()));
-      } else {
-        execv(executable_path.c_str(), const_cast<char**>(argv.data()));
-      }
-      std::exit(1);
-    } else if (pid < 0) {
-      XELOGE("Failed to fork process");
-      return;
-    }
-#endif
-    xe::FlushLog();
-    std::thread([]() {
-      std::this_thread::sleep_for(std::chrono::seconds(5));
-      XELOGW("UI loop drain exceeded watchdog timeout, forcing exit");
-      xe::FlushLog();
-      std::_Exit(0);
-    }).detach();
-    app_context_.RequestDeferredQuit();
-  });
+        if (!launch_module.empty()) {
+          args.push_back("--launch_module=" + launch_module);
+        }
+        if (launch_flags != 0) {
+          args.push_back(fmt::format("--launch_flags={}", launch_flags));
+        }
+        if (!launch_data.empty()) {
+          args.push_back("--launch_data=" + launch_data);
+        }
+        if (!xbox_disc.empty()) {
+          args.push_back("--launch_xbox_disc=" + xbox_disc);
+        }
+        if (!package.empty()) {
+          args.push_back("--launch_package=" + package);
+        }
+        if (!SpawnEmulatorProcess(args, host_path)) {
+          return;
+        }
+        xe::FlushLog();
+        std::thread([]() {
+          std::this_thread::sleep_for(std::chrono::seconds(5));
+          XELOGW("UI loop drain exceeded watchdog timeout, forcing exit");
+          xe::FlushLog();
+          std::_Exit(0);
+        }).detach();
+        // The title runs on into the exit, which deletes the window without
+        // closing it, so the title's frames are cut off from the window first.
+        // That comes after the quit has run what's queued and stopped taking
+        // more, so nothing reattaches them.
+        app_context_.CallInUIThreadDeferred([this]() {
+          app_context_.QuitFromUIThread();
+          ShutdownGraphicsSystemPresenterPainting();
+        });
+      });
 
   emulator_->set_on_exit_to_dashboard(
-      [this]() { return StopTitleAndReturnToList(); });
+      [this]() { return StopTitleAndReturnHome(); });
+  emulator_->set_on_power_off([this]() { return StopTitleAndReturnToList(); });
 
   // Register callback for disc swap to update title bar
   emulator_->set_on_disc_swap([this](uint8_t) {
     app_context_.CallInUIThread([this]() { UpdateTitle(); });
   });
+
+  // The dashboard's open tray asks for a disc the way File > Open asks for a
+  // title.
+  emulator_->set_disc_picker([this]() { return PickTitleFile(); });
+
+  // File > Close of a title in its own process starts a new one for the list.
+  if (cvars::target.empty() && !cvars::return_to_ui &&
+      !emulator_->is_title_open() && DashboardIsHome()) {
+    StartDashboard();
+  }
 }
 
 void EmulatorWindow::EmulatorWindowListener::OnClosing(ui::UIEvent& e) {
@@ -1013,6 +1064,11 @@ bool EmulatorWindow::Initialize() {
                              std::bind(&EmulatorWindow::FileOpen, this));
       file_open_menu_item_ = open_item.get();
       file_menu->AddChild(std::move(open_item));
+      auto start_dashboard_item =
+          WxMenuItem::Create(MenuItem::Type::kString, _("Start Dashboard"),
+                             std::bind(&EmulatorWindow::StartDashboard, this));
+      file_start_dashboard_menu_item_ = start_dashboard_item.get();
+      file_menu->AddChild(std::move(start_dashboard_item));
       auto add_games_item =
           WxMenuItem::Create(MenuItem::Type::kString, _("&Add Games..."),
                              std::bind(&EmulatorWindow::FileAddGames, this));
@@ -1105,6 +1161,9 @@ bool EmulatorWindow::Initialize() {
       tools_menu->AddChild(
           WxMenuItem::Create(MenuItem::Type::kString, _("&Install Content..."),
                              std::bind(&EmulatorWindow::InstallContent, this)));
+      tools_menu->AddChild(WxMenuItem::Create(
+          MenuItem::Type::kString, _("Install System Files..."),
+          std::bind(&EmulatorWindow::InstallSystemFiles, this)));
     }
     tools_menu_ = tools_menu.get();
     main_menu->AddChild(std::move(tools_menu));
@@ -1378,8 +1437,6 @@ bool EmulatorWindow::Initialize() {
       game_list_panel_ = new GameListPanel(frame, this);
       game_list_panel_->SetLaunchCallback(
           [this](const std::filesystem::path& path) { RunTitle(path); });
-      game_list_panel_->SetSelectionChangedCallback(
-          [this]() { ApplyContentVisibility(); });
       aui->AddPane(game_list_panel_,
                    wxAuiPaneInfo().Name("game_list").CenterPane());
       aui->Update();
@@ -1535,6 +1592,15 @@ void EmulatorWindow::OnKeyDown(ui::KeyEvent& e) {
     return;
   }
 
+  // A held hotkey acts once and its repeats are swallowed with it.
+  if (e.prev_state()) {
+    if (hotkeys_down_.count(e.virtual_key())) {
+      e.set_handled(true);
+    }
+    return;
+  }
+  hotkeys_down_.erase(e.virtual_key());
+
   switch (e.virtual_key()) {
     case ui::VirtualKey::kO: {
       if (!e.is_ctrl_pressed() || emulator_->is_title_open()) {
@@ -1580,6 +1646,16 @@ void EmulatorWindow::OnKeyDown(ui::KeyEvent& e) {
     } break;
 
     case ui::VirtualKey::kEscape: {
+      // In game Esc toggles the context menu, which offers leaving fullscreen.
+      // Other open dialogs keep Esc to cancel.
+      if (emulator_->is_title_open()) {
+        if (!context_menu_ && imgui_drawer() &&
+            imgui_drawer()->HasOpenDialogs()) {
+          return;
+        }
+        ToggleContextMenu(false);
+        break;
+      }
       // Allow users to escape fullscreen (but not enter it).
       if (!window_->IsFullscreen()) {
         return;
@@ -1598,6 +1674,7 @@ void EmulatorWindow::OnKeyDown(ui::KeyEvent& e) {
       return;
   }
 
+  hotkeys_down_.insert(e.virtual_key());
   e.set_handled(true);
 }
 
@@ -1671,13 +1748,15 @@ void EmulatorWindow::ToggleContextMenu(bool use_cursor_position) {
 
   context_menu->AddSeparator();
 
-  context_menu->AddAction("Return to Game List", [this, input_sys]() {
+  const char* return_label =
+      DashboardIsHome() ? "Return to Dashboard" : "Return to Game List";
+  context_menu->AddAction(return_label, [this, input_sys, return_label]() {
     new ui::ImGuiConfirmDialog(
-        imgui_drawer(), "Return to Game List",
+        imgui_drawer(), return_label,
         "Really stop title? Unsaved progress will be lost.",
         [this](bool confirmed) {
           if (confirmed) {
-            StopTitleAndReturnToList();
+            StopTitleAndReturnHome();
           }
         },
         input_sys);
@@ -1765,7 +1844,8 @@ void EmulatorWindow::SaveImage(const std::filesystem::path& filepath,
                                const xe::ui::RawImage& image) {
   auto file = std::ofstream(filepath, std::ios::binary);
   if (!file.is_open()) {
-    XELOGE("Failed to open file for writing: {}", filepath);
+    XELOGE("Failed to open file for writing: {}",
+           xe::strip_pii(xe::path_to_utf8(filepath)));
     return;
   }
 
@@ -1777,7 +1857,8 @@ void EmulatorWindow::SaveImage(const std::filesystem::path& filepath,
       &file, image.width, image.height, 4, image.data.data(),
       (int)image.stride);
   if (result == 0) {
-    XELOGE("Failed to write PNG to file: {}", filepath);
+    XELOGE("Failed to write PNG to file: {}",
+           xe::strip_pii(xe::path_to_utf8(filepath)));
     return;
   }
 }
@@ -1807,8 +1888,13 @@ void EmulatorWindow::FileDrop(const std::filesystem::path& path) {
 }
 
 void EmulatorWindow::FileOpen() {
-  std::filesystem::path path;
+  const std::filesystem::path path = PickTitleFile();
+  if (!path.empty()) {
+    RunTitle(path);
+  }
+}
 
+std::filesystem::path EmulatorWindow::PickTitleFile() {
   auto file_picker = xe::ui::FilePicker::Create();
   file_picker->set_mode(ui::FilePicker::Mode::kOpen);
   file_picker->set_type(ui::FilePicker::Type::kFile);
@@ -1832,15 +1918,25 @@ void EmulatorWindow::FileOpen() {
       //{"Content Package (*.xcp)", "*.xcp" },
       {"All Files", "*"},
   });
-  if (file_picker->Show(window_.get())) {
-    auto selected_files = file_picker->selected_files();
-    if (!selected_files.empty()) {
-      path = selected_files[0];
-    }
-    if (!path.empty()) {
-      RunTitle(path);
-    }
+  if (!file_picker->Show(window_.get()) ||
+      file_picker->selected_files().empty()) {
+    return {};
   }
+  return file_picker->selected_files().front();
+}
+
+void EmulatorWindow::StartDashboard() {
+  RunTitle(GetInstalledDashboardPath(), /*boot_animation=*/true);
+}
+
+std::filesystem::path EmulatorWindow::GetInstalledDashboardPath() const {
+  return emulator_->system_files_path() / "flash" / "dash.xex";
+}
+
+bool EmulatorWindow::DashboardIsHome() const {
+  std::error_code ec;
+  return cvars::boot_to_dashboard &&
+         std::filesystem::exists(GetInstalledDashboardPath(), ec);
 }
 
 void EmulatorWindow::FileAddGames() {
@@ -1972,7 +2068,7 @@ bool EmulatorWindow::StopTitleAndReturnToList() {
   if (!in_process) {
     if (auto cb = emulator_->on_launch_new_title()) {
       cb(/*host_path=*/{}, /*launch_module=*/{}, /*launch_flags=*/0,
-         /*launch_data=*/{});
+         /*launch_data=*/{}, /*xbox_disc=*/{}, /*package=*/{});
     }
     return false;
   }
@@ -1980,29 +2076,84 @@ bool EmulatorWindow::StopTitleAndReturnToList() {
   std::thread([this]() {
     emulator_->ResetTitle();
     app_context_.CallInUIThread([this]() {
-      if (game_list_panel_) {
-        game_list_panel_->Reload();
+      RestoreListWindow();
+      // XeFu exits when the build it picked for the game isn't there.
+      if (const std::string file = emulator_->TakeMissingXeFuFile();
+          !file.empty()) {
+        ShowMissingXeFuFile(file);
       }
-      UpdateTitle();
-      window_->ResetIcon();
-      // Drop fullscreen back to windowed now that the presenter is gone, so
-      // the user lands on the game list at the default size.
-      if (window_->IsFullscreen()) {
-        SetFullscreen(false);
-      }
-      window_->SetDesiredLogicalSize(default_logical_width_,
-                                     default_logical_height_);
-      // Render must be the visible center pane while we measure.
-      target_pending_launch_ = true;
-      ApplyContentVisibility();
-      if (auto* wx = dynamic_cast<ui::WxWindow*>(window_.get())) {
-        wx->EnsureInitialRenderSurfaceSize();
-      }
-      target_pending_launch_ = false;
-      ApplyContentVisibility();
     });
   }).detach();
   return true;
+}
+
+bool EmulatorWindow::StopTitleAndReturnHome() {
+  if (!DashboardIsHome()) {
+    return StopTitleAndReturnToList();
+  }
+  if (!emulator_->is_title_open()) {
+    return false;
+  }
+  // Deferred, since the context menu asks from inside a draw. The dashboard's
+  // launch clears the file XeFu found missing, so it's taken first.
+  return app_context_.CallInUIThreadDeferred(
+      [this, missing_xefu_file = emulator_->TakeMissingXeFuFile()]() {
+        RunTitle(GetInstalledDashboardPath());
+        if (!missing_xefu_file.empty()) {
+          ShowMissingXeFuFile(missing_xefu_file);
+        }
+      });
+}
+
+void EmulatorWindow::OnLaunchFailed() {
+  // Presence still shows the title a failed relaunch replaced.
+  if (cvars::discord) {
+    discord::DiscordPresence::Shutdown();
+  }
+  RestoreListWindow();
+  if (const std::string missing_xefu_file = emulator_->TakeMissingXeFuFile();
+      !missing_xefu_file.empty()) {
+    ShowMissingXeFuFile(missing_xefu_file);
+  } else {
+    ShowWindowMessage(window_.get(), _("Title Launch Failed!"),
+                      _("Failed to launch title.\n\nCheck xenia.log for "
+                        "technical details."),
+                      wxICON_ERROR);
+  }
+}
+
+void EmulatorWindow::ShowMissingXeFuFile(const std::string& file) {
+  const wxString message = wxString::Format(
+      _("Original Xbox games run through XeFu, the Xbox 360's backward "
+        "compatibility emulator, and %s is missing from its folder:\n\n%s\n\n"
+        "Copy xbox.xex and the xefu*.xex files there from the Compatibility "
+        "folder of an Xbox 360 hard drive."),
+      wxString::FromUTF8(file),
+      wxString::FromUTF8(xe::path_to_utf8(emulator_->xefu_path())));
+  ShowWindowMessage(window_.get(), _("XeFu not found"), message,
+                    wxICON_WARNING);
+}
+
+void EmulatorWindow::RestoreListWindow() {
+  if (game_list_panel_) {
+    game_list_panel_->Reload();
+  }
+  UpdateTitle();
+  window_->ResetIcon();
+  // The game list only shows windowed.
+  if (window_->IsFullscreen()) {
+    SetFullscreen(false);
+  }
+  window_->SetDesiredLogicalSize(default_logical_width_,
+                                 default_logical_height_);
+  // Render must be the visible center pane while we measure.
+  target_pending_launch_ = true;
+  ApplyContentVisibility();
+  if (auto* wx = dynamic_cast<ui::WxWindow*>(window_.get())) {
+    wx->EnsureInitialRenderSurfaceSize();
+  }
+  target_pending_launch_ = false;
+  ApplyContentVisibility();
 }
 
 void EmulatorWindow::ApplyContentVisibility() {
@@ -2084,6 +2235,7 @@ void EmulatorWindow::ApplyContentVisibility() {
     file_stop_menu_item_->SetEnabled(title_open);
   }
   UpdateAddGamesMenuState();
+  UpdateStartDashboardMenuState();
   // Subsystem-affecting cvars and tools (install/zar) only make sense between
   // launches.
   if (config_menu_) {
@@ -2195,6 +2347,75 @@ void EmulatorWindow::InstallContent() {
     }).detach();
   });
   dlg.ShowModal();
+}
+
+void EmulatorWindow::InstallSystemFiles() {
+  auto file_picker = xe::ui::FilePicker::Create();
+  file_picker->set_mode(ui::FilePicker::Mode::kOpen);
+  file_picker->set_type(ui::FilePicker::Type::kFile);
+  file_picker->set_title(_("Select a USB System Update").utf8_string());
+  file_picker->set_extensions({
+      {"Zip Archives (*.zip)", "*.zip"},
+      {"All Files", "*"},
+  });
+  if (!file_picker->Show(window_.get()) ||
+      file_picker->selected_files().empty()) {
+    return;
+  }
+  const auto zip_path = file_picker->selected_files().front();
+
+  auto* wx_window = dynamic_cast<ui::WxWindow*>(window_.get());
+  ui::SystemFilesResult result;
+  {
+    wxProgressDialog progress(_("Install System Files"),
+                              _("Installing the system files..."), 100,
+                              wx_window ? wx_window->frame() : nullptr,
+                              wxPD_APP_MODAL | wxPD_CAN_ABORT | wxPD_AUTO_HIDE);
+    result = ui::InstallSystemFiles(
+        zip_path, emulator_->system_files_path(),
+        [&progress](size_t done, size_t total) {
+          return progress.Update(int(done * 100 / total));
+        });
+  }
+  UpdateStartDashboardMenuState();
+
+  switch (result) {
+    case ui::SystemFilesResult::kSuccess:
+      ShowWindowMessage(
+          window_.get(), _("System files installed"),
+          wxString::Format(_("The system files are installed in:\n%s"),
+                           wxString::FromUTF8(xe::path_to_utf8(
+                               emulator_->system_files_path()))),
+          wxICON_INFORMATION);
+      break;
+    case ui::SystemFilesResult::kCancelled:
+      break;
+    case ui::SystemFilesResult::kNotSystemUpdate:
+      ShowWindowMessage(window_.get(), _("Install System Files"),
+                        _("This file isn't a USB system update."),
+                        wxICON_WARNING);
+      break;
+    case ui::SystemFilesResult::kReadFailed:
+      ShowWindowMessage(window_.get(), _("Install System Files"),
+                        _("Failed to read the system update."), wxICON_ERROR);
+      break;
+    case ui::SystemFilesResult::kWriteFailed:
+      ShowWindowMessage(window_.get(), _("Install System Files"),
+                        _("Failed to write the system files."), wxICON_ERROR);
+      break;
+    case ui::SystemFilesResult::kRestoreFailed:
+      ShowWindowMessage(
+          window_.get(), _("Install System Files"),
+          wxString::Format(
+              _("The previous system files couldn't be put back in place. "
+                "Move their folders back or delete them to install again. "
+                "They are in:\n%s"),
+              wxString::FromUTF8(
+                  xe::path_to_utf8(ui::GetUnrestoredSystemFilesPath(
+                      emulator_->system_files_path())))),
+          wxICON_ERROR);
+      break;
+  }
 }
 
 void EmulatorWindow::ShowContentDirectory() {
@@ -2324,6 +2545,16 @@ void EmulatorWindow::UpdateAddGamesMenuState() {
   }
   const bool title_open = emulator_ && emulator_->is_title_open();
   file_add_games_menu_item_->SetEnabled(!title_open);
+}
+
+void EmulatorWindow::UpdateStartDashboardMenuState() {
+  if (!file_start_dashboard_menu_item_ || !emulator_) {
+    return;
+  }
+  std::error_code ec;
+  file_start_dashboard_menu_item_->SetEnabled(
+      !emulator_->is_title_open() &&
+      std::filesystem::exists(GetInstalledDashboardPath(), ec));
 }
 
 void EmulatorWindow::PopulateProfileMenu(ui::MenuItem* parent) {
@@ -2496,38 +2727,54 @@ void EmulatorWindow::RefreshControllerToolbar() {
 
   // Fetch current bindings.
   std::vector<InputSystem::EnumeratedDevice> devices;
+  std::array<std::vector<InputSystem::SlotBinding>, XUserMaxUserCount> bindings;
   if (auto* is = emulator_ ? emulator_->input_system() : nullptr) {
     auto lock = is->lock();
     devices = is->EnumerateDevices();
+    for (uint32_t slot = 0; slot < XUserMaxUserCount; ++slot) {
+      bindings[slot] = is->GetSlotBindings(slot);
+    }
   }
 
   // Update each fixed controller slot's bitmap — bound slot gets the
   // appropriate type icon, empty slot keeps a transparent placeholder so the
   // toolbar geometry never changes.
   for (uint32_t slot = 0; slot < XUserMaxUserCount; ++slot) {
-    const InputSystem::EnumeratedDevice* bound = nullptr;
-    for (const auto& d : devices) {
-      if (d.bound_slot == static_cast<int>(slot)) {
-        bound = &d;
-        break;
-      }
-    }
     const int id = kToolIdControllerBase + static_cast<int>(slot);
-    if (!bound) {
+    const wxString names = SlotDeviceNames(bindings[slot]);
+    if (names.empty()) {
       tb->SetToolBitmap(id, s.controller_empty_bundle);
       tb->SetToolShortHelp(id, wxEmptyString);
       tb->EnableTool(id, false);
       continue;
     }
+    // The icon shows the type the guest sees, which the first device that
+    // isn't a plain gamepad sets, and the keyboard only when it's alone.
+    bool keyboard_only = true;
+    uint8_t effective = 0x01;
+    for (const auto& binding : bindings[slot]) {
+      if (!binding.driver) {
+        continue;
+      }
+      auto d =
+          std::find_if(devices.begin(), devices.end(), [&](const auto& dev) {
+            return dev.driver == binding.driver &&
+                   dev.info.driver_slot == binding.driver_slot;
+          });
+      if (d == devices.end() || d->info.stable_id == "keyboard") {
+        continue;
+      }
+      keyboard_only = false;
+      if (effective == 0x01) {
+        // User override takes precedence over the device's detected subtype.
+        effective =
+            EffectiveSubtype(d->info.subtype, d->info.native_subtype, binding);
+      }
+    }
     const wxBitmapBundle* bundle = &s.controller_gamepad_bundle;
-    if (bound->info.stable_id == "keyboard") {
+    if (keyboard_only) {
       bundle = &s.controller_keyboard_bundle;
     } else {
-      // User override takes precedence over the device's detected subtype.
-      const auto& binding = emulator_->input_system()->GetSlotBinding(slot);
-      const uint8_t effective = binding.subtype_override != 0
-                                    ? binding.subtype_override
-                                    : bound->info.subtype;
       switch (effective) {
         case 0x02:  // WHEEL
           bundle = &s.controller_wheel_bundle;
@@ -2554,8 +2801,8 @@ void EmulatorWindow::RefreshControllerToolbar() {
       }
     }
     tb->SetToolBitmap(id, *bundle);
-    tb->SetToolShortHelp(id, wxString::Format(_("Slot %d"), slot + 1) + ": " +
-                                 wxString::FromUTF8(bound->info.display_name));
+    tb->SetToolShortHelp(
+        id, wxString::Format(_("Slot %d"), slot + 1) + ": " + names);
     tb->EnableTool(id, true);
   }
   tb->Refresh();
@@ -2595,79 +2842,109 @@ void EmulatorWindow::PopulateControllersMenu(ui::MenuItem* parent) {
   auto lock = input_sys->lock();
   auto devices = input_sys->EnumerateDevices();
 
+  // A bound device's "Disconnect" action and type override.
+  auto add_device_items = [this, &devices](
+                              ui::MenuItem* menu,
+                              const InputSystem::SlotBinding& binding) {
+    InputDriver* driver = binding.driver;
+    uint8_t driver_slot = binding.driver_slot;
+    menu->AddChild(ui::WxMenuItem::Create(
+        ui::MenuItem::Type::kString, _("Disconnect"), "",
+        [this, driver, driver_slot]() {
+          auto* is = emulator_ ? emulator_->input_system() : nullptr;
+          if (!is) {
+            return;
+          }
+          auto l = is->lock();
+          is->UnbindDevice(driver, driver_slot);
+        }));
+
+    // "Type: <effective>" submenu lets the user override the subtype the
+    // guest sees (e.g. expose a regular pad as a wheel or drum kit).
+    uint8_t detected = 0x01;
+    uint8_t native_subtype = 0;
+    for (const auto& dev : devices) {
+      if (dev.driver == driver && dev.info.driver_slot == driver_slot) {
+        detected = dev.info.subtype;
+        native_subtype = dev.info.native_subtype;
+        break;
+      }
+    }
+    wxString type_label = wxString::Format(
+        _("Type: %s"),
+        SubtypeName(EffectiveSubtype(detected, native_subtype, binding)));
+    auto type_entry =
+        ui::WxMenuItem::Create(ui::MenuItem::Type::kPopup, type_label);
+
+    // Auto reads a device with a native mode through XInput, an override
+    // through SDL's mapping.
+    wxString auto_label = wxString::Format(
+        _("Auto (%s)"),
+        native_subtype ? wxString(wxT("XInput")) : SubtypeName(detected));
+    if (binding.subtype_override == 0) {
+      auto_label = wxT("✓ ") + auto_label;
+    }
+    type_entry->AddChild(ui::WxMenuItem::Create(
+        ui::MenuItem::Type::kString, auto_label, "",
+        [this, driver, driver_slot]() {
+          auto* is = emulator_ ? emulator_->input_system() : nullptr;
+          if (!is) {
+            return;
+          }
+          auto l = is->lock();
+          is->SetSubtypeOverride(driver, driver_slot, 0);
+        }));
+    for (uint8_t st : kSelectableSubtypes) {
+      const bool active = binding.subtype_override == st;
+      wxString item_label =
+          active ? wxT("✓ ") + SubtypeName(st) : SubtypeName(st);
+      uint8_t captured = st;
+      type_entry->AddChild(ui::WxMenuItem::Create(
+          ui::MenuItem::Type::kString, item_label, "",
+          [this, driver, driver_slot, captured]() {
+            auto* is = emulator_ ? emulator_->input_system() : nullptr;
+            if (!is) {
+              return;
+            }
+            auto l = is->lock();
+            is->SetSubtypeOverride(driver, driver_slot, captured);
+          }));
+    }
+    menu->AddChild(std::move(type_entry));
+  };
+
   for (uint32_t slot = 0; slot < XUserMaxUserCount; ++slot) {
-    const auto& binding = input_sys->GetSlotBinding(slot);
-    const bool bound = binding.driver != nullptr;
+    const auto& bindings = input_sys->GetSlotBindings(slot);
     wxString slot_label = wxString::Format(_("Slot %d"), slot + 1);
-    if (bound) {
-      slot_label += ": " + wxString::FromUTF8(binding.display_name);
+    const wxString names = SlotDeviceNames(bindings);
+    if (!names.empty()) {
+      slot_label += ": " + names;
     }
     auto slot_entry =
         ui::WxMenuItem::Create(ui::MenuItem::Type::kPopup, slot_label);
 
-    // Bound slot exposes a "Disconnect" action; an empty slot goes straight
-    // to the device list.
-    if (bound) {
-      slot_entry->AddChild(ui::WxMenuItem::Create(
-          ui::MenuItem::Type::kString, _("Disconnect"), "", [this, slot]() {
-            auto* is = emulator_ ? emulator_->input_system() : nullptr;
-            if (!is) {
-              return;
-            }
-            auto l = is->lock();
-            is->UnbindSlot(slot);
-          }));
-
-      // "Type: <effective>" submenu lets the user override the subtype the
-      // guest sees (e.g. expose a regular pad as a wheel or drum kit).
-      uint8_t detected = 0x01;
-      for (const auto& dev : devices) {
-        if (dev.bound_slot == static_cast<int>(slot)) {
-          detected = dev.info.subtype;
-          break;
-        }
+    // A slot with one device lists its actions directly, one with several
+    // gets a submenu per device, and an empty slot goes straight to the
+    // device list.
+    std::vector<const InputSystem::SlotBinding*> bound;
+    for (const auto& binding : bindings) {
+      if (binding.driver) {
+        bound.push_back(&binding);
       }
-      const uint8_t effective =
-          binding.subtype_override != 0 ? binding.subtype_override : detected;
-      wxString type_label =
-          wxString::Format(_("Type: %s"), SubtypeName(effective));
-      auto type_entry =
-          ui::WxMenuItem::Create(ui::MenuItem::Type::kPopup, type_label);
-
-      wxString auto_label =
-          wxString::Format(_("Auto (%s)"), SubtypeName(detected));
-      if (binding.subtype_override == 0) {
-        auto_label = wxT("✓ ") + auto_label;
+    }
+    if (bound.size() == 1) {
+      add_device_items(slot_entry.get(), *bound[0]);
+    } else {
+      for (const auto* binding : bound) {
+        auto device_entry =
+            ui::WxMenuItem::Create(ui::MenuItem::Type::kPopup,
+                                   wxString::FromUTF8(binding->display_name));
+        add_device_items(device_entry.get(), *binding);
+        slot_entry->AddChild(std::move(device_entry));
       }
-      type_entry->AddChild(ui::WxMenuItem::Create(
-          ui::MenuItem::Type::kString, auto_label, "", [this, slot]() {
-            auto* is = emulator_ ? emulator_->input_system() : nullptr;
-            if (!is) {
-              return;
-            }
-            auto l = is->lock();
-            is->SetSlotSubtypeOverride(slot, 0);
-          }));
-      for (uint8_t st : kSelectableSubtypes) {
-        const bool active = binding.subtype_override == st;
-        wxString item_label =
-            active ? wxT("✓ ") + SubtypeName(st) : SubtypeName(st);
-        uint8_t captured = st;
-        type_entry->AddChild(ui::WxMenuItem::Create(
-            ui::MenuItem::Type::kString, item_label, "",
-            [this, slot, captured]() {
-              auto* is = emulator_ ? emulator_->input_system() : nullptr;
-              if (!is) {
-                return;
-              }
-              auto l = is->lock();
-              is->SetSlotSubtypeOverride(slot, captured);
-            }));
-      }
-      slot_entry->AddChild(std::move(type_entry));
     }
 
-    // One entry per enumerated device.
+    // One entry per enumerated device, which picking adds to the slot.
     for (const auto& dev : devices) {
       const bool here = dev.bound_slot == static_cast<int>(slot);
       wxString device_label =
@@ -2770,9 +3047,7 @@ void EmulatorWindow::ShowNoProfilePrompt() {
   auto* wx_window = dynamic_cast<ui::WxWindow*>(window_.get());
   wxWindow* parent = wx_window ? wx_window->frame() : nullptr;
 
-  const auto content_dirs =
-      xe::filesystem::ListDirectories(emulator_->content_root());
-  const bool offer_migration = !content_dirs.empty();
+  const bool offer_migration = emulator_->HasDataToMigrate();
 
   wxMessageDialog prompt(
       parent,
@@ -2814,7 +3089,16 @@ void EmulatorWindow::ShowNoProfilePrompt() {
   const bool created = pm->CreateProfile(gt, /*autologin=*/true,
                                          /*default_xuid=*/offer_migration);
   if (created && offer_migration) {
-    emulator_->DataMigration(0xB13EBABEBABEBABE);
+    const uint32_t failures = emulator_->DataMigration(0xB13EBABEBABEBABE);
+    ShowWindowMessage(
+        window_.get(), _("Data migration"),
+        failures ? wxString::Format(
+                       _("Some of your existing data couldn't be migrated to "
+                         "the new profile. Items that failed: %u\n\nCheck "
+                         "xenia.log for technical details."),
+                       failures)
+                 : _("Your existing data was migrated to the new profile."),
+        failures ? wxICON_WARNING : wxICON_INFORMATION);
   }
   if (!created) {
     return;
@@ -3017,8 +3301,24 @@ void EmulatorWindow::UpdateTitle() {
 
   // Title information, if available
   if (emulator()->is_title_open()) {
-    sb.AppendFormat(" | [{:08X}", emulator()->title_id());
-    auto title_version = emulator()->title_version();
+    uint32_t title_id = emulator()->title_id();
+    std::string title_version = emulator()->title_version();
+    // XeFu shows the original Xbox game it runs, its build as the module. A
+    // title update of the game shows its own version. Another executable keeps
+    // the game's title id, which its per-game config is kept under.
+    if (title_id == kXeFuTitleId) {
+      const auto& game = emulator()->xbox_game();
+      const auto running = emulator()->running_xbe();
+      const vfs::XbeMetadata* shown = game ? &*game : nullptr;
+      if (running && (!game || running->title_id == game->title_id)) {
+        shown = &*running;
+      }
+      if (shown) {
+        title_id = shown->title_id;
+        title_version = shown->version ? VersionToString(shown->version) : "";
+      }
+    }
+    sb.AppendFormat(" | [{:08X}", title_id);
     if (!title_version.empty()) {
       sb.Append(" v");
       sb.Append(title_version);
@@ -3094,6 +3394,8 @@ void EmulatorWindow::UpdateTitle() {
 
   if (initializing_shader_storage_) {
     sb.Append(" (Preloading shaders\u2026)");
+  } else if (compiling_shaders_) {
+    sb.Append(" (Compiling shaders\u2026)");
   }
 
   patcher::Patcher* patcher = emulator()->patcher();
@@ -3115,6 +3417,30 @@ void EmulatorWindow::SetInitializingShaderStorage(bool initializing) {
   }
   initializing_shader_storage_ = initializing;
   UpdateTitle();
+}
+
+void EmulatorWindow::SetCompilingShaders(bool compiling) {
+  if (!compiling_shaders_hide_timer_) {
+    compiling_shaders_hide_timer_ = std::make_unique<wxTimer>();
+    compiling_shaders_hide_timer_->Bind(wxEVT_TIMER, [this](wxTimerEvent&) {
+      compiling_shaders_ = false;
+      UpdateTitle();
+    });
+  }
+  if (!compiling) {
+    // Held a moment, a game drawing new shaders every frame drains the queue
+    // in between.
+    if (compiling_shaders_) {
+      constexpr int kHoldMs = 500;
+      compiling_shaders_hide_timer_->StartOnce(kHoldMs);
+    }
+    return;
+  }
+  compiling_shaders_hide_timer_->Stop();
+  if (!compiling_shaders_) {
+    compiling_shaders_ = true;
+    UpdateTitle();
+  }
 }
 
 void EmulatorWindow::PollGamepads() {
@@ -3193,7 +3519,9 @@ void EmulatorWindow::PollGamepads() {
             const bool activate = (pressed & X_INPUT_GAMEPAD_A) != 0;
             if (navigate || activate) {
               app_context_.CallInUIThread([this, navigate, activate]() {
-                if (!game_list_panel_) {
+                // A launch hides the list before the title is open, and a
+                // press then would relaunch the selected title.
+                if (!game_list_panel_ || !game_list_panel_->IsShownOnScreen()) {
                   return;
                 }
                 using Direction = GameListPanel::Direction;
@@ -3228,104 +3556,118 @@ std::string EmulatorWindow::CanonicalizeFileExtension(
   return xe::utf8::lower_ascii(xe::path_to_utf8(path.extension()));
 }
 
-void EmulatorWindow::LaunchTitleInNewProcess(
-    const std::filesystem::path& path_to_file) {
-  // Get the path to the current executable
+bool EmulatorWindow::SpawnEmulatorProcess(const std::vector<std::string>& args,
+                                          const std::string& target) {
   std::filesystem::path executable_path = xe::filesystem::GetExecutablePath();
 
-  // Verify the file exists
-  if (!path_to_file.empty() && !std::filesystem::exists(path_to_file)) {
-    XELOGE("Cannot launch title - file not found: {}",
-           xe::path_to_utf8(path_to_file));
-    return;
-  }
-
-  std::string slot_bindings_arg;
-  if (auto* is = emulator_ ? emulator_->input_system() : nullptr) {
-    auto l = is->lock();
-    slot_bindings_arg = is->SerializeSlotBindingsForPassthrough();
-  }
-
+  // The new process continues this session: it takes this one's options and
+  // appends to the log rather than truncating it. Positional arguments are the
+  // game file, which |target| replaces.
+  std::vector<std::string> child_args;
+  auto forward_arg = [&](std::string arg) {
+    if (!IsLaunchOnlyArg(arg)) {
+      child_args.push_back(std::move(arg));
+    }
+  };
 #if XE_PLATFORM_WIN32
-  // On Windows, build command line using Xenia's Unicode path handling
-  auto exe_path_u16 = xe::path_to_utf16(executable_path);
-
-  // Build full command line with quotes for paths that may contain spaces
-  std::u16string cmd_line = u"\"" + exe_path_u16 + u"\"";
-
-  // Forward parent's CLI args.
   int parent_argc = 0;
   wchar_t** parent_argv = CommandLineToArgvW(GetCommandLineW(), &parent_argc);
   if (parent_argv) {
     for (int i = 1; i < parent_argc; ++i) {
-      std::u16string a(reinterpret_cast<const char16_t*>(parent_argv[i]));
-      if (a.empty() || a[0] != u'-') {
-        continue;  // positional game file — replaced below
+      if (parent_argv[i][0] == L'-') {
+        forward_arg(
+            xe::to_utf8(reinterpret_cast<const char16_t*>(parent_argv[i])));
       }
-      cmd_line += u" \"" + a + u"\"";
     }
     LocalFree(parent_argv);
   }
-
-  // Tell game process to return to UI when it exits
-  cmd_line += u" --return_to_ui=true";
-
-  if (!slot_bindings_arg.empty()) {
-    cmd_line += u" --slot_bindings_passthrough=\"" +
-                xe::to_utf16(slot_bindings_arg) + u"\"";
+#else
+  for (int i = 1; i < xe::ui::g_argc; ++i) {
+    if (xe::ui::g_argv[i][0] == '-') {
+      forward_arg(xe::ui::g_argv[i]);
+    }
+  }
+#endif
+  child_args.push_back("--log_append=true");
+  child_args.insert(child_args.end(), args.begin(), args.end());
+  if (auto* input_system = emulator_ ? emulator_->input_system() : nullptr) {
+    auto lock = input_system->lock();
+    std::string slot_bindings =
+        input_system->SerializeSlotBindingsForPassthrough();
+    if (!slot_bindings.empty()) {
+      child_args.push_back("--slot_bindings_passthrough=" + slot_bindings);
+    }
+  }
+  if (!target.empty()) {
+    child_args.push_back(target);
   }
 
-  // Add the target game file
-  if (!path_to_file.empty()) {
-    auto game_path_u16 = xe::path_to_utf16(path_to_file);
-    cmd_line += u" \"" + game_path_u16 + u"\"";
+#if XE_PLATFORM_WIN32
+  std::u16string command_line =
+      QuoteCommandLineArg(xe::path_to_utf16(executable_path));
+  for (const std::string& arg : child_args) {
+    command_line += u' ';
+    command_line += QuoteCommandLineArg(xe::to_utf16(arg));
   }
-
   STARTUPINFOW si = {};
   si.cb = sizeof(si);
   PROCESS_INFORMATION pi = {};
-
-  if (!CreateProcessW(nullptr,  // Application name (use command line)
-                      const_cast<wchar_t*>(reinterpret_cast<const wchar_t*>(
-                          cmd_line.c_str())),  // Command line
-                      nullptr,                 // Process attributes
-                      nullptr,                 // Thread attributes
-                      FALSE,                   // Inherit handles
-                      CREATE_NEW_CONSOLE,      // Creation flags
-                      nullptr,                 // Environment
-                      nullptr,                 // Current directory
-                      &si,                     // Startup info
-                      &pi)) {                  // Process information
+  if (!CreateProcessW(nullptr, reinterpret_cast<wchar_t*>(command_line.data()),
+                      nullptr, nullptr, FALSE, CREATE_NEW_CONSOLE, nullptr,
+                      nullptr, &si, &pi)) {
     XELOGE("Failed to launch new process: {}", GetLastError());
-    return;
+    return false;
   }
-
   // Allow the new process to bring itself to the foreground
   AllowSetForegroundWindow(pi.dwProcessId);
   CloseHandle(pi.hProcess);
   CloseHandle(pi.hThread);
 #else
-  // On Linux/Unix, use fork/exec for proper process creation
+  std::string gamemode_cmd;
+#if XE_PLATFORM_LINUX
+  if (cvars::use_gamemode) {
+    gamemode_cmd = "gamemoderun";
+  }
+#endif
+#if XE_PLATFORM_MAC
+  // Returning to the game list, the per-title rosetta override shouldn't follow
+  // back, so use native there.
+  const char* arch_flag =
+      RosettaArchFlagIfSwitchNeeded(!target.empty() && cvars::use_rosetta);
+#else
+  const char* arch_flag = nullptr;
+#endif
+  // Built before the fork, so the child only adjusts its environment and
+  // execs.
+  std::string executable = executable_path.string();
+  std::vector<const char*> argv;
+  if (!gamemode_cmd.empty()) {
+    argv.push_back(gamemode_cmd.c_str());
+  }
+  if (arch_flag) {
+    argv.push_back("arch");
+    argv.push_back(arch_flag);
+  }
+  argv.push_back(executable.c_str());
+  for (const std::string& arg : child_args) {
+    argv.push_back(arg.c_str());
+  }
+  argv.push_back(nullptr);
+
   setenv("XENIA_WAIT_FOR_PID",
          std::to_string(static_cast<long>(getpid())).c_str(), 1);
   pid_t pid = fork();
-
   if (pid == 0) {
-    // Child process
-    std::vector<const char*> argv;
-    std::string gamemode_cmd;
-
 #if XE_PLATFORM_LINUX
-    // See OnEmulatorInitialized: env vars survive the UI<->title spawn chain.
+    // unsetenv on the false branch: the env var is inherited across the
+    // UI <-> title spawn chain, so a stale "1" from a previous launch would
+    // otherwise outlive the unchecked cvar.
     if (cvars::use_mangohud) {
       setenv("MANGOHUD", "1", 1);
     } else {
       unsetenv("MANGOHUD");
     }
-    if (cvars::use_gamemode) {
-      gamemode_cmd = "gamemoderun";
-      argv.push_back(gamemode_cmd.c_str());
-    } else {
+    if (!cvars::use_gamemode) {
       StripGameModeFromLdPreload();  // GameMode off → drop any inherited wrap
     }
 #endif
@@ -3335,76 +3677,52 @@ void EmulatorWindow::LaunchTitleInNewProcess(
     } else {
       unsetenv("MTL_HUD_ENABLED");
     }
-    const char* arch_flag = RosettaArchFlagIfSwitchNeeded(cvars::use_rosetta);
-#else
-    const char* arch_flag = nullptr;
 #endif
-    const bool use_arch_wrapper = (arch_flag != nullptr);
-    if (use_arch_wrapper) {
-      argv.push_back("arch");
-      argv.push_back(arch_flag);
-    }
-
-    argv.push_back(executable_path.c_str());
-
-    // Forward parent's CLI args.
-    std::vector<std::string> forwarded_args;
-    for (int i = 1; i < xe::ui::g_argc; ++i) {
-      std::string_view a = xe::ui::g_argv[i];
-      if (a.empty() || a[0] != '-') {
-        continue;  // positional game file — replaced below
-      }
-      forwarded_args.emplace_back(a);
-    }
-    for (const auto& f : forwarded_args) {
-      argv.push_back(f.c_str());
-    }
-
-    // Tell game process to return to UI when it exits
-    argv.push_back("--return_to_ui=true");
-
-    std::string slot_bindings_cli_arg;
-    if (!slot_bindings_arg.empty()) {
-      slot_bindings_cli_arg =
-          "--slot_bindings_passthrough=" + slot_bindings_arg;
-      argv.push_back(slot_bindings_cli_arg.c_str());
-    }
-
-    // Add the target game file
-    std::string target_arg;
-    if (!path_to_file.empty()) {
-      target_arg = path_to_file.string();
-      argv.push_back(target_arg.c_str());
-    }
-    argv.push_back(nullptr);
-
     if (!gamemode_cmd.empty()) {
       execvp(gamemode_cmd.c_str(), const_cast<char**>(argv.data()));
-    } else if (use_arch_wrapper) {
+    } else if (arch_flag) {
       execvp("arch", const_cast<char**>(argv.data()));
     } else {
-      execv(executable_path.c_str(), const_cast<char**>(argv.data()));
+      execv(executable.c_str(), const_cast<char**>(argv.data()));
     }
-
-    // If exec returns, it failed
-    XELOGE("Failed to execute: {}", executable_path.string());
-    std::exit(1);
-  } else if (pid < 0) {
-    // Fork failed
+    _exit(1);
+  }
+  if (pid < 0) {
     XELOGE("Failed to fork process");
-    return;
+    return false;
   }
 #endif
+  return true;
+}
 
-  XELOGI("Launched title in new process: {}", xe::path_to_utf8(path_to_file));
+void EmulatorWindow::LaunchTitleInNewProcess(
+    const std::filesystem::path& path_to_file, bool boot_animation) {
+  // Verify the file exists
+  if (!path_to_file.empty() && !std::filesystem::exists(path_to_file)) {
+    XELOGE("Cannot launch title - file not found: {}",
+           xe::strip_pii(xe::path_to_utf8(path_to_file)));
+    return;
+  }
+
+  // Tell game process to return to UI when it exits
+  std::vector<std::string> args = {"--return_to_ui=true"};
+  if (boot_animation) {
+    args.push_back("--boot_animation=true");
+  }
+  if (!SpawnEmulatorProcess(args, xe::path_to_utf8(path_to_file))) {
+    return;
+  }
+
+  XELOGI("Launched title in new process: {}",
+         xe::strip_pii(xe::path_to_utf8(path_to_file)));
 
   // Exit UI process - game process will spawn new UI when it exits
   xe::FlushLog();
   app_context_.QuitFromUIThread();
 }
 
-xe::X_STATUS EmulatorWindow::RunTitle(
-    const std::filesystem::path& path_to_file) {
+xe::X_STATUS EmulatorWindow::RunTitle(const std::filesystem::path& path_to_file,
+                                      bool boot_animation) {
   std::error_code ec = {};
   bool titleExists = std::filesystem::exists(path_to_file, ec);
 
@@ -3424,12 +3742,22 @@ xe::X_STATUS EmulatorWindow::RunTitle(
 
     XELOGE("{}", log_msg);
 
-    ClearDialogs();
-
-    xe::ui::ImGuiDialog::ShowMessageBox(imgui_drawer_.get(),
-                                        "Title Launch Failed!", log_msg);
+    ShowWindowMessage(
+        window_.get(), _("Title not found"),
+        path_to_file.empty()
+            ? _("No file path is set for this title.")
+            : wxString::Format(
+                  _("File not found:\n%s"),
+                  wxString::FromUTF8(xe::path_to_utf8(path_to_file))),
+        wxICON_WARNING);
 
     return X_STATUS_NO_SUCH_FILE;
+  }
+
+  // Launching now would race the relaunch or reset under way.
+  if (emulator_->is_relaunching()) {
+    XELOGW("RunTitle: relaunch or reset in progress, ignoring");
+    return X_STATUS_UNSUCCESSFUL;
   }
 
   if (emulator_->is_title_open()) {
@@ -3451,7 +3779,8 @@ xe::X_STATUS EmulatorWindow::RunTitle(
       auto* emulator = emulator_;
       std::thread([emulator, host_path = std::move(host_path)]() mutable {
         emulator->RelaunchTitle(host_path, /*launch_module=*/{},
-                                /*launch_flags=*/0, /*launch_data=*/{});
+                                /*launch_flags=*/0, /*launch_data=*/{},
+                                /*keep_xbox_game=*/false);
       }).detach();
       return X_STATUS_SUCCESS;
     }
@@ -3460,7 +3789,7 @@ xe::X_STATUS EmulatorWindow::RunTitle(
     auto cb = emulator_->on_launch_new_title();
     if (cb) {
       cb(host_path, /*launch_module=*/{}, /*launch_flags=*/0,
-         /*launch_data=*/{});
+         /*launch_data=*/{}, /*xbox_disc=*/{}, /*package=*/{});
     }
     return X_STATUS_UNSUCCESSFUL;
   }
@@ -3524,7 +3853,7 @@ xe::X_STATUS EmulatorWindow::RunTitle(
     // cvars.
     config::ReloadConfig();
     config::LoadGameConfigForFile(abs_path);
-    LaunchTitleInNewProcess(abs_path);
+    LaunchTitleInNewProcess(abs_path, boot_animation);
     return X_STATUS_SUCCESS;
   }
 
@@ -3544,11 +3873,12 @@ xe::X_STATUS EmulatorWindow::RunTitle(
       (!last_apu.empty() && last_apu != cvars::apu)) {
     XELOGI("RunTitle: backend changed (gpu {} -> {}, apu {} -> {}); respawning",
            last_gpu, cvars::gpu, last_apu, cvars::apu);
-    LaunchTitleInNewProcess(abs_path);
+    LaunchTitleInNewProcess(abs_path, boot_animation);
     return X_STATUS_SUCCESS;
   }
   if (auto status = emulator_->SetupSubsystems(); XFAILED(status)) {
     XELOGE("Failed to setup subsystems: {:08X}", status);
+    OnLaunchFailed();
     return status;
   }
   // Toggle before swap chain creation so it picks up the right size.
@@ -3571,19 +3901,19 @@ xe::X_STATUS EmulatorWindow::RunTitle(
   // toolbar/render transition paints immediately. Post-launch work goes
   // back to the UI thread via CallAfter.
   auto* emulator = emulator_;
+  if (boot_animation) {
+    emulator->RequestBootAnimation();
+  }
   std::thread([this, emulator, abs_path]() {
     auto result = emulator->LaunchPath(abs_path);
+    if (result) {
+      XELOGE("Failed to launch target: {:08X}", result);
+      // Whatever of the title loaded goes, as when one stops.
+      emulator->ResetTitle();
+    }
     wxTheApp->CallAfter([this, result, abs_path]() {
-      ClearDialogs();
       if (result) {
-        XELOGE("Failed to launch target: {:08X}", result);
-        xe::ui::ImGuiDialog::ShowMessageBox(
-            imgui_drawer_.get(), "Title Launch Failed!",
-            "Failed to launch title.\n\nCheck xenia.log for technical "
-            "details.");
-        emulator_->file_system()->Clear();
-        target_pending_launch_ = false;
-        ApplyContentVisibility();
+        OnLaunchFailed();
       } else {
         auto xam =
             emulator_->kernel_state()->GetKernelModule<kernel::xam::XamModule>(

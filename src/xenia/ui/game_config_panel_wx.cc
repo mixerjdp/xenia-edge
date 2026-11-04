@@ -86,11 +86,13 @@ EditorBuild BuildEditor(wxWindow* parent, cvar::IConfigVar* var,
     const auto& enums = xe::ui::GetKnownEnumOptions();
     auto it = enums.find(var->name());
     if (it != enums.end()) {
+      const auto choices =
+          xe::ui::GetEnumChoices(var->name(), it->second, current_value);
       auto* choice = new wxChoice(parent, wxID_ANY);
       int sel = -1;
-      for (size_t i = 0; i < it->second.size(); ++i) {
-        choice->Append(wxString::FromUTF8(it->second[i]));
-        if (it->second[i] == current_value) {
+      for (size_t i = 0; i < choices.size(); ++i) {
+        choice->Append(wxString::FromUTF8(choices[i]));
+        if (choices[i] == current_value) {
           sel = static_cast<int>(i);
         }
       }
@@ -384,9 +386,9 @@ void GameConfigPanel::AddRow(const std::string& name,
   label->SetMinSize(wxSize(FromDIP(60), -1));
   label->SetToolTip(CvarTooltip(name));
   auto* var = cvar::ConfigVars ? (*cvar::ConfigVars)[name] : nullptr;
-  // Integer cvars shown as string dropdowns display their option name.
+  // Dropdown cvars display their option name rather than the stored value.
   EditorBuild built =
-      BuildEditor(this, var, xe::ui::IntCvarValueToDisplayName(name, value));
+      BuildEditor(this, var, xe::ui::CvarValueToDisplayName(name, value));
   row->editor = built.editor;
   row->get_value = std::move(built.get_value);
   // Editors size themselves to their content, which for a long enum option is
@@ -454,7 +456,8 @@ void GameConfigPanel::LoadOverrides() {
   try {
     table = config::LoadGameConfig(title_id_);
   } catch (const std::exception& e) {
-    XELOGE("GameConfigPanel: failed to load config: {}", e.what());
+    XELOGE("GameConfigPanel: failed to load config: {}",
+           xe::strip_pii(e.what()));
     loading_ = false;
     return;
   }
@@ -481,9 +484,10 @@ void GameConfigPanel::LoadOverrides() {
     auto enum_it = enums.find(config_var->name());
     if (enum_it != enums.end()) {
       const std::string display =
-          xe::ui::IntCvarValueToDisplayName(config_var->name(), value);
-      if (std::find(enum_it->second.begin(), enum_it->second.end(), display) ==
-          enum_it->second.end()) {
+          xe::ui::CvarValueToDisplayName(config_var->name(), value);
+      const auto choices =
+          xe::ui::GetEnumChoices(config_var->name(), enum_it->second, display);
+      if (std::find(choices.begin(), choices.end(), display) == choices.end()) {
         continue;
       }
     }
@@ -541,7 +545,7 @@ bool GameConfigPanel::SaveOverrides() {
       continue;
     }
     InsertTypedValue(by_category[var->category()], row->name,
-                     xe::ui::DisplayNameToIntCvarValue(row->name, value));
+                     xe::ui::DisplayNameToCvarValue(row->name, value));
   }
   for (auto& [cat, tbl] : by_category) {
     if (auto* dest = config::ResolveSectionTable(out, cat)) {
@@ -555,7 +559,8 @@ bool GameConfigPanel::SaveOverrides() {
   } catch (const std::exception& e) {
     // No dialog: this runs on every edit, so a modal per keystroke would be
     // worse than the status line saying it didn't take.
-    XELOGE("GameConfigPanel: failed to save config: {}", e.what());
+    XELOGE("GameConfigPanel: failed to save config: {}",
+           xe::strip_pii(e.what()));
     return false;
   }
   return true;

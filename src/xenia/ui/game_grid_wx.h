@@ -67,7 +67,9 @@ class GameGrid : public wxScrolledCanvas {
   void MoveSelection(int delta);
   void EnsureVisible(int index);
 
-  void SetSelectionChangedCallback(std::function<void()> cb) {
+  // `clicked` is set for a left click, which may be the start of a double
+  // click.
+  void SetSelectionChangedCallback(std::function<void(bool clicked)> cb) {
     selection_changed_cb_ = std::move(cb);
   }
   void SetActivatedCallback(std::function<void(int)> cb) {
@@ -111,7 +113,7 @@ class GameGrid : public wxScrolledCanvas {
   int selection_ = -1;
   int hover_ = -1;
 
-  std::function<void()> selection_changed_cb_;
+  std::function<void(bool clicked)> selection_changed_cb_;
   std::function<void(int)> activated_cb_;
   std::function<void(int, const wxPoint&)> context_menu_cb_;
 };

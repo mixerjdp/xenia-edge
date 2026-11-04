@@ -25,6 +25,7 @@
 #include <wx/image.h>
 #include <wx/menu.h>
 #include <wx/msgdlg.h>
+#include <wx/settings.h>
 #include <wx/sizer.h>
 #include <wx/splitter.h>
 #include <wx/stattext.h>
@@ -144,7 +145,10 @@ GameListPanel::GameListPanel(wxWindow* parent, EmulatorWindow* emulator_window)
   grid_ = new ui::GameGrid(list_side_, icon_size_px_);
   grid_->SetPlaceholder(not_played_placeholder_);
   grid_->SetMinSize(wxSize(0, 0));
-  grid_->SetSelectionChangedCallback([this]() { OnSelectionChanged(); });
+  grid_->SetSelectionChangedCallback(
+      [this](bool clicked) { OnSelectionChanged(clicked); });
+  pane_open_timer_.Bind(wxEVT_TIMER,
+                        [this](wxTimerEvent&) { RefreshInfoPane(); });
   grid_->SetActivatedCallback([this](int index) { OnItemActivated(index); });
   grid_->SetContextMenuCallback(
       [this](int index, const wxPoint&) { OnItemContextMenu(index); });
@@ -438,11 +442,11 @@ void GameListPanel::LaunchOrPrompt(const LibraryKey& key,
   }
   wxString warning =
       path.empty()
-          ? _("No file path is set for this title.")
-          : wxString::Format(_("File not found:\n%s"),
+          ? _("No file path is set for this title.\n\nBrowse for the file?")
+          : wxString::Format(_("File not found:\n%s\n\nBrowse for the file?"),
                              wxString::FromUTF8(xe::path_to_utf8(path)));
-  wxMessageDialog confirm(this, warning + _("\n\nBrowse for the file?"),
-                          _("Title not found"), wxYES_NO | wxICON_WARNING);
+  wxMessageDialog confirm(this, warning, _("Title not found"),
+                          wxYES_NO | wxICON_WARNING);
   if (confirm.ShowModal() != wxID_YES) {
     return;
   }
@@ -487,6 +491,25 @@ void GameListPanel::MarkPlayed(const LibraryKey& key) {
       entry.last_run_time = now;
       break;
     }
+  }
+}
+
+void GameListPanel::RefreshEntry(const LibraryKey& key) {
+  auto* library = emulator_window_ ? emulator_window_->game_library() : nullptr;
+  const LibraryEntry* stored = library ? library->Find(key) : nullptr;
+  for (auto& entry : entries_) {
+    if (stored && entry.key() == key && entry.title_name != stored->name) {
+      // The name labels the card and places it in the sort and filter, so the
+      // cards are laid out again, keeping their art.
+      entry.title_name = stored->name;
+      Repopulate();
+      return;
+    }
+  }
+  // Cards don't show the content type, only the pane does.
+  const Entry* entry = SelectedEntry();
+  if (entry && entry->key() == key) {
+    RefreshInfoPane();
   }
 }
 
@@ -556,12 +579,15 @@ void GameListPanel::OnItemActivated(int index) {
   LaunchOrPrompt(entries_[idx].key(), entries_[idx].path);
 }
 
-void GameListPanel::OnSelectionChanged() {
+void GameListPanel::OnSelectionChanged(bool clicked) {
   info_pane_closed_ = false;
-  RefreshInfoPane();
-  if (selection_changed_cb_) {
-    selection_changed_cb_();
+  // Opening the pane reflows the grid. After a click it waits out the double
+  // click time so the second click lands on the same card.
+  if (clicked && !splitter_->IsSplit()) {
+    pane_open_timer_.StartOnce(wxSystemSettings::GetMetric(wxSYS_DCLICK_MSEC));
+    return;
   }
+  RefreshInfoPane();
 }
 
 CompatState GameListPanel::GetEntryCompatState(const Entry& e) const {

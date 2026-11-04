@@ -299,7 +299,8 @@ bool D3D12Provider::Initialize() {
       cvars::d3d12_runtime_dir.empty()
           ? xe::filesystem::GetExecutablePath().parent_path() / "D3D12"
           : cvars::d3d12_runtime_dir;
-  XELOGI("D3D12 runtime directory: {}", xe::path_to_utf8(d3d12_dir));
+  XELOGI("D3D12 runtime directory: {}",
+         xe::strip_pii(xe::path_to_utf8(d3d12_dir)));
   {
     EnsureShaderCompilerRuntime(d3d12_dir);
 
@@ -689,6 +690,12 @@ bool D3D12Provider::Initialize() {
                                             &options13, sizeof(options13)))) {
     alpha_blend_factor_supported_ = bool(options13.AlphaBlendFactorSupported);
   }
+  dynamic_depth_bias_supported_ = false;
+  D3D12_FEATURE_DATA_D3D12_OPTIONS16 options16 = {};
+  if (SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS16,
+                                            &options16, sizeof(options16)))) {
+    dynamic_depth_bias_supported_ = bool(options16.DynamicDepthBiasSupported);
+  }
   virtual_address_bits_per_resource_ = 0;
   D3D12_FEATURE_DATA_GPU_VIRTUAL_ADDRESS_SUPPORT virtual_address_support;
   if (SUCCEEDED(device->CheckFeatureSupport(
@@ -715,6 +722,7 @@ bool D3D12Provider::Initialize() {
       "* Programmable sample positions: tier {}\n"
       "* Rasterizer-ordered views: {}\n"
       "* Scalar alpha blend factor: {}\n"
+      "* Dynamic depth bias: {}\n"
       "* Resource binding: tier {}\n"
       "* Tiled resources: tier {}\n"
       "* Unaligned block-compressed textures: {}",
@@ -726,6 +734,7 @@ bool D3D12Provider::Initialize() {
       uint32_t(programmable_sample_positions_tier_),
       rasterizer_ordered_views_supported_ ? "yes" : "no",
       alpha_blend_factor_supported_ ? "yes" : "no",
+      dynamic_depth_bias_supported_ ? "yes" : "no",
       uint32_t(resource_binding_tier_), uint32_t(tiled_resources_tier_),
       unaligned_block_textures_supported_ ? "yes" : "no");
 

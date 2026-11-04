@@ -34,10 +34,12 @@ class StackLayout {
    *  | q10, q11         | sp + 0x080
    *  | q12, q13         | sp + 0x0A0
    *  | q14, q15         | sp + 0x0C0
+   *  | host FPCR        | sp + 0x0E0  (HostToGuestThunk, 16 bytes)
    *  +------------------+
-   *  Total: 0xE0 = 224 bytes (16-byte aligned)
+   *  Total: 0xF0 = 240 bytes (16-byte aligned)
    */
-  static constexpr size_t THUNK_STACK_SIZE = 224;
+  static constexpr size_t THUNK_STACK_SIZE = 240;
+  static constexpr size_t THUNK_HOST_FPCR = 0xE0;
 
   /**
    * ARM64 Guest Stack Layout
@@ -64,6 +66,11 @@ class StackLayout {
   // Reserved padding. Longjmp detection state lives in A64BackendContext so it
   // can be checked even when native SP still points at a skipped frame.
   static constexpr size_t GUEST_RESERVED = 72;
+
+  // The guest-to-host thunks save x30 in the top 8 bytes of their frames, so
+  // the host address a guest frame's call into host code returns to sits this
+  // far below that frame.
+  static constexpr size_t THUNK_CALLER_RET_ADDR = 8;
 };
 
 }  // namespace a64

@@ -12,6 +12,7 @@
 
 #include <functional>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "xenia/base/arena.h"
@@ -128,6 +129,8 @@ class A64Emitter : public Xbyak_aarch64::CodeGenerator {
 
   void Call(const hir::Instr* instr, GuestFunction* function);
   void CallIndirect(const hir::Instr* instr, int reg_index);
+  // w16 = guest address in, x9 = host target out; clobbers x14/x15.
+  void EmitEncodedIndirectionLookup();
   void CallExtern(const hir::Instr* instr, const Function* function);
   // Emits a PPC __savegprlr_N/__restgprlr_N helper body inline instead of
   // calling it. Returns false when the callee is not a GPR saverest helper.
@@ -135,13 +138,22 @@ class A64Emitter : public Xbyak_aarch64::CodeGenerator {
                                     const GuestFunction* function);
   void CallNative(void* fn);
   void CallNativeSafe(void* fn);
-  // Loads the host address for the guest address in w16 into x9.
-  void EmitDynamicCallLookup(bool tail);
+  // Loads the host address for the guest address in w16 into x9. A direct bl,
+  // |direct| without |tail|, takes any entry. Other lookups take Any entries
+  // and check a return site's for a live frame.
+  void EmitDynamicCallLookup(bool tail, bool direct = false);
+  // Jumps to the dynamic blr target in x9 on the caller's frame, or falls
+  // through when the records don't allow that.
+  void EmitDropCallingFrame();
   void SetReturnAddress(uint64_t value);
 
   // Backend context register = x19.
   // Points to A64BackendContext (immediately before PPCContext in memory).
   const Xbyak_aarch64::XReg& GetBackendCtxReg() const { return x19; }
+  // Operand for an A64BackendContext field; offset comes from offsetof.
+  Xbyak_aarch64::AdrUimm BackendCtxPtr(size_t offset) const {
+    return Xbyak_aarch64::ptr(x19, static_cast<uint32_t>(offset));
+  }
   // Context register = x20.
   const Xbyak_aarch64::XReg& GetContextReg() const { return x20; }
   // Memory base register = x21.
@@ -155,11 +167,39 @@ class A64Emitter : public Xbyak_aarch64::CodeGenerator {
 
   static void HandleStackpointOverflowError(ppc::PPCContext* context);
 
+  void MergeFpcrModeAfterConditional(FPCRMode skip_path_mode) {
+    if (fpcr_mode_ != skip_path_mode) {
+      fpcr_mode_ = UntrackedFpcrMode();
+    }
+  }
+  FPCRMode fpcr_mode() const { return fpcr_mode_; }
   void ForgetFpcrMode() {
     if (IsVmxFpcrMode(fpcr_mode_)) {
       ChangeFpcrMode(FPCRMode::Fpu);
     }
+    fpcr_mode_ = UntrackedFpcrMode();
+  }
+  // The mode to assume where the tracker cannot follow the paths in, such as
+  // a loop header. Only a function that touches VEC128 ever enters a VMX
+  // mode, so in any other the FPCR holds the Fpu mode throughout.
+  FPCRMode UntrackedFpcrMode() const {
+    return function_has_vmx_ ? FPCRMode::Unknown : FPCRMode::Fpu;
+  }
+  // For cold paths whose host call clobbered the mode the tracker still holds.
+  void ReloadFpcrMode(FPCRMode mode) {
     fpcr_mode_ = FPCRMode::Unknown;
+    ChangeFpcrMode(mode);
+    fpcr_mode_ = mode;
+  }
+  // Every guest function is entered and left, and every host call made, in
+  // the scalar (Fpu) mode. Unknown may be VMX at runtime, but only in a
+  // function that touches VEC128.
+  void EnsureFpuFpcrModeForTransition() {
+    if (IsVmxFpcrMode(fpcr_mode_) ||
+        (fpcr_mode_ == FPCRMode::Unknown && function_has_vmx_)) {
+      ChangeFpcrMode(FPCRMode::Fpu);
+    }
+    fpcr_mode_ = FPCRMode::Fpu;
   }
   bool ChangeFpcrMode(FPCRMode new_mode, bool already_set = false);
   bool IsFeatureEnabled(uint64_t feature_flag) const {
@@ -183,16 +223,21 @@ class A64Emitter : public Xbyak_aarch64::CodeGenerator {
   // int64_t-immediate overloads remain available via the using-declarations
   // for hand-tuned thunks that pass literal byte offsets.
   //
-  // When the target label is already bound (backward branch — e.g. loop
-  // back-edges) the distance is known exactly, so a single direct branch is
-  // emitted whenever it is in range. This halves the hottest branches in
-  // guest code and keeps the natural taken/not-taken polarity for the
-  // branch predictor.
+  // A single direct branch is emitted whenever the target is provably in
+  // range: when the whole function is (near_tail_branches_safe_ and
+  // near_tbz_branches_safe_), and otherwise when the label is already bound
+  // (backward branch, e.g. a loop back-edge) and the distance is known. This
+  // halves the hottest branches in guest code and keeps the natural
+  // taken/not-taken polarity for the branch predictor.
   using Xbyak_aarch64::CodeGenerator::b;
   using Xbyak_aarch64::CodeGenerator::cbnz;
   using Xbyak_aarch64::CodeGenerator::cbz;
   using Xbyak_aarch64::CodeGenerator::tbnz;
   using Xbyak_aarch64::CodeGenerator::tbz;
+  void b(const Xbyak_aarch64::Label& label) {
+    CheckRemapKeptBranch(label);
+    CodeGenerator::b(label);
+  }
   void b(const Xbyak_aarch64::Cond cond, const Xbyak_aarch64::Label& label);
   void cbz(const Xbyak_aarch64::WReg& rt, const Xbyak_aarch64::Label& label);
   void cbz(const Xbyak_aarch64::XReg& rt, const Xbyak_aarch64::Label& label);
@@ -234,12 +279,116 @@ class A64Emitter : public Xbyak_aarch64::CodeGenerator {
     CodeGenerator::cbnz(rt, label);
   }
 
+  // +/-32 KiB only; guard with near_tbz_branches_safe_.
+  void tbnz_near(const Xbyak_aarch64::WReg& rt, uint32_t bit,
+                 const Xbyak_aarch64::Label& label) {
+    CodeGenerator::tbnz(rt, bit, label);
+  }
+
   // Shadow of CodeGenerator::L that records the bind offset so later
   // branches to this label can be emitted in single-instruction form.
   void L(Xbyak_aarch64::Label& label) {
     CodeGenerator::L(label);
     label_bind_offsets_.emplace(label.getId(), getSize());
+    // A label may be reached from code that never loaded the bound.
+    DropPhysicalRemapBound();
   }
+  // Binds a label that is reached only by branches emitted in the state the
+  // emitter is in now, through code that leaves w7 alone: the skip after a
+  // long branch, or the return from a tail stub that works in scratch
+  // registers. The physical remap bound stays valid across it.
+  void LKeepingRemapBound(Xbyak_aarch64::Label& label) {
+    CodeGenerator::L(label);
+    label_bind_offsets_.emplace(label.getId(), getSize());
+    remap_kept_label_ids_.insert(label.getId());
+  }
+  // A call clobbers w7, so tail code that made one must not return through a
+  // label that kept the bound. Emit fails the function if it does.
+  void NoteCallClobbersRemapBound() { tail_item_called_ = true; }
+  void CheckRemapKeptBranch(const Xbyak_aarch64::Label& label) {
+    if (emitting_tail_ && tail_item_called_ &&
+        remap_kept_label_ids_.count(label.getId())) {
+      remap_kept_branch_after_call_ = true;
+    }
+  }
+
+  // A producer that emits nothing hands the next sequence the register it
+  // should have read and a 32-bit mask to fold into the address it computes
+  // anyway. Keyed on the register the producer would have written; cleared
+  // on read. The very next sequence must read it, or Emit fails the function.
+  void MarkFusedAddressMask(int dest_reg, int src_reg, uint32_t mask) {
+    fused_addr_mask_dest_reg_ = dest_reg;
+    fused_addr_mask_src_reg_ = src_reg;
+    fused_addr_mask_imm_ = mask;
+  }
+  bool ConsumeFusedAddressMask(int dest_reg, int* out_src_reg,
+                               uint32_t* out_mask) {
+    if (dest_reg < 0 || fused_addr_mask_dest_reg_ != dest_reg) {
+      return false;
+    }
+    *out_src_reg = fused_addr_mask_src_reg_;
+    *out_mask = fused_addr_mask_imm_;
+    fused_addr_mask_dest_reg_ = -1;
+    return true;
+  }
+
+  // A compare whose only reader is the branch right after it makes no
+  // boolean: the branch reads the flags the compare set. Keyed on the
+  // register the cset would have written; cleared on read. Only instructions
+  // that PassesHandoffs may sit between the two, and the branch must take it,
+  // or Emit fails the function.
+  void MarkFusedCompareBranch(int dest_reg, Xbyak_aarch64::Cond cond) {
+    fused_cmp_branch_reg_ = dest_reg;
+    fused_cmp_branch_cond_ = cond;
+  }
+  bool ConsumeFusedCompareBranch(int dest_reg, Xbyak_aarch64::Cond* out_cond) {
+    if (dest_reg < 0 || fused_cmp_branch_reg_ != dest_reg) {
+      return false;
+    }
+    *out_cond = fused_cmp_branch_cond_;
+    fused_cmp_branch_reg_ = -1;
+    return true;
+  }
+
+  // SOURCE_OFFSET, CONTEXT_BARRIER and NOP emit no code that touches NZCV
+  // or a register a required handoff names (SOURCE_OFFSET's coverage
+  // counter uses add, not adds, and only x0/x1). COMMENT does not pass: it
+  // calls TraceString when instruction tracing is on.
+  static bool PassesHandoffs(const hir::Instr* instr) {
+    switch (instr->GetOpcodeNum()) {
+      case hir::OPCODE_SOURCE_OFFSET:
+      case hir::OPCODE_CONTEXT_BARRIER:
+      case hir::OPCODE_NOP:
+        return true;
+      default:
+        return false;
+    }
+  }
+
+  // A guest call writes its return address twice from the same immediate:
+  // into the host stack slot and into the guest link register. The first
+  // leaves it in x0, and `reader`, the HIR instruction right after it, may
+  // store it from there. Nothing is emitted between two adjacent sequences.
+  void MarkX0HoldsConstant(const hir::Instr* reader, uint64_t value) {
+    x0_constant_reader_ = reader;
+    x0_constant_ = value;
+  }
+  bool X0HoldsConstant(const hir::Instr* reader, uint64_t value) const {
+    return reader == x0_constant_reader_ && value == x0_constant_;
+  }
+
+  // w7 holds 0xE0000000 for the physical remap from its first use until the
+  // next host call or label, across a block boundary only when every edge
+  // into the block carries it. Nothing else in the backend uses w7.
+  bool physical_remap_bound_valid() const {
+    return physical_remap_bound_valid_;
+  }
+  void set_physical_remap_bound_valid() { physical_remap_bound_valid_ = true; }
+  void DropPhysicalRemapBound() { physical_remap_bound_valid_ = false; }
+
+  // Whether this function translates guest addresses through the context's
+  // tables rather than the membase. Decided when the function is emitted.
+  bool guest_tlb() const { return guest_tlb_; }
 
   // Get or create a xbyak_aarch64 label for a HIR label ID.
   Xbyak_aarch64::Label& GetLabel(uint32_t label_id);
@@ -270,6 +419,7 @@ class A64Emitter : public Xbyak_aarch64::CodeGenerator {
   XexModule* guest_module_ = nullptr;
   uint64_t feature_flags_ = 0;
   uint32_t current_guest_function_ = 0;
+  bool guest_tlb_ = false;
 
   Xbyak_aarch64::Label* epilog_label_ = nullptr;
 
@@ -286,6 +436,11 @@ class A64Emitter : public Xbyak_aarch64::CodeGenerator {
   Arena source_map_arena_;
 
   size_t stack_size_ = 0;
+  // Whether every branch within the function, to the epilog and the tail
+  // included, is provably within b.cond/cbnz reach (+/-1 MiB), and within
+  // tbz/tbnz reach (+/-32 KiB).
+  bool near_tail_branches_safe_ = false;
+  bool near_tbz_branches_safe_ = false;
 
   static const uint32_t gpr_reg_map_[GPR_COUNT];
   static const uint32_t vec_reg_map_[VEC_COUNT];
@@ -306,6 +461,11 @@ class A64Emitter : public Xbyak_aarch64::CodeGenerator {
   // to be in range. Must be cleared whenever the code generator is reset
   // (xbyak reuses label ids after reset()).
   std::unordered_map<int, size_t> label_bind_offsets_;
+  // Labels bound with LKeepingRemapBound, keyed like label_bind_offsets_.
+  std::unordered_set<int> remap_kept_label_ids_;
+  bool emitting_tail_ = false;
+  bool tail_item_called_ = false;
+  bool remap_kept_branch_after_call_ = false;
 
   // True if `label` is bound at most `max_backward_bytes` behind the
   // current emission offset.
@@ -331,6 +491,55 @@ class A64Emitter : public Xbyak_aarch64::CodeGenerator {
   static constexpr int64_t kTestBranchBackwardRange = (1ll << 15) - 8;
 
   FPCRMode fpcr_mode_ = FPCRMode::Unknown;
+  bool function_has_vmx_ = false;
+  // FPCR tracking across blocks: lattice {Unknown, Fpu, Vmx, VmxDaz}, where
+  // meet(a, b) = a if a == b else Unknown. A block starts in the meet of its
+  // incoming edges once all of them have been emitted, else Unknown. The
+  // remap bound in w7 is tracked the same way: a block starts with it loaded
+  // only when every incoming edge left it loaded.
+  struct IncomingState {
+    FPCRMode fpcr_meet = FPCRMode::Unknown;
+    bool remap_bound_valid = false;
+    uint32_t count = 0;
+  };
+  std::unordered_map<const hir::Block*, uint32_t> expected_preds_;
+  std::unordered_map<const hir::Block*, IncomingState> incoming_state_;
+  void RecordIncomingState(const hir::Block* target, FPCRMode mode,
+                           bool remap_bound_valid) {
+    auto& in = incoming_state_[target];
+    if (in.count == 0) {
+      in.fpcr_meet = mode;
+      in.remap_bound_valid = remap_bound_valid;
+    } else {
+      if (in.fpcr_meet != mode) {
+        in.fpcr_meet = FPCRMode::Unknown;
+      }
+      in.remap_bound_valid = in.remap_bound_valid && remap_bound_valid;
+    }
+    ++in.count;
+  }
+  // An edge leaving from where the emitter is now.
+  void RecordIncomingState(const hir::Block* target) {
+    RecordIncomingState(target, fpcr_mode_, physical_remap_bound_valid_);
+  }
+  bool physical_remap_bound_valid_ = false;
+  // Handoffs between adjacent sequences; see MarkFusedAddressMask and
+  // MarkFusedCompareBranch.
+  void ResetSequenceHandoffs() {
+    fused_addr_mask_dest_reg_ = -1;
+    fused_cmp_branch_reg_ = -1;
+    x0_constant_reader_ = nullptr;
+  }
+  bool sequence_handoff_pending() const {
+    return fused_addr_mask_dest_reg_ >= 0 || fused_cmp_branch_reg_ >= 0;
+  }
+  int fused_addr_mask_dest_reg_ = -1;
+  int fused_addr_mask_src_reg_ = -1;
+  uint32_t fused_addr_mask_imm_ = 0;
+  int fused_cmp_branch_reg_ = -1;
+  Xbyak_aarch64::Cond fused_cmp_branch_cond_ = Xbyak_aarch64::EQ;
+  const hir::Instr* x0_constant_reader_ = nullptr;
+  uint64_t x0_constant_ = 0;
   bool synchronize_stack_on_next_instruction_ = false;
 };
 

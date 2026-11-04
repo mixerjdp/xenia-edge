@@ -29,7 +29,8 @@ void DeferredCommandList::Reset() { command_stream_.clear(); }
 
 void DeferredCommandList::Execute(ID3D12GraphicsCommandList* command_list,
                                   ID3D12GraphicsCommandList1* command_list_1,
-                                  ID3D12GraphicsCommandList2* command_list_2) {
+                                  ID3D12GraphicsCommandList2* command_list_2,
+                                  ID3D12GraphicsCommandList9* command_list_9) {
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
@@ -135,6 +136,12 @@ void DeferredCommandList::Execute(ID3D12GraphicsCommandList* command_list,
             args.query_heap, args.query_type, args.start_index,
             args.query_count, args.destination_buffer, args.destination_offset);
       } break;
+      case Command::kD3DSetPredication: {
+        auto& args =
+            *reinterpret_cast<const D3DSetPredicationArguments*>(stream);
+        command_list->SetPredication(args.buffer, args.aligned_buffer_offset,
+                                     args.operation);
+      } break;
       case Command::kD3DIASetIndexBuffer: {
         auto view = reinterpret_cast<const D3D12_INDEX_BUFFER_VIEW*>(stream);
         command_list->IASetIndexBuffer(
@@ -169,6 +176,19 @@ void DeferredCommandList::Execute(ID3D12GraphicsCommandList* command_list,
       case Command::kD3DOMSetStencilRef: {
         command_list->OMSetStencilRef(*reinterpret_cast<const UINT*>(stream));
       } break;
+      case Command::kD3DResolveSubresourceRegion: {
+        if (command_list_1 != nullptr) {
+          auto& args =
+              *reinterpret_cast<const D3DResolveSubresourceRegionArguments*>(
+                  stream);
+          command_list_1->ResolveSubresourceRegion(
+              args.dst_resource, args.dst_subresource, args.dst_x, args.dst_y,
+              args.src_resource, args.src_subresource,
+              args.has_src_rect ? const_cast<D3D12_RECT*>(&args.src_rect)
+                                : nullptr,
+              args.format, args.resolve_mode);
+        }
+      } break;
       case Command::kD3DResourceBarrier: {
         static_assert(alignof(D3D12_RESOURCE_BARRIER) <= alignof(uintmax_t));
         command_list->ResourceBarrier(
@@ -176,6 +196,14 @@ void DeferredCommandList::Execute(ID3D12GraphicsCommandList* command_list,
             reinterpret_cast<const D3D12_RESOURCE_BARRIER*>(
                 reinterpret_cast<const uint8_t*>(stream) +
                 xe::align(sizeof(UINT), alignof(D3D12_RESOURCE_BARRIER))));
+      } break;
+      case Command::kD3DRSSetDepthBias: {
+        if (command_list_9 != nullptr && current_pipeline_state != nullptr) {
+          auto& args =
+              *reinterpret_cast<const D3DRSSetDepthBiasArguments*>(stream);
+          command_list_9->RSSetDepthBias(args.depth_bias, args.depth_bias_clamp,
+                                         args.slope_scaled_depth_bias);
+        }
       } break;
       case Command::kRSSetScissorRect: {
         command_list->RSSetScissorRects(

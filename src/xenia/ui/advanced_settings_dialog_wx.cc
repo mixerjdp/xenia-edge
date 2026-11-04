@@ -87,14 +87,14 @@ bool IsIntCvar(cvar::IConfigVar* var) {
 
 std::string GetCurrentValue(cvar::IConfigVar* var) {
   if (auto* s = dynamic_cast<cvar::ConfigVar<std::string>*>(var)) {
-    return s->GetTypedConfigValue();
+    return ui::CvarValueToDisplayName(var->name(), s->GetTypedConfigValue());
   }
   if (auto* p = dynamic_cast<cvar::ConfigVar<std::filesystem::path>*>(var)) {
     return xe::path_to_utf8(p->GetTypedConfigValue());
   }
   // Integer cvars shown as string dropdowns (e.g. user_language) display their
   // option name rather than the raw id.
-  return ui::IntCvarValueToDisplayName(var->name(), var->config_value());
+  return ui::CvarValueToDisplayName(var->name(), var->config_value());
 }
 
 }  // namespace
@@ -281,12 +281,15 @@ wxWindow* AdvancedSettingsDialog::CreateEditor(wxWindow* parent,
   }
 
   if (enum_it != enums.end()) {
+    const auto choices =
+        ui::GetEnumChoices(info->name, enum_it->second, info->pending_value);
     auto* combo = new wxChoice(parent, wxID_ANY);
-    for (size_t i = 0; i < enum_it->second.size(); ++i) {
-      combo->Append(wxString::FromUTF8(enum_it->second[i]));
+    for (const auto& choice : choices) {
+      combo->Append(wxString::FromUTF8(choice));
     }
-    int sel = ui::GetEnumSelectionIndex(enum_it->second, info->pending_value,
-                                        info->var->default_value());
+    int sel = ui::GetEnumSelectionIndex(
+        choices, info->pending_value,
+        ui::CvarValueToDisplayName(info->name, info->var->default_value()));
     if (sel >= 0) {
       combo->SetSelection(sel);
     }
@@ -433,12 +436,14 @@ void AdvancedSettingsDialog::Save() {
     try {
       if (dynamic_cast<cvar::ConfigVar<bool>*>(var)) {
         tbl.insert(var->name(), trimmed == "true");
-      } else if (dynamic_cast<cvar::ConfigVar<std::string>*>(var) ||
-                 dynamic_cast<cvar::ConfigVar<std::filesystem::path>*>(var)) {
+      } else if (dynamic_cast<cvar::ConfigVar<std::string>*>(var)) {
+        tbl.insert(var->name(),
+                   ui::DisplayNameToCvarValue(var->name(), trimmed));
+      } else if (dynamic_cast<cvar::ConfigVar<std::filesystem::path>*>(var)) {
         tbl.insert(var->name(), trimmed);
       } else if (IsIntCvar(var)) {
         // Dropdown int cvars hold an option name; convert back to its id.
-        trimmed = ui::DisplayNameToIntCvarValue(var->name(), trimmed);
+        trimmed = ui::DisplayNameToCvarValue(var->name(), trimmed);
         int64_t val = (trimmed.size() > 2 && trimmed[0] == '0' &&
                        (trimmed[1] == 'x' || trimmed[1] == 'X'))
                           ? std::stoll(trimmed, nullptr, 16)

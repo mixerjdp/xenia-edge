@@ -74,7 +74,8 @@ class MetalTraceDump : public TraceDump {
     NS::Error* error = nullptr;
     if (manager->startCapture(descriptor, &error)) {
       capturing_ = true;
-      XELOGI("Metal trace dump: capturing to {}", capture_path.string());
+      XELOGI("Metal trace dump: capturing to {}",
+             xe::strip_pii(xe::path_to_utf8(capture_path)));
     } else {
       const char* message = "unknown error";
       if (error && error->localizedDescription()) {

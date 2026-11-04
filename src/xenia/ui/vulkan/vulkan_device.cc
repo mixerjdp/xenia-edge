@@ -205,13 +205,19 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     // #148.
     XE_UI_VULKAN_STRUCT_PROMOTED_EXTENSION(KHR_image_format_list, 1, 2)
     if (get_physical_device_properties2_supported) {
+      // #144.
+      XE_UI_VULKAN_STRUCT_EXTENSION(EXT_sample_locations)
       // #157.
       XE_UI_VULKAN_STRUCT_PROMOTED_EXTENSION(KHR_sampler_ycbcr_conversion, 1, 1)
       // #198. Also must be enabled for VK_KHR_spirv_1_4.
       XE_UI_VULKAN_LOCAL_PROMOTED_EXTENSION(KHR_shader_float_controls, 1, 2)
       XE_UI_VULKAN_LOCAL_PROMOTED_EXTENSION(EXT_host_query_reset, 1, 2)
+      // #82.
+      XE_UI_VULKAN_STRUCT_EXTENSION(EXT_conditional_rendering)
       // #83. Float16 and Int16 capabilities are declared by system shaders.
       XE_UI_VULKAN_LOCAL_PROMOTED_EXTENSION(KHR_shader_float16_int8, 1, 2)
+      // #284.
+      XE_UI_VULKAN_STRUCT_EXTENSION(EXT_depth_bias_control)
       // #252.
       XE_UI_VULKAN_LOCAL_EXTENSION(EXT_fragment_shader_interlock)
       // #55.
@@ -342,6 +348,8 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       features_KHR_portability_subset;
   VkPhysicalDeviceDriverPropertiesKHR properties_1_2_KHR_driver_properties = {
       VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+  VkPhysicalDeviceSampleLocationsPropertiesEXT properties_EXT_sample_locations =
+      {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLE_LOCATIONS_PROPERTIES_EXT};
   VkPhysicalDeviceFloatControlsProperties
       properties_1_2_KHR_shader_float_controls = {
           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FLOAT_CONTROLS_PROPERTIES};
@@ -390,6 +398,14 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   VkPhysicalDeviceExternalMemoryHostPropertiesEXT
       properties_EXT_external_memory_host = {
           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT};
+  VulkanFeatures<
+      VkPhysicalDeviceConditionalRenderingFeaturesEXT,
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CONDITIONAL_RENDERING_FEATURES_EXT>
+      features_EXT_conditional_rendering;
+  VulkanFeatures<
+      VkPhysicalDeviceDepthBiasControlFeaturesEXT,
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_BIAS_CONTROL_FEATURES_EXT>
+      features_EXT_depth_bias_control;
 
   if (get_physical_device_properties2_supported) {
     if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 1, 0)) {
@@ -431,6 +447,10 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       properties_1_2_KHR_shader_float_controls.pNext = properties_2.pNext;
       properties_2.pNext = &properties_1_2_KHR_shader_float_controls;
     }
+    if (device->extensions_.ext_EXT_sample_locations) {
+      properties_EXT_sample_locations.pNext = properties_2.pNext;
+      properties_2.pNext = &properties_EXT_sample_locations;
+    }
     if (ext_EXT_fragment_shader_interlock) {
       features_EXT_fragment_shader_interlock.Link(supported_features_2,
                                                   device_create_info);
@@ -471,6 +491,14 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     if (device->extensions_.ext_EXT_external_memory_host) {
       properties_EXT_external_memory_host.pNext = properties_2.pNext;
       properties_2.pNext = &properties_EXT_external_memory_host;
+    }
+    if (device->extensions_.ext_EXT_conditional_rendering) {
+      features_EXT_conditional_rendering.Link(supported_features_2,
+                                              device_create_info);
+    }
+    if (device->extensions_.ext_EXT_depth_bias_control) {
+      features_EXT_depth_bias_control.Link(supported_features_2,
+                                           device_create_info);
     }
     ifn.vkGetPhysicalDeviceProperties2(physical_device, &properties_2);
     ifn.vkGetPhysicalDeviceFeatures2(physical_device, &supported_features_2);
@@ -885,6 +913,8 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
                             shaderDenormFlushToZeroFloat32);
     XE_UI_VULKAN_PROPERTY_2(properties_1_2_KHR_shader_float_controls,
                             shaderRoundingModeRTEFloat32);
+    XE_UI_VULKAN_PROPERTY_2(properties_1_2_KHR_shader_float_controls,
+                            shaderRoundingModeRTZFloat32);
   }
 
   if (ext_EXT_fragment_shader_interlock) {
@@ -894,6 +924,13 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       XE_UI_VULKAN_FEATURE_2(features_EXT_fragment_shader_interlock,
                              fragmentShaderPixelInterlock)
     }
+  }
+
+  if (device->extensions_.ext_EXT_sample_locations) {
+    XE_UI_VULKAN_PROPERTY_2(properties_EXT_sample_locations,
+                            sampleLocationSampleCounts);
+    XE_UI_VULKAN_PROPERTY_2(properties_EXT_sample_locations,
+                            variableSampleLocations);
   }
 
   if (ext_EXT_non_seamless_cube_map) {
@@ -975,6 +1012,22 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
        ext_NV_fragment_shader_barycentric) &&
       !driver_is_moltenvk;
 
+  if (device->extensions_.ext_EXT_conditional_rendering) {
+    if (with_gpu_emulation) {
+      XE_UI_VULKAN_FEATURE_2(features_EXT_conditional_rendering,
+                             conditionalRendering)
+    }
+  }
+
+  if (device->extensions_.ext_EXT_depth_bias_control) {
+    if (with_gpu_emulation) {
+      XE_UI_VULKAN_FEATURE_2(features_EXT_depth_bias_control, depthBiasControl)
+      XE_UI_VULKAN_FEATURE_2(features_EXT_depth_bias_control,
+                             leastRepresentableValueForceUnormRepresentation)
+      XE_UI_VULKAN_FEATURE_2(features_EXT_depth_bias_control, depthBiasExact)
+    }
+  }
+
 #undef XE_UI_VULKAN_LIMIT
 #undef XE_UI_VULKAN_ENUM_LIMIT
 #undef XE_UI_VULKAN_FEATURE
@@ -1054,6 +1107,12 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   }
   if (device->extensions_.ext_KHR_swapchain) {
 #include "xenia/ui/vulkan/functions/device_khr_swapchain.inc"
+  }
+  if (device->extensions_.ext_EXT_conditional_rendering) {
+#include "xenia/ui/vulkan/functions/device_ext_conditional_rendering.inc"
+  }
+  if (device->extensions_.ext_EXT_depth_bias_control) {
+#include "xenia/ui/vulkan/functions/device_ext_depth_bias_control.inc"
   }
 #undef XE_UI_VULKAN_FUNCTION_PROMOTED
 

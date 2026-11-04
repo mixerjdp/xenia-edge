@@ -691,6 +691,8 @@ void WxWindow::OnPanelSetFocus(wxFocusEvent& event) {
 
 void WxWindow::OnPanelKillFocus(wxFocusEvent& event) {
   event.Skip();
+  // Releases while unfocused aren't seen.
+  keys_down_.clear();
   WindowDestructionReceiver destruction_receiver(this);
   OnFocusUpdate(false, destruction_receiver);
 }
@@ -701,8 +703,10 @@ void WxWindow::OnPanelKeyDown(wxKeyEvent& event) {
     event.Skip();
     return;
   }
-  KeyEvent key_event(this, vk, 1, false, event.ShiftDown(), event.ControlDown(),
-                     event.AltDown(), false);
+  // wx doesn't flag auto-repeat on every platform, so held keys are tracked.
+  const bool prev_state = !keys_down_.insert(vk).second;
+  KeyEvent key_event(this, vk, 1, prev_state, event.ShiftDown(),
+                     event.ControlDown(), event.AltDown(), false);
   WindowDestructionReceiver destruction_receiver(this);
   OnKeyDown(key_event, destruction_receiver);
   if (destruction_receiver.IsWindowDestroyed()) {
@@ -737,6 +741,7 @@ void WxWindow::OnPanelKeyUp(wxKeyEvent& event) {
     event.Skip();
     return;
   }
+  keys_down_.erase(vk);
   KeyEvent key_event(this, vk, 0, true, event.ShiftDown(), event.ControlDown(),
                      event.AltDown(), false);
   WindowDestructionReceiver destruction_receiver(this);

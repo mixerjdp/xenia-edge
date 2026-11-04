@@ -946,6 +946,14 @@ struct PERMUTE_I32
       e.ext(VReg(d).b16, VReg(s2).b16, VReg(s3).b16, words[0] * 4);
       return;
     }
+    if (words[0] == 0 && words[1] == 4 && words[2] == 1 && words[3] == 5) {
+      e.zip1(VReg(d).s4, VReg(s2).s4, VReg(s3).s4);
+      return;
+    }
+    if (words[0] == 2 && words[1] == 6 && words[2] == 3 && words[3] == 7) {
+      e.zip2(VReg(d).s4, VReg(s2).s4, VReg(s3).s4);
+      return;
+    }
     // Build TBL control from the I32 permute control word.
     uint8_t tbl_ctrl[16];
     for (int idx = 0; idx < 4; idx++) {
@@ -972,40 +980,51 @@ struct PERMUTE_V128
                I<OPCODE_PERMUTE, V128Op, V128Op, V128Op, V128Op>> {
   static void EmitByInt8(A64Emitter& e, const EmitArgType& i) {
     int d = i.dest.reg().getIdx();
-    // Copy src2 to v0, src3 to v1 (consecutive for 2-register TBL).
-    if (i.src2.is_constant) {
-      LoadV128Const(e, 0, i.src2.constant());
-    } else if (i.src2.reg().getIdx() != 0) {
-      e.orr(VReg(0).b16, VReg(i.src2.reg().getIdx()).b16,
-            VReg(i.src2.reg().getIdx()).b16);
-    }
-    if (i.src3.is_constant) {
-      LoadV128Const(e, 1, i.src3.constant());
-    } else if (i.src3.reg().getIdx() != 1) {
-      e.orr(VReg(1).b16, VReg(i.src3.reg().getIdx()).b16,
-            VReg(i.src3.reg().getIdx()).b16);
-    }
-    // Load control vector into v2, XOR each byte with 3 for endian swap.
-    int ctrl;
+    // rev32 of the tables replaces XORing the control with 3.
+    int zip_form = 0;
     if (i.src1.is_constant) {
-      LoadV128Const(e, 2, i.src1.constant());
-      ctrl = 2;
-    } else {
-      ctrl = i.src1.reg().getIdx();
-      if (ctrl == 0 || ctrl == 1) {
-        // Control conflicts with table registers, copy to v2.
-        e.orr(VReg(2).b16, VReg(ctrl).b16, VReg(ctrl).b16);
-        ctrl = 2;
+      vec128_t ctrl = i.src1.constant();
+      for (int k = 0; k < 16; k++) {
+        ctrl.u8[k] &= 0x1F;
       }
+      static const vec128_t kMrghbCtrl =
+          vec128b(0, 16, 1, 17, 2, 18, 3, 19, 4, 20, 5, 21, 6, 22, 7, 23);
+      static const vec128_t kMrglbCtrl =
+          vec128b(8, 24, 9, 25, 10, 26, 11, 27, 12, 28, 13, 29, 14, 30, 15, 31);
+      zip_form = (ctrl == kMrghbCtrl) ? 1 : (ctrl == kMrglbCtrl) ? 2 : 0;
+      if (!zip_form) {
+        LoadV128Const(e, 2, ctrl);
+      }
+    } else {
+      e.movi(VReg(2).b16, 0x1F);
+      e.and_(VReg(2).b16, VReg(i.src1.reg().getIdx()).b16, VReg(2).b16);
     }
-    // XOR control bytes with 0x03 to remap PPC byte indices to LE,
-    // then mask to 5 bits (0-31) so TBL indices stay in range.
-    e.movi(VReg(3).b16, 0x03);
-    e.eor(VReg(3).b16, VReg(ctrl).b16, VReg(3).b16);
-    e.movi(VReg(2).b16, 0x1F);
-    e.and_(VReg(3).b16, VReg(3).b16, VReg(2).b16);
+    // Table register `idx` = the source with the bytes of each word reversed.
+    auto load_table = [&e](const V128Op& src, int idx) {
+      if (src.is_constant) {
+        const vec128_t& t = src.constant();
+        vec128_t swapped;
+        for (int k = 0; k < 16; k++) {
+          swapped.u8[k] = t.u8[k ^ 3];
+        }
+        LoadV128Const(e, idx, swapped);
+      } else {
+        e.rev32(VReg(idx).b16, VReg(src.reg().getIdx()).b16);
+      }
+    };
+    load_table(i.src2, 0);
+    load_table(i.src3, 1);
+    if (zip_form) {
+      if (zip_form == 1) {
+        e.zip1(VReg(d).b16, VReg(0).b16, VReg(1).b16);
+      } else {
+        e.zip2(VReg(d).b16, VReg(0).b16, VReg(1).b16);
+      }
+      e.rev32(VReg(d).b16, VReg(d).b16);
+      return;
+    }
     // TBL with 2-register table {v0, v1}.
-    e.tbl(VReg(d).b16, VReg(0).b16, 2, VReg(3).b16);
+    e.tbl(VReg(d).b16, VReg(0).b16, 2, VReg(2).b16);
   }
 
   static void EmitByInt16(A64Emitter& e, const EmitArgType& i) {
@@ -1015,6 +1034,25 @@ struct PERMUTE_V128
     // PPC halfword index H maps to NEON u16 index (H&7)^1 (halfword swap
     // within 32-bit words). For src3 (indices >= 8), add 16 byte offset.
     vec128_t ctrl = i.src1.constant();
+    {
+      static const vec128_t kMrghhCtrl = vec128s(0, 8, 1, 9, 2, 10, 3, 11);
+      static const vec128_t kMrglhCtrl = vec128s(4, 12, 5, 13, 6, 14, 7, 15);
+      vec128_t masked = ctrl;
+      for (int k = 0; k < 8; k++) {
+        masked.u16[k] &= 0xF;
+      }
+      if (masked == kMrghhCtrl || masked == kMrglhCtrl) {
+        int a = SrcVReg(e, i.src2, 0);
+        int b = SrcVReg(e, i.src3, 1);
+        if (masked == kMrghhCtrl) {
+          e.zip1(VReg(d).h8, VReg(b).h8, VReg(a).h8);
+        } else {
+          e.zip2(VReg(d).h8, VReg(b).h8, VReg(a).h8);
+        }
+        e.rev64(VReg(d).s4, VReg(d).s4);
+        return;
+      }
+    }
     vec128_t tbl_ctrl = {};
     for (int k = 0; k < 8; k++) {
       uint16_t h = ctrl.u16[k] & 0xF;
@@ -1179,6 +1217,11 @@ EMITTER_OPCODE_TABLE(OPCODE_LOAD_VECTOR_SHR, LOAD_VECTOR_SHR_I8);
 // ============================================================================
 // OPCODE_PACK
 // ============================================================================
+// FMAXNM(x, x) quiets a signalling NaN; x86 MAXPS/MINPS treat any NaN alike.
+static void EmitQuietSnan(A64Emitter& e, int d, int s) {
+  e.fmaxnm(VReg(d).s4, VReg(s).s4, VReg(s).s4);
+}
+
 struct PACK : Sequence<PACK, I<OPCODE_PACK, V128Op, V128Op, V128Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
     switch (i.instr->flags & hir::PACK_TYPE_MODE) {
@@ -1219,9 +1262,10 @@ struct PACK : Sequence<PACK, I<OPCODE_PACK, V128Op, V128Op, V128Op>> {
     int s = SrcVReg(e, i.src1, 2);
     int d = i.dest.reg().getIdx();
     // Clamp to [3.0f, 3.0f + 255*2^-22].
-    // fmaxnm/fminnm: NaN operand returns the non-NaN value (pack NaN as zero).
     e.fmov(VReg(0).s4, 3.0f);
-    e.fmaxnm(VReg(d).s4, VReg(s).s4, VReg(0).s4);
+    // fmaxnm/fminnm: NaN operand returns the non-NaN value (pack NaN as zero).
+    EmitQuietSnan(e, d, s);
+    e.fmaxnm(VReg(d).s4, VReg(d).s4, VReg(0).s4);
     LoadV128Const(e, 0, vec128i(0x404000FFu));  // 3.0f + 255*2^-22
     e.fminnm(VReg(d).s4, VReg(d).s4, VReg(0).s4);
     // TBL: extract low byte from each lane, reorder RGBA->ARGB in lane 3.
@@ -1238,7 +1282,8 @@ struct PACK : Sequence<PACK, I<OPCODE_PACK, V128Op, V128Op, V128Op>> {
     int d = i.dest.reg().getIdx();
     // Clamp to [PackSHORT_Min, PackSHORT_Max].
     LoadV128Const(e, 0, vec128i(0x403F8001u));
-    e.fmaxnm(VReg(d).s4, VReg(s).s4, VReg(0).s4);
+    EmitQuietSnan(e, d, s);
+    e.fmaxnm(VReg(d).s4, VReg(d).s4, VReg(0).s4);
     LoadV128Const(e, 0, vec128i(0x40407FFFu));
     e.fminnm(VReg(d).s4, VReg(d).s4, VReg(0).s4);
     // TBL: extract low 2 bytes from lanes 0,1 -> pack into lane 3.
@@ -1254,7 +1299,8 @@ struct PACK : Sequence<PACK, I<OPCODE_PACK, V128Op, V128Op, V128Op>> {
     int s = SrcVReg(e, i.src1, 2);
     int d = i.dest.reg().getIdx();
     LoadV128Const(e, 0, vec128i(0x403F8001u));
-    e.fmaxnm(VReg(d).s4, VReg(s).s4, VReg(0).s4);
+    EmitQuietSnan(e, d, s);
+    e.fmaxnm(VReg(d).s4, VReg(d).s4, VReg(0).s4);
     LoadV128Const(e, 0, vec128i(0x40407FFFu));
     e.fminnm(VReg(d).s4, VReg(d).s4, VReg(0).s4);
     // TBL ctrl for PACK_SHORT_4: bytes 8-11={0x04,0x05,0x00,0x01},
@@ -1371,14 +1417,15 @@ struct PACK : Sequence<PACK, I<OPCODE_PACK, V128Op, V128Op, V128Op>> {
     int d = i.dest.reg().getIdx();
 
     // Clamp to valid range: fmaxnm(src, min) then fminnm(result, max).
-    // fmaxnm clamps NaN to min (NaN packs as the minimum value).
     // XYZ min=0x403FFE01 (-511), max=0x404001FF (+511)
     // W   min=0x40400000 (0),    max=0x40400003 (+3)
     e.mov(e.x0, 0x403FFE01403FFE01ull);
     e.fmov(DReg(0), e.x0);
     e.mov(e.x0, 0x40400000403FFE01ull);
     e.ins(VReg(0).d2[1], e.x0);
-    e.fmaxnm(VReg(d).s4, VReg(s).s4, VReg(0).s4);
+    // fmaxnm clamps NaN to min (NaN packs as the minimum value).
+    EmitQuietSnan(e, d, s);
+    e.fmaxnm(VReg(d).s4, VReg(d).s4, VReg(0).s4);
 
     e.mov(e.x0, 0x404001FF404001FFull);
     e.fmov(DReg(0), e.x0);
@@ -1420,7 +1467,8 @@ struct PACK : Sequence<PACK, I<OPCODE_PACK, V128Op, V128Op, V128Op>> {
     e.fmov(DReg(0), e.x0);
     e.mov(e.x0, 0x4040000040380001ull);
     e.ins(VReg(0).d2[1], e.x0);
-    e.fmaxnm(VReg(d).s4, VReg(s).s4, VReg(0).s4);
+    EmitQuietSnan(e, d, s);
+    e.fmaxnm(VReg(d).s4, VReg(d).s4, VReg(0).s4);
 
     e.mov(e.x0, 0x4047FFFF4047FFFFull);
     e.fmov(DReg(0), e.x0);
@@ -1893,11 +1941,10 @@ struct LVL_V128 : Sequence<LVL_V128, I<OPCODE_LVL, V128Op, I64Op>> {
     // Inline LVL using TBL.  The bswap-within-lanes base pattern plus the
     // address offset gives a TBL control vector.  Indices >= 16 naturally
     // produce zero from TBL, which is the correct LVL behaviour.
-    auto addr = ComputeMemoryAddress(e, i.src1);
     int d = i.dest.reg().getIdx();
 
-    // x0 = host address
-    e.add(e.x0, e.GetMembaseReg(), addr);
+    // x0 = host address. The aligned block never leaves the address's page.
+    ComputeGuestHostAddress(e, e.x0, i.src1, 1, false);
     // w17 = offset within 16-byte block
     e.and_(e.w17, e.w0, 0xF);
     // Align address down to 16-byte boundary and load.
@@ -1924,13 +1971,12 @@ struct LVR_V128 : Sequence<LVR_V128, I<OPCODE_LVR, V128Op, I64Op>> {
     // Indices 0-15 read zeros (from v0), 16-31 read mem (from v1).
     // base + offset produces indices > 15 exactly where LVR should output
     // the memory bytes, and <= 15 where it should output zero.
-    auto addr = ComputeMemoryAddress(e, i.src1);
     int d = i.dest.reg().getIdx();
     // Unqualified Label here is hir::Label.
     Xbyak_aarch64::Label endpoint;
 
-    // x0 = host address
-    e.add(e.x0, e.GetMembaseReg(), addr);
+    // x0 = host address. The aligned block never leaves the address's page.
+    ComputeGuestHostAddress(e, e.x0, i.src1, 1, false);
     // w17 = offset
     e.and_(e.w17, e.w0, 0xF);
     // An aligned address reads nothing, and it can sit one past a valid page.
@@ -1964,13 +2010,14 @@ static void EmitPartialVectorStore(A64Emitter& e,
   // Unqualified Label here is hir::Label.
   Xbyak_aarch64::Label from8, from4, from2, from1, done;
 
+  // Every label below is bound within this helper, so the near forms are safe.
   e.cmp(count, 8);
-  e.b(Xbyak_aarch64::HS, from8);
+  e.b_near(Xbyak_aarch64::HS, from8);
   e.cmp(count, 4);
-  e.b(Xbyak_aarch64::HS, from4);
+  e.b_near(Xbyak_aarch64::HS, from4);
   e.cmp(count, 2);
-  e.b(Xbyak_aarch64::HS, from2);
-  e.cbnz(count, from1);
+  e.b_near(Xbyak_aarch64::HS, from2);
+  e.cbnz_near(count, from1);
   e.b(done);
 
   e.L(from8);
@@ -2019,8 +2066,7 @@ struct STVL_V128 : Sequence<STVL_V128, I<OPCODE_STVL, VoidOp, I64Op, V128Op>> {
     e.str(QReg(0),
           ptr(e.sp, static_cast<uint32_t>(StackLayout::GUEST_SCRATCH)));
 
-    auto addr = ComputeMemoryAddress(e, i.src1);
-    e.add(e.x0, e.GetMembaseReg(), addr);
+    ComputeGuestHostAddress(e, e.x0, i.src1, 1, true);
     e.and_(e.w2, e.w0, 0xF);
     e.mov(e.w1, 16);
     e.sub(e.w2, e.w1, e.w2);
@@ -2044,8 +2090,7 @@ struct STVR_V128 : Sequence<STVR_V128, I<OPCODE_STVR, VoidOp, I64Op, V128Op>> {
     e.str(QReg(0),
           ptr(e.sp, static_cast<uint32_t>(StackLayout::GUEST_SCRATCH)));
 
-    auto addr = ComputeMemoryAddress(e, i.src1);
-    e.add(e.x0, e.GetMembaseReg(), addr);
+    ComputeGuestHostAddress(e, e.x0, i.src1, 1, true);
     e.and_(e.w2, e.w0, 0xF);
     e.and_(e.x0, e.x0, ~0xFull);
     e.add(e.x1, e.sp, static_cast<uint32_t>(StackLayout::GUEST_SCRATCH) + 16);

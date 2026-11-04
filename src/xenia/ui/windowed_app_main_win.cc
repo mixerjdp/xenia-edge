@@ -11,8 +11,11 @@
 
 #include <wx/wx.h>
 
+#include "xenia/base/logging.h"
 #include "xenia/base/platform_win.h"
-#include "xenia/kernel/kernel_state.cc"
+#include "xenia/emulator.h"
+#include "xenia/kernel/kernel_state.h"
+#include "xenia/kernel/util/shim_utils.h"
 #include "xenia/ui/windowed_app_wx.h"
 
 #include "version.h"
@@ -278,6 +281,14 @@ static ExceptionInfoCategoryHandler host_exception_category_handlers[] = {
     exception_ntstatus_error_handle, exception_cerror_handle,
     thread_name_handle};
 
+// The message box can open behind other windows and goes with the process, so
+// the report goes in the log too. Outside the filter, as __try can't share a
+// function with objects that unwind.
+static void LogHostExceptionReport(const char* report) {
+  XELOGE("Unhandled exception in Xenia:\n{}", report);
+  xe::FlushLog();
+}
+
 LONG _UnhandledExceptionFilter(_EXCEPTION_POINTERS* ExceptionInfo) {
   HostExceptionReport report{ExceptionInfo};
   for (auto&& handler : host_exception_category_handlers) {
@@ -287,6 +298,12 @@ LONG _UnhandledExceptionFilter(_EXCEPTION_POINTERS* ExceptionInfo) {
       }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
       report.AddString("<Nested Exception Encountered>\n");
+    }
+  }
+  if (!xe::IsLogWriterThread()) {
+    __try {
+      LogHostExceptionReport(report.Report_Scratchbuffer);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
     }
   }
   report.DisplayExceptionMessage();

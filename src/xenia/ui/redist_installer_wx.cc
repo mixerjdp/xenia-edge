@@ -16,7 +16,6 @@
 
 #include <cstdint>
 #include <cstring>
-#include <fstream>
 #include <memory>
 #include <string>
 #include <vector>
@@ -475,16 +474,6 @@ bool VerifyMicrosoftSignature(const std::wstring& path) {
   return is_microsoft;
 }
 
-bool WriteFileBytes(const std::filesystem::path& path, const void* data,
-                    size_t size) {
-  std::ofstream file(path, std::ios::binary | std::ios::trunc);
-  if (!file) {
-    return false;
-  }
-  file.write(static_cast<const char*>(data), std::streamsize(size));
-  return bool(file);
-}
-
 bool ExtractEntries(const std::vector<uint8_t>& zip_data,
                     const RedistEntry* entries, size_t entry_count,
                     const std::filesystem::path& out_dir) {
@@ -516,11 +505,11 @@ bool ExtractEntries(const std::vector<uint8_t>& zip_data,
       if (!wanted[i] || name != entries[i].zip_path) {
         continue;
       }
-      std::vector<char> buffer(static_cast<size_t>(entry->GetSize()));
+      std::vector<uint8_t> buffer(static_cast<size_t>(entry->GetSize()));
       zip.Read(buffer.data(), buffer.size());
       auto dest_path = out_dir / entries[i].dest_name;
       if (static_cast<size_t>(zip.LastRead()) != buffer.size() ||
-          !WriteFileBytes(dest_path, buffer.data(), buffer.size())) {
+          !xe::filesystem::WriteAllBytes(dest_path, buffer)) {
         XELOGE("DLL install: failed to extract {}", entries[i].zip_path);
         return false;
       }
@@ -545,7 +534,10 @@ void RelaunchAndExit() {
   if (length == 0 || length >= xe::countof(exe_path)) {
     return;
   }
+  // Continues this session's log rather than truncating it.
   std::wstring command_line = GetCommandLineW();
+  command_line += L" --log_append=true";
+  xe::FlushLog();
   STARTUPINFOW startup_info = {};
   startup_info.cb = sizeof(startup_info);
   PROCESS_INFORMATION process_info = {};
@@ -616,7 +608,8 @@ bool EnsureShaderCompilerRuntime(const std::filesystem::path& d3d12_dir) {
     return false;
   }
 
-  XELOGI("DXIL validator installed to {}", xe::path_to_utf8(d3d12_dir));
+  XELOGI("DXIL validator installed to {}",
+         xe::strip_pii(xe::path_to_utf8(d3d12_dir)));
   return true;
 }
 
@@ -658,7 +651,7 @@ bool EnsureAgilityRuntime(const std::filesystem::path& d3d12_dir) {
   }
 
   XELOGI("DirectX 12 Agility SDK runtime installed to {}; restarting",
-         xe::path_to_utf8(d3d12_dir));
+         xe::strip_pii(xe::path_to_utf8(d3d12_dir)));
   RelaunchAndExit();
   // Only reached if the relaunch couldn't be started.
   ShowError(
@@ -705,7 +698,7 @@ bool EnsureDebugLayer(const std::filesystem::path& d3d12_dir) {
   }
 
   XELOGI("DirectX 12 debug layer installed to {}; restarting",
-         xe::path_to_utf8(d3d12_dir));
+         xe::strip_pii(xe::path_to_utf8(d3d12_dir)));
   RelaunchAndExit();
   // Only reached if the relaunch couldn't be started.
   ShowError(
@@ -750,7 +743,8 @@ bool EnsureVulkanLoader(const std::filesystem::path& vulkan_dir) {
     return false;
   }
 
-  XELOGI("Vulkan loader installed to {}", xe::path_to_utf8(vulkan_dir));
+  XELOGI("Vulkan loader installed to {}",
+         xe::strip_pii(xe::path_to_utf8(vulkan_dir)));
   return true;
 }
 #endif
@@ -808,7 +802,7 @@ bool EnsureVCRuntime() {
   }
   std::filesystem::path installer_path =
       std::filesystem::path(temp_dir) / L"xenia_vc_redist.exe";
-  if (!WriteFileBytes(installer_path, installer.data(), installer.size())) {
+  if (!xe::filesystem::WriteAllBytes(installer_path, installer)) {
     ShowError(_("Failed to install the downloaded files."));
     return false;
   }

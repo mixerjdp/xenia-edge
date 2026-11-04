@@ -48,6 +48,8 @@ class UserModule : public XModule {
     kModuleFormatElf,
   };
 
+  ModuleFormat module_format() const { return module_format_; }
+
   const xe::cpu::XexModule* xex_module() const {
     assert_true(module_format_ == kModuleFormatXex);
     return reinterpret_cast<xe::cpu::XexModule*>(processor_module_);
@@ -124,6 +126,7 @@ class UserModule : public XModule {
 
  private:
   void CalculateHash();
+  void DumpImage();
 
   std::string name_;
   std::string path_;

@@ -14,6 +14,7 @@
 #include "xenia/kernel/user_module.h"
 #include "xenia/kernel/xboxkrnl/cert_monitor.h"
 #include "xenia/kernel/xboxkrnl/debug_monitor.h"
+#include "xenia/kernel/xboxkrnl/xboxkrnl_memory.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_private.h"
 
 DEFINE_string(cl, "", "Specify additional command-line provided to guest.",
@@ -258,7 +259,11 @@ void XboxkrnlModule::RegisterExportTable(
   export_resolver->RegisterTable("xboxkrnl.exe", &xboxkrnl_exports);
 }
 
-XboxkrnlModule::~XboxkrnlModule() = default;
+XboxkrnlModule::~XboxkrnlModule() { xeMmForgetSegmentArrays(); }
+
+XboxkrnlModule* GetXboxkrnlModule() {
+  return kernel_state()->GetKernelModule<XboxkrnlModule>("xboxkrnl.exe").get();
+}
 
 }  // namespace xboxkrnl
 }  // namespace kernel

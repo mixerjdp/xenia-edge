@@ -50,8 +50,7 @@ inline void EmitWithFpcrMode(A64Emitter& e, FPCRMode mode, Fn&& emit_op) {
   // Enter the requested FPCR mode using tracked lazy switching.  If the
   // emitter is already in that mode (e.g. consecutive VMX ops in the same
   // basic block) this is a no-op — no system register access at all.
-  // FPU mode is restored at block boundaries and calls via ForgetFpcrMode,
-  // or on demand by scalar FP sequences via ChangeFpcrMode(Fpu).
+  // FPU mode is re-established at transitions and by scalar FP sequences.
   e.ChangeFpcrMode(mode);
   emit_op();
 }
@@ -298,14 +297,31 @@ inline int SrcVReg(A64Emitter& e, const T& op, int scratch_idx) {
   return op.reg().getIdx();
 }
 
+inline bool NeedsPhysicalRemap() {
+  return xe::memory::allocation_granularity() > 0x1000;
+}
+
+// w0 = src, plus 0x1000 when src >= 0xE0000000. The bound is not an
+// immediate operand, so it is kept in w7 until the emitter drops it.
+inline void ApplyPhysicalRemapW0(A64Emitter& e,
+                                 const Xbyak_aarch64::WReg& src) {
+  using namespace Xbyak_aarch64;
+  if (!e.physical_remap_bound_valid()) {
+    e.mov(e.w7, uint64_t(0xE0000000u));
+    e.set_physical_remap_bound_valid();
+  }
+  e.cmp(src, e.w7);
+  e.add(e.w17, src, 1, 12);  // + 0x1000 via LSL #12
+  e.csel(e.w0, e.w17, src, HS);
+}
+
 // Compute a guest memory address, returning the XReg for [x21, xN] addressing.
 // For constants, loads the address into x0 (scratch).
 inline XReg ComputeMemoryAddress(A64Emitter& e, const I64Op& guest) {
   using namespace Xbyak_aarch64;
   if (guest.is_constant) {
     uint32_t address = static_cast<uint32_t>(guest.constant());
-    if (address >= 0xE0000000 &&
-        xe::memory::allocation_granularity() > 0x1000) {
+    if (address >= 0xE0000000 && NeedsPhysicalRemap()) {
       address += 0x1000;
     }
     e.mov(e.x0, static_cast<uint64_t>(address));
@@ -314,47 +330,226 @@ inline XReg ComputeMemoryAddress(A64Emitter& e, const I64Op& guest) {
     auto src = guest.reg();
     // Guest addresses are always 32-bit. Clear any stale upper bits before
     // applying the host membase so guest pointers can't escape above 4 GB.
-    e.mov(e.w0, WReg(src.getIdx()));
-    if (xe::memory::allocation_granularity() > 0x1000) {
-      // Branch-free: w17 = w0 + 0x1000, kept only when w0 >= 0xE0000000.
-      e.mov(e.w17, 0xE0000000u);
-      e.cmp(e.w0, e.w17);
-      e.add(e.w17, e.w0, 1, 12);  // w17 = w0 + 0x1000 via LSL #12
-      e.csel(e.w0, e.w0, e.w17, LO);
+    // The remap writes w0 itself, which is the same truncation.
+    int mask_src_reg;
+    uint32_t mask;
+    if (e.ConsumeFusedAddressMask(src.getIdx(), &mask_src_reg, &mask)) {
+      // The producing AND emitted nothing; its mask and this truncation are
+      // the same W-form instruction.
+      e.and_(e.w0, WReg(mask_src_reg), static_cast<uint64_t>(mask));
+      ApplyPhysicalRemapW0(e, e.w0);
+    } else if (NeedsPhysicalRemap()) {
+      ApplyPhysicalRemapW0(e, WReg(src.getIdx()));
+    } else {
+      e.mov(e.w0, WReg(src.getIdx()));
     }
     return e.x0;
   }
 }
 
+inline bool GuestMemDirectIndex(const I64Op& guest, int* out_w_idx) {
+  if (guest.is_constant || NeedsPhysicalRemap()) {
+    return false;
+  }
+  *out_w_idx = guest.reg().getIdx();
+  return true;
+}
+
+// The 32-bit guest address: the guest register itself, or w0. A fused mask is
+// applied here and returned in |out_mask|, else all ones.
+inline WReg GuestAddressW(A64Emitter& e, const I64Op& guest,
+                          uint32_t* out_mask) {
+  *out_mask = UINT32_MAX;
+  if (guest.is_constant) {
+    e.mov(e.w0, static_cast<uint64_t>(static_cast<uint32_t>(guest.constant())));
+    return e.w0;
+  }
+  int mask_src_reg;
+  if (e.ConsumeFusedAddressMask(guest.reg().getIdx(), &mask_src_reg,
+                                out_mask)) {
+    e.and_(e.w0, WReg(mask_src_reg), static_cast<uint64_t>(*out_mask));
+    return e.w0;
+  }
+  return WReg(guest.reg().getIdx());
+}
+
+// Loads the table entry for |address|'s 4 KB page into x16, so x16 plus
+// |address| zero-extended is the host address. An access of |size| bytes that
+// reaches the next page uses the membase instead, from the tail, and a |size|
+// of 1 never does. Clobbers w17 and NZCV.
+inline void EmitGuestTlbLookup(A64Emitter& e, const WReg& address,
+                               bool is_write, uint32_t size) {
+  using namespace Xbyak_aarch64;
+  static_assert(offsetof(ppc::PPCContext, tlb_write) < 32768);
+  const size_t table_offset = is_write ? offsetof(ppc::PPCContext, tlb_write)
+                                       : offsetof(ppc::PPCContext, tlb_read);
+  e.ldr(e.x16, ptr(e.GetContextReg(), static_cast<uint32_t>(table_offset)));
+  e.lsr(e.w17, address, 12);
+  e.ldr(e.x16, ptr(e.x16, e.x17, LSL, 3));
+  if (size <= 1) {
+    return;
+  }
+  auto& join = e.NewCachedLabel();
+  const int address_idx = address.getIdx();
+  auto& cross =
+      e.AddToTail([address_idx, &join](A64Emitter& e, Xbyak_aarch64::Label&) {
+        // x16 = membase + remapped address - address, so the remap wraps.
+        const WReg address(address_idx);
+        e.mov(e.w17, uint64_t(0xE0000000u));
+        e.cmp(address, e.w17);
+        e.add(e.w17, address, 1, 12);
+        e.csel(e.w17, e.w17, address, HS);
+        e.add(e.x16, e.GetMembaseReg(), e.x17);
+        e.sub(e.x16, e.x16, address, UXTW);
+        e.b(join);
+      });
+  // Carries out when the page offset plus size - 1 passes 0xFFF.
+  e.orr(e.w17, address, uint64_t(0xFFFFF000u));
+  e.cmn(e.w17, size - 1);
+  e.b(HS, cross);
+  e.LKeepingRemapBound(join);
+}
+
+// The access size that can reach the next page, 1 when none can. A constant
+// address is checked here, a mask that clears the low bits proves alignment.
+inline uint32_t GuestTlbCrossSize(const I64Op& guest, uint32_t mask,
+                                  uint32_t size) {
+  if (guest.is_constant) {
+    const uint32_t offset = static_cast<uint32_t>(guest.constant()) & 0xFFF;
+    return offset + size <= 0x1000 ? 1 : size;
+  }
+  return (mask & (size - 1)) ? size : 1;
+}
+
+// emit_access gets the address of a |size| byte access, which can use x0 and on
+// the TLB path has x16 as its base. emit_access must not write either first.
+template <typename Fn>
+inline void EmitGuestMemAccess(A64Emitter& e, const I64Op& guest, uint32_t size,
+                               bool is_write, Fn&& emit_access) {
+  if (e.guest_tlb()) {
+    uint32_t mask;
+    const WReg address = GuestAddressW(e, guest, &mask);
+    EmitGuestTlbLookup(e, address, is_write,
+                       GuestTlbCrossSize(guest, mask, size));
+    emit_access(ptr(e.x16, address, Xbyak_aarch64::UXTW));
+    return;
+  }
+  int w_idx;
+  if (GuestMemDirectIndex(guest, &w_idx)) {
+    emit_access(ptr(e.GetMembaseReg(), WReg(w_idx), Xbyak_aarch64::UXTW));
+  } else {
+    emit_access(ptr(e.GetMembaseReg(), ComputeMemoryAddress(e, guest)));
+  }
+}
+
+// dst = the host address of a |size| byte access at |guest|.
+inline void ComputeGuestHostAddress(A64Emitter& e, const XReg& dst,
+                                    const I64Op& guest, uint32_t size,
+                                    bool is_write) {
+  if (e.guest_tlb()) {
+    uint32_t mask;
+    const WReg address = GuestAddressW(e, guest, &mask);
+    EmitGuestTlbLookup(e, address, is_write,
+                       GuestTlbCrossSize(guest, mask, size));
+    e.add(dst, e.x16, address, Xbyak_aarch64::UXTW);
+    return;
+  }
+  e.add(dst, e.GetMembaseReg(), ComputeMemoryAddress(e, guest));
+}
+
+// Adds a displacement to a guest address in W registers, so it wraps at 32
+// bits. Returns base unchanged for a zero displacement, else x0.
 template <typename OffsetOp>
 inline XReg AddGuestMemoryOffset(A64Emitter& e, const XReg& base,
                                  const OffsetOp& offset) {
-  // Guest address arithmetic wraps at 32 bits before the host membase is
-  // applied. Keep the add in W registers so stale high bits can't escape into
-  // the final host pointer.
-  e.mov(e.w0, WReg(base.getIdx()));
+  const WReg src = WReg(base.getIdx());
   if (offset.is_constant) {
     const uint32_t imm = static_cast<uint32_t>(offset.constant());
     const uint32_t neg = 0u - imm;
     if (imm == 0) {
-      // Nothing to add.
+      return base;
     } else if (imm <= 0xFFF) {
-      e.add(e.w0, e.w0, imm);
+      e.add(e.w0, src, imm);
     } else if (!(imm & 0xFFF) && (imm >> 12) <= 0xFFF) {
-      e.add(e.w0, e.w0, imm >> 12, 12);
+      e.add(e.w0, src, imm >> 12, 12);
     } else if (neg <= 0xFFF) {
       // Adding a small negative offset wraps identically to subtracting.
-      e.sub(e.w0, e.w0, neg);
+      e.sub(e.w0, src, neg);
     } else if (!(neg & 0xFFF) && (neg >> 12) <= 0xFFF) {
-      e.sub(e.w0, e.w0, neg >> 12, 12);
+      e.sub(e.w0, src, neg >> 12, 12);
     } else {
       e.mov(e.w17, static_cast<uint64_t>(imm));
-      e.add(e.w0, e.w0, e.w17);
+      e.add(e.w0, src, e.w17);
     }
   } else {
-    e.add(e.w0, e.w0, WReg(offset.reg().getIdx()));
+    e.add(e.w0, src, WReg(offset.reg().getIdx()));
   }
   return e.x0;
+}
+
+// The remap is decided on the effective address, not the base, as on x64.
+template <typename OffsetOp>
+inline XReg ComputeMemoryAddressOffset(A64Emitter& e, const I64Op& guest,
+                                       const OffsetOp& offset) {
+  using namespace Xbyak_aarch64;
+  if (guest.is_constant && offset.is_constant) {
+    uint32_t address = static_cast<uint32_t>(guest.constant()) +
+                       static_cast<uint32_t>(offset.constant());
+    if (address >= 0xE0000000 && NeedsPhysicalRemap()) {
+      address += 0x1000;
+    }
+    e.mov(e.x0, static_cast<uint64_t>(address));
+    return e.x0;
+  }
+  XReg address = e.x0;
+  if (guest.is_constant) {
+    e.mov(e.w0, static_cast<uint64_t>(static_cast<uint32_t>(guest.constant())));
+    address = AddGuestMemoryOffset(e, e.x0, offset);
+  } else {
+    address = AddGuestMemoryOffset(e, guest.reg(), offset);
+  }
+  if (NeedsPhysicalRemap()) {
+    ApplyPhysicalRemapW0(e, WReg(address.getIdx()));
+  } else if (address.getIdx() != e.x0.getIdx()) {
+    e.mov(e.w0, WReg(address.getIdx()));
+  }
+  return e.x0;
+}
+
+// Guest addresses wrap at 32 bits: a nonzero displacement is added in W first.
+template <typename OffsetOp, typename Fn>
+inline void EmitGuestMemAccessOffset(A64Emitter& e, const I64Op& guest,
+                                     const OffsetOp& offset, uint32_t size,
+                                     bool is_write, Fn&& emit_access) {
+  if (e.guest_tlb()) {
+    WReg address = e.w0;
+    uint32_t cross_size = size;
+    if (guest.is_constant && offset.is_constant) {
+      const uint32_t constant = static_cast<uint32_t>(guest.constant()) +
+                                static_cast<uint32_t>(offset.constant());
+      e.mov(e.w0, static_cast<uint64_t>(constant));
+      if ((constant & 0xFFF) + size <= 0x1000) {
+        cross_size = 1;
+      }
+    } else if (guest.is_constant) {
+      e.mov(e.w0,
+            static_cast<uint64_t>(static_cast<uint32_t>(guest.constant())));
+      AddGuestMemoryOffset(e, e.x0, offset);
+    } else {
+      address = WReg(AddGuestMemoryOffset(e, guest.reg(), offset).getIdx());
+    }
+    EmitGuestTlbLookup(e, address, is_write, cross_size);
+    emit_access(ptr(e.x16, address, Xbyak_aarch64::UXTW));
+    return;
+  }
+  int w_idx;
+  if (offset.is_constant && offset.constant() == 0 &&
+      GuestMemDirectIndex(guest, &w_idx)) {
+    emit_access(ptr(e.GetMembaseReg(), WReg(w_idx), Xbyak_aarch64::UXTW));
+  } else {
+    emit_access(
+        ptr(e.GetMembaseReg(), ComputeMemoryAddressOffset(e, guest, offset)));
+  }
 }
 
 // Flush denormal float32 lanes to zero in a NEON register (in-place).
@@ -362,23 +557,36 @@ inline XReg AddGuestMemoryOffset(A64Emitter& e, const XReg& base,
 // vreg must not equal sa or sb.
 // This is needed because FPCR.FZ may not flush denormal inputs on all ARM64
 // implementations (the ARM spec says input flushing is implementation-defined).
+inline void LoadDenormalThreshold_V128(A64Emitter& e, int k) {
+  e.movi(VReg(k).s4, 0x1, LSL, 24);
+}
+
+// Flushes with the threshold already in k. vreg must equal neither k nor t.
+inline void FlushDenormalsWithK_V128(A64Emitter& e, int vreg, int k, int t) {
+  e.shl(VReg(t).s4, VReg(vreg).s4, 1);
+  e.cmhi(VReg(t).s4, VReg(k).s4,
+         VReg(t).s4);                 // mask: all-1s for denormal-or-zero lanes
+  e.ushr(VReg(t).s4, VReg(t).s4, 1);  // clear bit 31: preserve the sign
+  e.bic(VReg(vreg).b16, VReg(vreg).b16, VReg(t).b16);
+}
+
+// Hardware flushes vector denormals only with VSCR.NJ set, so the software
+// flushes are skipped at run time when it is clear. w17 is free in every
+// vector FP sequence.
+inline void EmitSkipFlushUnlessNJM(A64Emitter& e, Xbyak_aarch64::Label& skip) {
+  e.ldr(e.w17, Xbyak_aarch64::ptr(e.x19, static_cast<uint32_t>(offsetof(
+                                             A64BackendContext, flags))));
+  e.tbz(e.w17, kA64BackendNJMOn, skip);
+}
+
+// vreg must not equal sa or sb.
 inline void FlushDenormals_V128(A64Emitter& e, int vreg, int sa = 2,
                                 int sb = 3) {
-  // val<<1 removes the sign bit and doubles the value.
-  // Denormals become [0x00000002, 0x00FFFFFE]; zeros become 0x00000000.
-  // (val<<1) - 1: wraps 0→0xFFFFFFFF (excluded),
-  // denorms→[0x00000001,0x00FFFFFD]. Denormal iff ((val<<1) - 1) < 0x00FFFFFF
-  // (unsigned).
-  e.shl(VReg(sa).s4, VReg(vreg).s4, 1);
-  e.movi(VReg(sb).s4, 1u);
-  e.sub(VReg(sa).s4, VReg(sa).s4, VReg(sb).s4);
-  e.mvni(VReg(sb).s4, 0xFFu, LSL, 24);  // 0x00FFFFFF
-  e.cmhi(VReg(sb).s4, VReg(sb).s4,
-         VReg(sa).s4);  // mask: all-1s for denormal lanes
-  // Clear only bits 30:0 (preserve sign bit 31) so -denormal → -0, +denormal →
-  // +0.
-  e.ushr(VReg(sa).s4, VReg(sb).s4, 1);  // sa = mask with bit 31 cleared
-  e.bic(VReg(vreg).b16, VReg(vreg).b16, VReg(sa).b16);
+  Xbyak_aarch64::Label no_flush;
+  EmitSkipFlushUnlessNJM(e, no_flush);
+  LoadDenormalThreshold_V128(e, sa);
+  FlushDenormalsWithK_V128(e, vreg, sa, sb);
+  e.L(no_flush);
 }
 
 // Fixup for vmaxfp/vminfp NaN lanes.
@@ -417,8 +625,12 @@ inline void PrepareVmxFpSources(A64Emitter& e, const T1& op1, const T2& op2,
   }
   // Flush denormal inputs in software only if FPCR.FZ doesn't handle it.
   if (!e.IsFeatureEnabled(xe::arm64::kA64FZFlushesInputs)) {
-    FlushDenormals_V128(e, 0);
-    FlushDenormals_V128(e, 1);
+    Xbyak_aarch64::Label no_flush;
+    EmitSkipFlushUnlessNJM(e, no_flush);
+    LoadDenormalThreshold_V128(e, 2);
+    FlushDenormalsWithK_V128(e, 0, 2, 3);
+    FlushDenormalsWithK_V128(e, 1, 2, 3);
+    e.L(no_flush);
   }
   out_s1 = 0;
   out_s2 = 1;
@@ -448,57 +660,86 @@ inline void FixupVmxNan_V128(A64Emitter& e) {
   e.orr(VReg(2).b16, VReg(2).b16, VReg(1).b16);
 }
 
-// Load an FMA's three sources into the registers FixupVmxNan_V128_Fma reads:
-// v0 = src1 (A), v1 = src2 (C), v3 = src3 (B), flushing input denormals in
-// software where FPCR.FZ does not. Uses v2 and `tmp` as flush scratch.
+// Loads an FMA's three sources for FixupVmxNan_V128_Fma and writes the
+// registers now holding A, C and B. Where FPCR.FZ flushes inputs the
+// allocated registers are used directly; otherwise they are copied to v0, v1
+// and v3 and flushed in software, using v2 and `tmp` as scratch.
 template <typename T1, typename T2, typename T3>
 inline void PrepareVmxFmaSources(A64Emitter& e, const T1& op1, const T2& op2,
-                                 const T3& op3, int tmp) {
+                                 const T3& op3, int tmp, int* out_a, int* out_c,
+                                 int* out_b) {
   const int s1 = SrcVReg(e, op1, 0);
+  const int s2 = SrcVReg(e, op2, 1);
+  const int s3 = SrcVReg(e, op3, 3);
+  if (e.IsFeatureEnabled(xe::arm64::kA64FZFlushesInputs)) {
+    *out_a = s1;
+    *out_c = s2;
+    *out_b = s3;
+    return;
+  }
   if (s1 != 0) {
     e.mov(VReg(0).b16, VReg(s1).b16);
   }
-  const int s2 = SrcVReg(e, op2, 1);
   if (s2 != 1) {
     e.mov(VReg(1).b16, VReg(s2).b16);
   }
-  const int s3 = SrcVReg(e, op3, 3);
   if (s3 != 3) {
     e.mov(VReg(3).b16, VReg(s3).b16);
   }
-  if (!e.IsFeatureEnabled(xe::arm64::kA64FZFlushesInputs)) {
-    FlushDenormals_V128(e, 0, 2, tmp);
-    FlushDenormals_V128(e, 1, 2, tmp);
-    FlushDenormals_V128(e, 3, 2, tmp);
+  // accurate_vmx_denormal_flush pins the input flush on; the output flush
+  // stays NJ-gated, which is harmless since VmxDaz flushes outputs.
+  Xbyak_aarch64::Label no_flush;
+  const bool gate_on_njm = !cvars::accurate_vmx_denormal_flush;
+  if (gate_on_njm) {
+    EmitSkipFlushUnlessNJM(e, no_flush);
   }
+  LoadDenormalThreshold_V128(e, 2);
+  FlushDenormalsWithK_V128(e, 0, 2, tmp);
+  FlushDenormalsWithK_V128(e, 1, 2, tmp);
+  FlushDenormalsWithK_V128(e, 3, 2, tmp);
+  if (gate_on_njm) {
+    e.L(no_flush);
+  }
+  *out_a = 0;
+  *out_c = 1;
+  *out_b = 3;
 }
 
 // Fix PPC NaN propagation for a V128 FMA result (3 source operands).
 // Hardware returns the first NaN in A, B, C order, quieted, and the HIR
 // operands are (A, C, B). An invalid operation with no NaN operand needs
 // nothing: ARM's default NaN is already the one PPC produces.
-// Expects: v0 = flushed A, v1 = flushed C, v3 = flushed B, v2 = the FMA result.
-// `tmp` must be a register free until the result is stored, which v0-v3 cannot
-// supply. Modifies v2 in place. Clobbers v1 and tmp.
-inline void FixupVmxNan_V128_Fma(A64Emitter& e, int tmp) {
+// Expects v2 = the FMA result and a, c, b holding the (flushed) sources.
+// A four-instruction test of the result skips the fixup unless some lane is
+// NaN. tmp must differ from a, c, b, v2 and every live allocated register; qs
+// is written only after the sources die. Modifies v2 in place.
+inline void FixupVmxNan_V128_Fma(A64Emitter& e, int a, int c, int b, int tmp,
+                                 int qs) {
   using namespace Xbyak_aarch64;
-  // Lowest priority first, so an earlier operand overwrites a later one: C,
-  // then B, then A. BIF inserts an operand wherever its self-compare is false,
-  // which is exactly where that operand is NaN.
-  e.fcmeq(VReg(tmp).s4, VReg(1).s4, VReg(1).s4);
-  e.bif(VReg(2).b16, VReg(1).b16, VReg(tmp).b16);
-  e.fcmeq(VReg(tmp).s4, VReg(3).s4, VReg(3).s4);
-  e.bif(VReg(2).b16, VReg(3).b16, VReg(tmp).b16);
-  e.fcmeq(VReg(tmp).s4, VReg(0).s4, VReg(0).s4);
-  e.bif(VReg(2).b16, VReg(0).b16, VReg(tmp).b16);
+  auto& done = e.NewCachedLabel();
+  e.fcmeq(VReg(tmp).s4, VReg(2).s4, VReg(2).s4);  // all-ones where not NaN
+  e.uminv(SReg(tmp), VReg(tmp).s4);               // 0 iff any lane is NaN
+  e.fmov(WReg(0), SReg(tmp));
+  e.cbnz_near(WReg(0), done);
+
+  // Lowest priority first (C, B, A) so an earlier operand overwrites. BIF
+  // inserts an operand wherever its self-compare is false, which is exactly
+  // where it is NaN.
+  e.fcmeq(VReg(tmp).s4, VReg(c).s4, VReg(c).s4);
+  e.bif(VReg(2).b16, VReg(c).b16, VReg(tmp).b16);
+  e.fcmeq(VReg(tmp).s4, VReg(b).s4, VReg(b).s4);
+  e.bif(VReg(2).b16, VReg(b).b16, VReg(tmp).b16);
+  e.fcmeq(VReg(tmp).s4, VReg(a).s4, VReg(a).s4);
+  e.bif(VReg(2).b16, VReg(a).b16, VReg(tmp).b16);
 
   // Quiet whatever NaN each lane ended up with. A lane still holding the
   // arithmetic result is either not NaN or already the default NaN, so this
   // only ever quiets an operand that was signalling.
   e.fcmeq(VReg(tmp).s4, VReg(2).s4, VReg(2).s4);
-  e.movi(VReg(1).s4, 0x40, LSL, 16);
-  e.bic(VReg(1).b16, VReg(1).b16, VReg(tmp).b16);
-  e.orr(VReg(2).b16, VReg(2).b16, VReg(1).b16);
+  e.movi(VReg(qs).s4, 0x40, LSL, 16);
+  e.bic(VReg(qs).b16, VReg(qs).b16, VReg(tmp).b16);
+  e.orr(VReg(2).b16, VReg(2).b16, VReg(qs).b16);
+  e.L(done);
 }
 
 // VMX float32x4 binary operations with full PPC semantics.

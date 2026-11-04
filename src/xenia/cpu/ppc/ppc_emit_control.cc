@@ -10,6 +10,7 @@
 #include "xenia/cpu/ppc/ppc_emit-private.h"
 
 #include "xenia/base/assert.h"
+#include "xenia/base/logging.h"
 #include "xenia/cpu/cpu_flags.h"
 #include "xenia/cpu/ppc/ppc_context.h"
 #include "xenia/cpu/ppc/ppc_frontend.h"
@@ -66,7 +67,12 @@ int InstrEmit_branch(PPCHIRBuilder& f, const char* src, uint64_t cia,
     if (nia_value == f.function()->address() && lk) {
       is_recursion = true;
     }
-    Label* label = is_recursion ? NULL : f.LookupLabel(nia_value);
+    // Dynamic code makes a bl into its own body a call too. XeFu calls an x86
+    // CALL's stub that way and returns past the bl from elsewhere, which only
+    // finds the frame to return into when the bl made one.
+    Label* label = is_recursion || (lk && f.dynamic_code())
+                       ? NULL
+                       : f.LookupLabel(nia_value);
     if (label) {
       // Branch to label.
       uint32_t branch_flags = 0;
@@ -82,10 +88,21 @@ int InstrEmit_branch(PPCHIRBuilder& f, const char* src, uint64_t cia,
     } else {
       // Call function.
       auto function = f.LookupFunction(nia_value);
-      if (cond) {
-        if (!expect_true) {
-          cond = f.IsFalse(cond);
+      if (cond && !expect_true) {
+        cond = f.IsFalse(cond);
+      }
+      if (!function) {
+        // No loaded module owns the target. Resolve it at the call site like
+        // a computed branch instead of handing the backend a null symbol.
+        XELOGE("Unresolved direct call target {:08X} from {:08X}", nia_value,
+               static_cast<uint32_t>(cia));
+        Value* target = f.LoadConstantUint64(nia_value);
+        if (cond) {
+          f.CallIndirectTrue(cond, target, call_flags);
+        } else {
+          f.CallIndirect(target, call_flags);
         }
+      } else if (cond) {
         f.CallTrue(cond, function, call_flags);
       } else {
         f.Call(function, call_flags);

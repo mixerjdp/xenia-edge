@@ -53,9 +53,7 @@ bool MetalDxilBinder::GatherStage(const SpirvShader* shader,
                                   StageRange& range_out) {
   range_out.texture_start = uint32_t(texture_heap_entries_.size());
   range_out.sampler_start = uint32_t(sampler_heap_entries_.size());
-  // bindings_ready() guards against reading a binding list a translation is
-  // still filling in.
-  if (!shader || !shader->bindings_ready()) {
+  if (!shader) {
     return true;
   }
 

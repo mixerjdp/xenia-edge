@@ -72,7 +72,7 @@ if(XENIA_BUILD_MISC)
     xenia-apu xenia-apu-nop xenia-base xenia-core xenia-cpu
     xenia-gpu xenia-gpu-metal xenia-hid xenia-hid-nop xenia-hid-portal
     xenia-kernel xenia-patcher xenia-ui xenia-ui-metal xenia-vfs
-    aes_128 capstone fmt glslang-spirv imgui libavcodec libavutil mspack snappy xxhash
+    capstone fmt glslang-spirv imgui libavcodec libavutil mspack snappy xxhash
   )
   if(XE_TARGET_X86_64)
     target_link_libraries(xenia-gpu-metal-trace-dump PRIVATE xenia-cpu-backend-x64)

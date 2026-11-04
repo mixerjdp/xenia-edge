@@ -11,6 +11,8 @@
 #define XENIA_HID_KEYBOARD_KEYBOARD_INPUT_DRIVER_H_
 
 #include <queue>
+#include <unordered_map>
+#include <unordered_set>
 
 #include "xenia/base/mutex.h"
 #include "xenia/hid/input_driver.h"
@@ -35,6 +37,8 @@ class KeyboardInputDriver final : public InputDriver {
                         X_INPUT_KEYSTROKE* out_keystroke) override;
   virtual InputType GetInputType() const override;
   std::vector<InputDeviceInfo> EnumerateDevices() override;
+  void DiscardKeystrokes() override;
+  void ResetKeystrokes() override;
 
  protected:
   class KeyboardWindowInputListener final : public ui::WindowInputListener,
@@ -57,7 +61,7 @@ class KeyboardInputDriver final : public InputDriver {
     int repeat_count = 0;
     bool transition = false;  // going up(false) or going down(true)
     bool prev_state = false;  // down(true) or up(false)
-    bool is_capital = false;  // shift held at event time
+    bool is_capital = false;  // shift held at the key's press
     bool is_ctrl_pressed = false;
     bool is_alt_pressed = false;
     uint16_t unicode = 0;  // attached from a following OnKeyChar, if any
@@ -83,9 +87,15 @@ class KeyboardInputDriver final : public InputDriver {
 
   std::queue<KeyEvent> key_events_;
   std::vector<KeyBinding> key_bindings_;
+  // Held keys and whether shift was down at their press.
+  std::unordered_map<ui::VirtualKey, bool> keys_down_;
+  // Keys whose press the title received and whose release it hasn't.
+  std::unordered_set<ui::VirtualKey> delivered_;
 
   KeyboardWindowInputListener window_input_listener_;
 
+  xe_mutex state_lock_;
+  X_INPUT_GAMEPAD last_gamepad_ = {};
   uint32_t packet_number_ = 1;
 };
 

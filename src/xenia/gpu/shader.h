@@ -536,9 +536,36 @@ struct ParsedTextureFetchInstruction {
   // is not always zero.
   uint32_t GetNonZeroResultComponents() const;
 
+  // Whether the fetch can return a single texel with no instruction override to
+  // linear/anisotropic filtering.
+  bool AllowsPointSampling(bool use_computed_lod) const {
+    return attributes.mag_filter != xenos::TextureFilter::kLinear &&
+           attributes.min_filter != xenos::TextureFilter::kLinear &&
+           attributes.mip_filter != xenos::TextureFilter::kLinear &&
+           (!use_computed_lod ||
+            attributes.aniso_filter == xenos::AnisoFilter::kDisabled ||
+            attributes.aniso_filter == xenos::AnisoFilter::kUseFetchConst);
+  }
+
+  // Whether a tfetch snaps its coordinates to the texel center instead of
+  // adding kTextureCoordEpsilon. Only point sampled 2D fetches with normalized
+  // coordinates snap. The fetch constant side is bit 26 in GetIntegerScaleBits.
+  // The epsilon is there so host rounding picks the texel guest trunc would,
+  // but near an edge it can push the sample into the next texel. That shows up
+  // as texture seams in 425307EC's virtual texture tables.
+  bool CanSnapToTexelCenter(bool use_computed_lod) const {
+    return opcode == ucode::FetchOpcode::kTextureFetch &&
+           dimension == xenos::FetchOpDimension::k2D &&
+           !attributes.unnormalized_coordinates &&
+           AllowsPointSampling(use_computed_lod);
+  }
+
   // Disassembles the instruction into ucode assembly text.
   void Disassemble(StringBuffer* out) const;
 };
+
+// Fixed point texture coordinate ULP (see ProcessTextureFetchInstruction).
+constexpr float kTextureCoordEpsilon = 1.5f / 1024.0f;
 
 struct ParsedAluInstruction {
   // Opcode for the vector part of the instruction.
@@ -921,6 +948,31 @@ class Shader {
 
   // Labels that jumps (explicit or from loops) can be done to.
   const std::set<uint32_t>& label_addresses() const { return label_addresses_; }
+  // Components of registers 0-15, 4 bits per register, that may be written
+  // after the label in the program and then reach it by jumping back or
+  // returning from a subroutine. Zero for labels only jumped to forward.
+  uint64_t GetRegisterComponentsWrittenBeforeReentering(uint32_t label) const {
+    return label < reentered_label_register_components_written_.size()
+               ? reentered_label_register_components_written_[label]
+               : 0;
+  }
+  // Registers 0-15 used with absolute addressing as coordinates of texture
+  // fetches that may snap to texel centers (see CanSnapToTexelCenter).
+  uint32_t point_fetch_coordinate_registers() const {
+    return point_fetch_coordinate_registers_;
+  }
+  // Whether the result of the vector or the scalar operation of the ALU
+  // instruction at the address may reach a vertex fetch index, the address
+  // register, a memory export or a floor, trunc or frc operand, where rounding
+  // it differently may change the outcome by a whole unit. Vertex shaders only.
+  bool IsAluVectorResultRoundingSensitive(uint32_t address) const {
+    return address < alu_rounding_sensitive_results_.size() &&
+           (alu_rounding_sensitive_results_[address] & 0b01);
+  }
+  bool IsAluScalarResultRoundingSensitive(uint32_t address) const {
+    return address < alu_rounding_sensitive_results_.size() &&
+           (alu_rounding_sensitive_results_[address] & 0b10);
+  }
 
   // Exclusive upper bound of the indexes of paired control flow instructions
   // (each corresponds to 3 dwords).
@@ -1039,6 +1091,11 @@ class Shader {
         expected, new_index, std::memory_order_relaxed);
   }
 
+  // Whether a draw has used this vertex shader, or the storage warm-up builds a
+  // pipeline with it.
+  bool is_drawn() const { return is_drawn_; }
+  void set_drawn() { is_drawn_ = true; }
+
   // Dumps the shader's microcode binary and, if analyzed, disassembly, to files
   // in the given directory based on ucode hash. Returns the name of the written
   // file. Can be called at any time, doesn't require the shader to be
@@ -1077,6 +1134,13 @@ class Shader {
   std::vector<TextureBinding> texture_bindings_;
   ConstantRegisterMap constant_register_map_ = {0};
   std::set<uint32_t> label_addresses_;
+  // Per control flow instruction index.
+  std::vector<uint64_t> cf_register_components_written_;
+  std::vector<uint64_t> reentered_label_register_components_written_;
+  uint32_t point_fetch_coordinate_registers_ = 0;
+  // Per instruction address, bit 0 for the vector and bit 1 for the scalar
+  // operation (see IsAluVectorResultRoundingSensitive).
+  std::vector<uint8_t> alu_rounding_sensitive_results_;
   uint32_t cf_pair_index_bound_ = 0;
   uint32_t register_static_address_bound_ = 0;
   uint32_t writes_interpolators_ = 0;
@@ -1105,25 +1169,32 @@ class Shader {
 
   std::atomic<uint32_t> ucode_storage_index_{UINT32_MAX};
 
+  bool is_drawn_ = false;
+
  private:
   void GatherExecInformation(
       const ParsedExecInstruction& instr,
       ucode::VertexFetchInstruction& previous_vfetch_full,
       uint32_t& unique_texture_bindings, StringBuffer& ucode_disasm_buffer);
   void GatherVertexFetchInformation(
-      const ucode::VertexFetchInstruction& op,
+      const ucode::VertexFetchInstruction& op, uint32_t exec_cf_index,
       ucode::VertexFetchInstruction& previous_vfetch_full,
       StringBuffer& ucode_disasm_buffer);
   void GatherTextureFetchInformation(const ucode::TextureFetchInstruction& op,
+                                     uint32_t exec_cf_index,
                                      uint32_t& unique_texture_bindings,
                                      StringBuffer& ucode_disasm_buffer);
   void GatherAluInstructionInformation(const ucode::AluInstruction& op,
                                        uint32_t exec_cf_index,
                                        StringBuffer& ucode_disasm_buffer);
   void GatherOperandInformation(const InstructionOperand& operand);
-  void GatherFetchResultInformation(const InstructionResult& result);
+  void GatherFetchResultInformation(const InstructionResult& result,
+                                    uint32_t exec_cf_index);
   void GatherAluResultInformation(const InstructionResult& result,
                                   uint32_t exec_cf_index);
+  void GatherRegisterWriteInformation(const InstructionResult& result,
+                                      uint32_t exec_cf_index);
+  void GatherAluRoundingSensitivity();
 };
 
 }  // namespace gpu

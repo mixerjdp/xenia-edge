@@ -11,16 +11,6 @@ msgstr ""
 "Content-Transfer-Encoding: 8bit\n"
 "Plural-Forms: nplurals=2; plural=(n > 1);\n"
 
-#: src/xenia/ui/game_list_panel_wx.cc:596
-msgid ""
-"\n"
-"\n"
-"Browse for the file?"
-msgstr ""
-"\n"
-"\n"
-"می‌خواهید فایل را جستجو کنید؟"
-
 #: src/xenia/ui/game_scan_progress_dialog_wx.cc:55
 msgid "   %zu already installed"
 msgstr "   %zu مورد از قبل نصب‌شده"
@@ -1658,3 +1648,139 @@ msgstr "Xenia تحت %s منتشر می‌شود"
 #: src/xenia/ui/game_info_panel_wx.cc:212
 msgid "Content"
 msgstr "محتوا"
+
+#: src/xenia/app/emulator_window.cc:405
+msgid "Alternate Guitar"
+msgstr "گیتار جایگزین"
+
+#: src/xenia/app/emulator_window.cc:407
+msgid "Bass Guitar"
+msgstr "گیتار باس"
+
+#: src/xenia/app/emulator_window.cc:2027
+msgid ""
+"Original Xbox games run through XeFu, the Xbox 360's backward compatibility emulator, and %s is missing from its folder:\n"
+"\n"
+"%s\n"
+"\n"
+"Copy xbox.xex and the xefu*.xex files there from the Compatibility folder of an Xbox 360 hard drive."
+msgstr ""
+"بازی‌های Xbox اصلی از طریق XeFu، شبیه‌ساز سازگاری با نسخه‌های قبلی Xbox 360، اجرا می‌شوند، اما %s در پوشه آن وجود ندارد:\n"
+"\n"
+"%s\n"
+"\n"
+"فایل xbox.xex و فایل‌های xefu*.xex را از پوشه Compatibility هارد دیسک یک Xbox 360 در این پوشه کپی کنید."
+
+#: src/xenia/app/emulator_window.cc:2034
+msgid "XeFu not found"
+msgstr "XeFu یافت نشد"
+
+#: src/xenia/app/emulator_window.cc:3665
+msgid ""
+"Failed to launch title.\n"
+"\n"
+"Check xenia.log for technical details."
+msgstr ""
+"اجرای بازی ناموفق بود.\n"
+"\n"
+"برای جزئیات فنی، xenia.log را بررسی کنید."
+
+#: src/xenia/app/emulator_window.cc:3664
+msgid "Title Launch Failed!"
+msgstr "اجرای بازی ناموفق بود!"
+
+#: src/xenia/app/emulator_window.cc:2891
+msgid "Data migration"
+msgstr "انتقال داده‌ها"
+
+#: src/xenia/app/emulator_window.cc:2891
+msgid ""
+"Some of your existing data couldn't be migrated to the new profile. Items that failed: %u\n"
+"\n"
+"Check xenia.log for technical details."
+msgstr ""
+"برخی از داده‌های موجود شما به نمایه جدید منتقل نشد. موارد ناموفق: %u\n"
+"\n"
+"برای جزئیات فنی، xenia.log را بررسی کنید."
+
+#: src/xenia/app/emulator_window.cc:2897
+msgid "Your existing data was migrated to the new profile."
+msgstr "داده‌های موجود شما به نمایه جدید منتقل شد."
+
+#: src/xenia/ui/game_list_panel_wx.cc:441
+msgid ""
+"No file path is set for this title.\n"
+"\n"
+"Browse for the file?"
+msgstr ""
+"هیچ مسیر فایلی برای این بازی تنظیم نشده است.\n"
+"\n"
+"می‌خواهید فایل را جستجو کنید؟"
+
+#: src/xenia/ui/game_list_panel_wx.cc:442
+msgid ""
+"File not found:\n"
+"%s\n"
+"\n"
+"Browse for the file?"
+msgstr ""
+"فایل یافت نشد:\n"
+"%s\n"
+"\n"
+"می‌خواهید فایل را جستجو کنید؟"
+
+#: src/xenia/app/emulator_window.cc:2325
+msgid "Failed to read the system update."
+msgstr "خواندن به‌روزرسانی سیستم ناموفق بود."
+
+#: src/xenia/app/emulator_window.cc:2329
+msgid "Failed to write the system files."
+msgstr "نوشتن فایل‌های سیستم ناموفق بود."
+
+#: src/xenia/app/emulator_window.cc:2296
+#: src/xenia/app/emulator_window.cc:2319
+#: src/xenia/app/emulator_window.cc:2324
+#: src/xenia/app/emulator_window.cc:2328
+#: src/xenia/app/emulator_window.cc:2333
+msgid "Install System Files"
+msgstr "نصب فایل‌های سیستم"
+
+#: src/xenia/app/emulator_window.cc:1127
+msgid "Install System Files..."
+msgstr "نصب فایل‌های سیستم…"
+
+#: src/xenia/app/emulator_window.cc:2297
+msgid "Installing the system files..."
+msgstr "در حال نصب فایل‌های سیستم…"
+
+#: src/xenia/app/emulator_window.cc:2282
+msgid "Select a USB System Update"
+msgstr "انتخاب به‌روزرسانی سیستم از طریق USB"
+
+#: src/xenia/app/emulator_window.cc:2310
+msgid "System files installed"
+msgstr "فایل‌های سیستم نصب شدند"
+
+#: src/xenia/app/emulator_window.cc:2335
+msgid ""
+"The previous system files couldn't be put back in place. Move their folders back or delete them to install again. They are in:\n"
+"%s"
+msgstr ""
+"فایل‌های سیستم قبلی به جای خود برگردانده نشدند. برای نصب دوباره، پوشه‌های آن‌ها را به جای قبلی منتقل کنید یا حذفشان کنید. مکان آن‌ها:\n"
+"%s"
+
+#: src/xenia/app/emulator_window.cc:2311
+msgid ""
+"The system files are installed in:\n"
+"%s"
+msgstr ""
+"فایل‌های سیستم در این پوشه نصب شده‌اند:\n"
+"%s"
+
+#: src/xenia/app/emulator_window.cc:2320
+msgid "This file isn't a USB system update."
+msgstr "این فایل به‌روزرسانی سیستم از طریق USB نیست."
+
+#: src/xenia/app/emulator_window.cc:1035
+msgid "Start Dashboard"
+msgstr "اجرای داشبورد"

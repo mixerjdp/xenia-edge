@@ -11,6 +11,8 @@
 
 #if XE_PLATFORM_WIN32
 #include "xenia/base/platform_win.h"
+
+#include <xinput.h>
 #endif  // XE_PLATFORM_WIN32
 
 #include <algorithm>
@@ -40,6 +42,94 @@ UPDATE_from_path(mappings_file, 2026, 5, 21, 12, "gamecontrollerdb.txt");
 namespace xe {
 namespace hid {
 namespace sdl {
+
+#if XE_PLATFORM_WIN32
+namespace {
+struct XInputApi {
+  decltype(&XInputGetCapabilities) get_capabilities = nullptr;
+  // Ordinal 100 (XInputGetStateEx) also reports the guide button.
+  decltype(&XInputGetState) get_state = nullptr;
+
+  XInputApi() {
+    HMODULE module = LoadLibraryW(L"xinput1_4.dll");
+    if (!module) {
+      return;
+    }
+    get_capabilities = reinterpret_cast<decltype(get_capabilities)>(
+        GetProcAddress(module, "XInputGetCapabilities"));
+    get_state = reinterpret_cast<decltype(get_state)>(
+        GetProcAddress(module, MAKEINTRESOURCEA(100)));
+    if (!get_state) {
+      get_state = reinterpret_cast<decltype(get_state)>(
+          GetProcAddress(module, "XInputGetState"));
+    }
+    if (!get_capabilities || !get_state) {
+      get_capabilities = nullptr;
+      get_state = nullptr;
+    }
+  }
+};
+
+const XInputApi& GetXInputApi() {
+  static const XInputApi api;
+  return api;
+}
+}  // namespace
+#endif  // XE_PLATFORM_WIN32
+
+// SDL's XInput backend names the device path "XInput#<user index>".
+static int GetXInputSlot(SDL_Gamepad* gamepad) {
+#if XE_PLATFORM_WIN32
+  if (!GetXInputApi().get_capabilities) {
+    return -1;
+  }
+  constexpr std::string_view kPrefix = "XInput#";
+  const char* path = SDL_GetGamepadPath(gamepad);
+  if (!path || std::string_view(path).substr(0, kPrefix.size()) != kPrefix) {
+    return -1;
+  }
+  const std::string_view index(path + kPrefix.size());
+  if (index.size() != 1 || index[0] < '0' ||
+      index[0] >= '0' + XUSER_MAX_COUNT) {
+    return -1;
+  }
+  return index[0] - '0';
+#else
+  return -1;
+#endif  // XE_PLATFORM_WIN32
+}
+
+static bool PollXInput(int slot, X_INPUT_STATE* out_state) {
+#if XE_PLATFORM_WIN32
+  // XInputGetStateEx writes past XINPUT_STATE.
+  struct {
+    XINPUT_STATE state;
+    DWORD reserved;
+  } native;
+  if (GetXInputApi().get_state(slot, &native.state) != ERROR_SUCCESS) {
+    return false;
+  }
+  out_state->packet_number = native.state.dwPacketNumber;
+  auto& pad = out_state->gamepad;
+  pad.buttons = native.state.Gamepad.wButtons;
+  pad.left_trigger = native.state.Gamepad.bLeftTrigger;
+  pad.right_trigger = native.state.Gamepad.bRightTrigger;
+  pad.thumb_lx = native.state.Gamepad.sThumbLX;
+  pad.thumb_ly = native.state.Gamepad.sThumbLY;
+  pad.thumb_rx = native.state.Gamepad.sThumbRX;
+  pad.thumb_ry = native.state.Gamepad.sThumbRY;
+  return true;
+#else
+  return false;
+#endif  // XE_PLATFORM_WIN32
+}
+
+// SDL_GetGamepadName returns the mapping name, which the bundled DB replaces
+// with generic ones like "XInput Controller".
+static const char* GetDeviceName(SDL_Gamepad* gamepad) {
+  const char* name = SDL_GetJoystickName(SDL_GetGamepadJoystick(gamepad));
+  return name ? name : SDL_GetGamepadName(gamepad);
+}
 
 SDLInputDriver::SDLInputDriver(xe::ui::Window* window, size_t window_z_order)
     : InputDriver(window, window_z_order),
@@ -166,15 +256,17 @@ void SDLInputDriver::LoadGameControllerDB() {
 
   if (!std::filesystem::exists(cvars::mappings_file)) {
     XELOGW("SDL GameControllerDB: file '{}' does not exist.",
-           cvars::mappings_file);
+           xe::strip_pii(xe::path_to_utf8(cvars::mappings_file)));
     return;
   }
 
-  XELOGI("SDL GameControllerDB: Loading {}", cvars::mappings_file);
+  XELOGI("SDL GameControllerDB: Loading {}",
+         xe::strip_pii(xe::path_to_utf8(cvars::mappings_file)));
   // ifstream for Unicode-safe paths.
   std::ifstream stream(cvars::mappings_file, std::ios::binary);
   if (!stream) {
-    XELOGW("SDL GameControllerDB: could not open '{}'.", cvars::mappings_file);
+    XELOGW("SDL GameControllerDB: could not open '{}'.",
+           xe::strip_pii(xe::path_to_utf8(cvars::mappings_file)));
     return;
   }
   std::ostringstream ss;
@@ -240,6 +332,11 @@ X_RESULT SDLInputDriver::GetState(uint32_t user_index,
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
 
+  if (controller->native()) {
+    return PollXInput(controller->xinput_slot, out_state)
+               ? X_ERROR_SUCCESS
+               : X_ERROR_DEVICE_NOT_CONNECTED;
+  }
   if (controller->state_changed) {
     controller->state.packet_number++;
     controller->state_changed = false;
@@ -328,7 +425,10 @@ X_RESULT SDLInputDriver::GetKeystroke(uint32_t users, uint32_t flags,
   for (uint32_t user_index = (user_any ? 0 : users);
        user_index < (user_any ? HID_SDL_USER_COUNT : users + 1); user_index++) {
     auto controller = GetControllerState(user_index);
-    if (!controller) {
+    const bool native = controller && controller->native();
+    X_INPUT_STATE native_state = {};
+    if (!controller ||
+        (native && !PollXInput(controller->xinput_slot, &native_state))) {
       if (user_any) {
         continue;
       } else {
@@ -339,18 +439,22 @@ X_RESULT SDLInputDriver::GetKeystroke(uint32_t users, uint32_t flags,
     // If input is not active (e.g. due to a dialog overlay), force buttons to
     // "unpressed". The algorithm will automatically send UP events when
     // `is_active()` goes low and DOWN events when it goes high again.
-    const uint64_t curr_butts = controller->state.gamepad.buttons |
-                                AnalogToKeyfield(controller->state.gamepad);
+    const X_INPUT_GAMEPAD& gamepad =
+        native ? native_state.gamepad : controller->state.gamepad;
+    const uint64_t curr_butts = gamepad.buttons | AnalogToKeyfield(gamepad);
     KeystrokeState& last = keystroke_states_.at(user_index);
 
     // Handle repeating
     auto guest_now = Clock::QueryGuestUptimeMillis();
     static_assert(HID_SDL_REPEAT_DELAY >= HID_SDL_REPEAT_RATE);
-    if (last.repeat_state == RepeatState::Waiting &&
+    // A button let go while the title wasn't polling gets its up event below
+    // rather than a repeat.
+    const bool repeat_held = (curr_butts >> last.repeat_butt_idx) & 1;
+    if (repeat_held && last.repeat_state == RepeatState::Waiting &&
         (last.repeat_time + HID_SDL_REPEAT_DELAY < guest_now)) {
       last.repeat_state = RepeatState::Repeating;
     }
-    if (last.repeat_state == RepeatState::Repeating &&
+    if (repeat_held && last.repeat_state == RepeatState::Repeating &&
         (last.repeat_time + HID_SDL_REPEAT_RATE < guest_now)) {
       last.repeat_time = guest_now;
       ui::VirtualKey vk = kVkLookup.at(last.repeat_butt_idx);
@@ -605,20 +709,18 @@ void SDLInputDriver::OnControllerDeviceAdded(const SDL_Event& event) {
 
   const SDL_JoystickType joy_type =
       SDL_GetJoystickType(SDL_GetGamepadJoystick(controller));
-  const char* controller_name = SDL_GetGamepadName(controller);
-  const uint8_t xinput_subtype =
-      SdlTypeToXInputSubType(joy_type, controller_name);
+  const char* controller_name = GetDeviceName(controller);
+  const int xinput_slot = GetXInputSlot(controller);
   XELOGI(
       "SDL OnControllerDeviceAdded: \"{}\", "
       "JoystickType({}), "
       "GameControllerType({}), "
-      "XInputSubType({} = 0x{:02X}), "
+      "XInputSlot({}), "
       "VendorID(0x{:04X}), "
       "ProductID(0x{:04X}), "
       "GUID({})",
       controller_name ? controller_name : "?", JoystickTypeName(joy_type),
-      static_cast<uint32_t>(SDL_GetGamepadType(controller)),
-      XInputSubTypeName(xinput_subtype), xinput_subtype,
+      static_cast<uint32_t>(SDL_GetGamepadType(controller)), xinput_slot,
       SDL_GetGamepadVendor(controller), SDL_GetGamepadProduct(controller),
       guid_str);
   // Check if the controller has a player index LED.
@@ -641,11 +743,29 @@ void SDLInputDriver::OnControllerDeviceAdded(const SDL_Event& event) {
   if (user_id >= 0) {
     auto& state = controllers_.at(user_id);
     state = {controller, {}};
+    state.xinput_slot = xinput_slot;
     // XInput seems to start with packet_number = 1 .
     state.state_changed = true;
     UpdateXCapabilities(state);
 
-    XELOGI("SDL OnControllerDeviceAdded: Added at index {}.", user_id);
+    XELOGI(
+        "SDL OnControllerDeviceAdded: Added at index {}, "
+        "XInputSubType({} = 0x{:02X}).",
+        user_id, XInputSubTypeName(state.caps.sub_type), state.caps.sub_type);
+    if (xinput_slot >= 0) {
+      const auto& c = state.native_caps;
+      XELOGI(
+          "SDL Controller {}: XInput caps Type(0x{:02X}) SubType(0x{:02X}) "
+          "Flags(0x{:04X}) Buttons(0x{:04X}) Triggers(0x{:02X}, 0x{:02X}) "
+          "LeftThumb(0x{:04X}, 0x{:04X}) RightThumb(0x{:04X}, 0x{:04X}) "
+          "Vibration(0x{:04X}, 0x{:04X})",
+          user_id, c.type, c.sub_type, uint16_t(c.flags),
+          uint16_t(c.gamepad.buttons), c.gamepad.left_trigger,
+          c.gamepad.right_trigger, uint16_t(c.gamepad.thumb_lx),
+          uint16_t(c.gamepad.thumb_ly), uint16_t(c.gamepad.thumb_rx),
+          uint16_t(c.gamepad.thumb_ry), uint16_t(c.vibration.left_motor_speed),
+          uint16_t(c.vibration.right_motor_speed));
+    }
     XELOGI("SDL Controller {}: {}", user_id, SDL_GetGamepadMapping(controller));
     NotifyDevicesChanged();
   } else {
@@ -660,7 +780,7 @@ void SDLInputDriver::OnControllerDeviceRemoved(const SDL_Event& event) {
   auto idx = GetControllerIndexFromInstanceID(event.gdevice.which);
   if (idx) {
     auto* sdl = controllers_.at(*idx).sdl;
-    const char* name = SDL_GetGamepadName(sdl);
+    const char* name = GetDeviceName(sdl);
     char guid_str[33] = {};
     SDL_GUIDToString(SDL_GetJoystickGUID(SDL_GetGamepadJoystick(sdl)), guid_str,
                      sizeof(guid_str));
@@ -802,6 +922,32 @@ SDLInputDriver::ControllerState* SDLInputDriver::GetControllerState(
 
 void SDLInputDriver::UpdateXCapabilities(ControllerState& state) {
   assert(state.sdl);
+#if XE_PLATFORM_WIN32
+  XINPUT_CAPABILITIES native;
+  if (state.xinput_slot >= 0 &&
+      GetXInputApi().get_capabilities(state.xinput_slot, 0, &native) ==
+          ERROR_SUCCESS) {
+    auto& c = state.native_caps;
+    c.type = native.Type;
+    c.sub_type = native.SubType;
+    c.flags = native.Flags;
+    c.gamepad.buttons = native.Gamepad.wButtons;
+    c.gamepad.left_trigger = native.Gamepad.bLeftTrigger;
+    c.gamepad.right_trigger = native.Gamepad.bRightTrigger;
+    c.gamepad.thumb_lx = native.Gamepad.sThumbLX;
+    c.gamepad.thumb_ly = native.Gamepad.sThumbLY;
+    c.gamepad.thumb_rx = native.Gamepad.sThumbRX;
+    c.gamepad.thumb_ry = native.Gamepad.sThumbRY;
+    c.vibration.left_motor_speed = native.Vibration.wLeftMotorSpeed;
+    c.vibration.right_motor_speed = native.Vibration.wRightMotorSpeed;
+  }
+  // A transient failure keeps the last caps read from XInput.
+  if (state.native()) {
+    state.caps = state.native_caps;
+    return;
+  }
+#endif  // XE_PLATFORM_WIN32
+
   uint16_t cap_flags = 0x0;
 
   // The RAWINPUT driver combines and enhances input from different APIs. For
@@ -838,7 +984,7 @@ void SDLInputDriver::UpdateXCapabilities(ControllerState& state) {
   c.type = 0x01;  // XINPUT_DEVTYPE_GAMEPAD
   c.sub_type = SdlTypeToXInputSubType(
       SDL_GetJoystickType(SDL_GetGamepadJoystick(state.sdl)),
-      SDL_GetGamepadName(state.sdl));
+      GetDeviceName(state.sdl));
   c.flags = cap_flags;
   c.gamepad.buttons = 0xF3FF | X_INPUT_GAMEPAD_GUIDE;
   c.gamepad.left_trigger = 0xFF;
@@ -860,7 +1006,7 @@ std::vector<InputDeviceInfo> SDLInputDriver::EnumerateDevices() {
     }
     InputDeviceInfo info{};
     info.driver_slot = static_cast<uint8_t>(i);
-    const char* name = SDL_GetGamepadName(sdl);
+    const char* name = GetDeviceName(sdl);
     auto* joystick = SDL_GetGamepadJoystick(sdl);
     if (joystick) {
       char guid_buf[33] = {};
@@ -869,11 +1015,28 @@ std::vector<InputDeviceInfo> SDLInputDriver::EnumerateDevices() {
       info.stable_id = guid_buf;
       info.subtype =
           SdlTypeToXInputSubType(SDL_GetJoystickType(joystick), name);
+      if (controllers_.at(i).xinput_slot >= 0) {
+        info.native_subtype = controllers_.at(i).native_caps.sub_type;
+      }
     }
     info.display_name = name ? name : "Controller";
     out.push_back(std::move(info));
   }
   return out;
+}
+
+void SDLInputDriver::SetNativeMode(uint8_t driver_slot, bool enabled) {
+  if (driver_slot >= controllers_.size()) {
+    return;
+  }
+  auto& controller = controllers_.at(driver_slot);
+  if (controller.native_mode == enabled) {
+    return;
+  }
+  controller.native_mode = enabled;
+  if (controller.sdl) {
+    UpdateXCapabilities(controller);
+  }
 }
 
 // Check if the analog inputs exceed their thresholds to become a button press
