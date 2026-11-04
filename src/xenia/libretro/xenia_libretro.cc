@@ -148,6 +148,9 @@ std::atomic<bool> g_resetting{false};
 // Bumped every time a title is torn down, so the thread that was waiting on
 // the old one can tell its exit apart from a real one and stay quiet.
 std::atomic<uint64_t> g_title_generation{0};
+// Set when the title asks for the dashboard or a power off, for retro_run to
+// pass on to the frontend.
+std::atomic<bool> g_shutdown_requested{false};
 
 std::vector<uint32_t> g_framebuffer;
 unsigned g_output_width = kInitialWidth;
@@ -1655,6 +1658,19 @@ RETRO_API bool retro_load_game(const struct retro_game_info* game) {
     return false;
   }
 
+  // A title leaving for the dashboard, or powering the console off, ends the
+  // whole process unless the host takes it from there - std::quick_exit from
+  // a guest thread, which inside a frontend kills it mid-frame and sometimes
+  // leaves it half dead. The frontend's own way to end content is to be asked
+  // to shut down: it then unloads the game, which takes the title down.
+  // Returning true parks the guest thread until then.
+  const auto request_shutdown = []() {
+    g_shutdown_requested.store(true);
+    return true;
+  };
+  g_emulator->set_on_exit_to_dashboard(request_shutdown);
+  g_emulator->set_on_power_off(request_shutdown);
+
   g_state.store(CoreState::kStarting);
   std::thread(EmulatorThread, path).detach();
   return true;
@@ -1699,6 +1715,12 @@ RETRO_API void retro_run(void) {
   // The frontend's video context exists by the time it starts calling us, so
   // this is the emulator thread's cue to bring the graphics system up.
   g_frontend_ready.store(true, std::memory_order_release);
+
+  if (g_shutdown_requested.exchange(false)) {
+    g_log_cb(RETRO_LOG_INFO,
+             "[xenia] Title left for the dashboard; closing content\n");
+    g_environ_cb(RETRO_ENVIRONMENT_SHUTDOWN, nullptr);
+  }
 
   bool options_updated = false;
   if (g_environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE, &options_updated) &&
