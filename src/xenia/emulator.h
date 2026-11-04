@@ -56,6 +56,9 @@ namespace ui {
 class ImGuiDrawer;
 class Window;
 }  // namespace ui
+namespace vfs {
+struct XContentContainerHeader;
+}  // namespace vfs
 }  // namespace xe
 
 namespace xe {
@@ -102,6 +105,9 @@ class Emulator {
   // Folder XeFu and its xbox.xex are in, shown to them as the system partition
   // Compatibility folder.
   std::filesystem::path xefu_path() const;
+  // Folder with the XNA launcher indie games run through, and the packages it
+  // needs.
+  std::filesystem::path xna_path() const;
   // Folder shown to XeFu as the user partition's Compatibility folder, where
   // it keeps original Xbox saves and downloads under Xbox1.
   std::filesystem::path compatibility_path() const {
@@ -319,6 +325,16 @@ class Emulator {
   // image or an Xbox Original package, with |xbe_name| the game's file in it.
   X_STATUS LaunchXboxOriginal(const std::filesystem::path& path,
                               std::string_view xbe_name);
+
+  // Whether the package is an indie game, run through the XNA launcher.
+  static bool IsIndieGamePackage(const vfs::XContentContainerHeader& header);
+  // Launches an indie game package through the XNA launcher in xna_path(),
+  // installing it, and the packages next to the launcher, as content first.
+  X_STATUS LaunchIndieGame(const std::filesystem::path& path);
+  // Installs the package at |path| as content under |install_name|, unless it
+  // already is.
+  X_STATUS InstallContentPackageOnce(const std::filesystem::path& path,
+                                     std::string_view install_name);
 
   // Launches a game from a disc archive file (.zar, etc).
   X_STATUS LaunchDiscArchive(const std::filesystem::path& path);

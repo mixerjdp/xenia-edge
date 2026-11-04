@@ -48,6 +48,7 @@
 #include "xenia/kernel/xam/achievement_manager.h"
 #include "xenia/kernel/xam/content_manager.h"
 #include "xenia/kernel/xam/ui/disc_swap_ui.h"
+#include "xenia/kernel/xam/xam_content_device.h"
 #include "xenia/kernel/xam/xam_module.h"
 #include "xenia/kernel/xam/xam_state.h"
 #include "xenia/kernel/xam/xdbf/spa_info.h"
@@ -179,6 +180,18 @@ DEFINE_string(xefu_launcher, "xbox.xex",
               "does. A XeFu build, such as config_loader_xefu7.xex, runs every "
               "game.",
               "General");
+
+DEFINE_path(xna_path, "",
+            "Folder with the XNA Indie Player launcher, Xna_TitleLauncher.xex "
+            "from a USB system update, along with the packages it needs, such "
+            "as the XNA runtime. Opening an indie game package installs it and "
+            "runs it through the launcher from there, installing the packages "
+            "in the folder first. Empty for the xna folder under the storage "
+            "root.",
+            "Storage");
+
+DEFINE_string(xna_launcher, "Xna_TitleLauncher.xex",
+              "File in xna_path that indie games start through.", "General");
 
 DECLARE_bool(force_mount_devkit);
 
@@ -786,6 +799,9 @@ X_STATUS Emulator::LaunchPath(const std::filesystem::path& path,
                         XContentType::kXboxTitle) {
         return LaunchXboxOriginal(path, "default.xbe");
       }
+      if (header && IsIndieGamePackage(*header)) {
+        return LaunchIndieGame(path);
+      }
       mount_result = MountPath(path, "\\Device\\Package_0");
       return mount_result ? mount_result : LaunchStfsContainer(path);
     } break;
@@ -876,6 +892,10 @@ X_STATUS Emulator::LaunchDiscImage(const std::filesystem::path& path) {
 
 std::filesystem::path Emulator::xefu_path() const {
   return cvars::xefu_path.empty() ? storage_root_ / "xefu" : cvars::xefu_path;
+}
+
+std::filesystem::path Emulator::xna_path() const {
+  return cvars::xna_path.empty() ? storage_root_ / "xna" : cvars::xna_path;
 }
 
 void Emulator::InsertXboxGame(const std::filesystem::path& path) {
@@ -1084,6 +1104,148 @@ X_STATUS Emulator::LaunchXboxOriginal(const std::filesystem::path& path,
   InsertXboxGame(path);
   X_STATUS result = MountPath(launcher, "\\Device\\Package_0");
   return result ? result : LaunchXexFile(launcher);
+}
+
+// An indie game is a package of content for the XNA Indie Player, which the
+// dashboard starts with launch data naming it. The XNA runtime comes as
+// content for the player too, but of another type, so it is not a game.
+bool Emulator::IsIndieGamePackage(const vfs::XContentContainerHeader& header) {
+  const XContentType type = header.content_metadata.content_type;
+  return kernel::IsXNTitle(header.content_metadata.execution_info.title_id) &&
+         (type == XContentType::kMarketplaceContent ||
+          type == XContentType::kCommunityGame);
+}
+
+// Content is found by the name of its folder, which a title gets back as the
+// XCONTENT_DATA file name and so has to fit in it. A package keeps its name,
+// or the one it had before an extension was added to make it selectable, and
+// one renamed to something longer installs under a name derived from it.
+static std::string ContentInstallName(const std::filesystem::path& path) {
+  constexpr size_t kMaxContentFileName = 0x2A;
+  const auto fits = [](const std::string& name) {
+    return !name.empty() && name.size() <= kMaxContentFileName &&
+           std::ranges::all_of(name, [](char c) {
+             return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') ||
+                    (c >= 'a' && c <= 'z') || c == '_' || c == '-' ||
+                    c == '.';
+           });
+  };
+  const std::string name = xe::path_to_utf8(path.filename());
+  if (fits(name)) {
+    return name;
+  }
+  if (const std::string stem = xe::path_to_utf8(path.stem()); fits(stem)) {
+    return stem;
+  }
+  // FNV-1a, so the name stays the same from one run to the next.
+  uint64_t hash = 0xCBF29CE484222325ull;
+  for (const char c : name) {
+    hash = (hash ^ static_cast<uint8_t>(c)) * 0x100000001B3ull;
+  }
+  return fmt::format("{:016X}", hash);
+}
+
+X_STATUS Emulator::InstallContentPackageOnce(
+    const std::filesystem::path& path, std::string_view install_name) {
+  ContentInstallEntry entry(path);
+  if (const X_STATUS result = ProcessContentPackageHeader(path, entry);
+      XFAILED(result)) {
+    return result;
+  }
+  entry.data_installation_path_.replace_filename(install_name);
+  entry.header_installation_path_.replace_filename(install_name);
+  // The header goes next to where the path points, named with .header added.
+  std::filesystem::path header_file =
+      content_root() / entry.header_installation_path_;
+  header_file += ".header";
+  std::error_code error;
+  if (std::filesystem::is_regular_file(header_file, error) &&
+      !std::filesystem::is_empty(content_root() / entry.data_installation_path_,
+                                 error) &&
+      !error) {
+    return X_STATUS_SUCCESS;
+  }
+  XELOGI("Installing {} as content {}", entry.name_,
+         xe::strip_pii(xe::path_to_utf8(entry.data_installation_path_)));
+  return InstallContentPackage(path, entry);
+}
+
+X_STATUS Emulator::LaunchIndieGame(const std::filesystem::path& path) {
+  const std::filesystem::path launcher = xna_path() / cvars::xna_launcher;
+  if (!std::filesystem::is_regular_file(launcher)) {
+    XELOGE("Indie games run through the XNA launcher, which needs {} in {}",
+           cvars::xna_launcher, xe::strip_pii(xe::path_to_utf8(xna_path())));
+    // Somewhere for the user to copy the launcher to.
+    std::error_code create_error;
+    std::filesystem::create_directories(xna_path(), create_error);
+    return X_STATUS_NOT_SUPPORTED;
+  }
+
+  // What the user would have put in with Install Content: the XNA runtime,
+  // and anything else the launcher needs, kept next to it.
+  std::error_code list_error;
+  for (const auto& file :
+       std::filesystem::directory_iterator(xna_path(), list_error)) {
+    std::error_code file_error;
+    if (!file.is_regular_file(file_error)) {
+      continue;
+    }
+    switch (GetFileSignature(file.path())) {
+      case FileSignatureType::LIVE:
+      case FileSignatureType::CON:
+      case FileSignatureType::PIRS:
+        break;
+      default:
+        continue;
+    }
+    if (XFAILED(InstallContentPackageOnce(file.path(),
+                                          ContentInstallName(file.path())))) {
+      XELOGW("Could not install {} for the XNA launcher",
+             xe::strip_pii(xe::path_to_utf8(file.path())));
+    }
+  }
+
+  const std::string install_name = ContentInstallName(path);
+  if (const X_STATUS result = InstallContentPackageOnce(path, install_name);
+      XFAILED(result)) {
+    XELOGE("Failed to install the indie game {}: {:08X}",
+           xe::strip_pii(xe::path_to_utf8(path)), result);
+    return result;
+  }
+
+  auto xam = kernel_state_->GetKernelModule<kernel::xam::XamModule>("xam.xex");
+  if (!xam) {
+    return X_STATUS_UNSUCCESSFUL;
+  }
+  // Laid out as the dashboard passes it, the same as the launcher's own game
+  // picker in xam_info.cc builds it.
+  auto& loader_data = xam->loader_data();
+  auto& data = loader_data.launch_data;
+  data.assign(0x34, 0);
+  xe::store_and_swap<uint32_t>(data.data(), 0xCAFEBABE);
+  std::memcpy(data.data() + 4, install_name.data(),
+              std::min<size_t>(install_name.size(), 0x2A));
+  xe::store_and_swap<uint32_t>(
+      data.data() + 0x30,
+      static_cast<uint32_t>(kernel::xam::DummyDeviceId::HDD));
+  loader_data.launch_data_present = true;
+
+  X_STATUS result = MountPath(launcher, "\\Device\\Package_0");
+  if (XFAILED(result)) {
+    return result;
+  }
+  result = LaunchXexFile(launcher);
+  if (XSUCCEEDED(result)) {
+    const auto header = vfs::XContentContainerDevice::ReadContainerHeader(path);
+    const std::string name =
+        header ? xe::to_utf8(header->content_metadata.display_name(
+                     XLanguage::kEnglish))
+               : std::string();
+    if (!name.empty()) {
+      SetTitleName(name);
+    }
+  }
+  return result;
 }
 
 X_STATUS Emulator::LaunchDiscArchive(const std::filesystem::path& path) {
