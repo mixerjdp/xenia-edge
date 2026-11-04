@@ -264,8 +264,10 @@ void GamercardUI::LoadGamercardInfo() {
     gamercardOriginalValues_.profile_icon.assign(gamer_icon.begin(),
                                                  gamer_icon.end());
 
-    gamercardOriginalValues_.icon_texture =
-        imgui_drawer()->LoadImGuiIcon(gamer_icon).release();
+    if (imgui_drawer()) {
+      gamercardOriginalValues_.icon_texture =
+          imgui_drawer()->LoadImGuiIcon(gamer_icon).release();
+    }
 
     LoadStringSetting(UserSettingId::XPROFILE_GAMERCARD_USER_NAME,
                       gamercardOriginalValues_.gamer_name);

@@ -39,7 +39,7 @@ struct GamercardSettings {
   // Other
   std::vector<uint8_t> profile_icon;
   // Immediate Texture?
-  xe::ui::ImmediateTexture* icon_texture;
+  xe::ui::ImmediateTexture* icon_texture = nullptr;
 };
 
 class GamercardUI final : public XamDialog {

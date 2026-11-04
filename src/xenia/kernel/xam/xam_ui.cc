@@ -75,6 +75,16 @@ namespace xam {
 //
 // We deliberately delay the XN_SYS_UI = false notification to give games time
 // to create a listener (if they're insane enough do this).
+// Every dialog is drawn into Xenia's own window. An embedder without one (the
+// libretro core) has nowhere to put it, so the dispatchers below close the
+// dialog straight away with what it holds before anyone answers - its
+// defaults, as a console with nobody at the controller would - rather than
+// leave the guest waiting for an answer that can never come.
+static bool CanShowDialogs() {
+  const Emulator* emulator = kernel_state()->emulator();
+  return emulator->display_window() && emulator->imgui_drawer();
+}
+
 template <typename T>
 X_RESULT xeXamDispatchDialog(T* dialog,
                              std::function<X_RESULT(T*)> close_callback,
@@ -87,20 +97,15 @@ X_RESULT xeXamDispatchDialog(T* dialog,
     dialog->set_close_callback([&dialog, &result, &close_callback]() {
       result = close_callback(dialog);
     });
-    xe::threading::Fence fence;
-    // Every dialog is drawn into Xenia's own window. An embedder without one
-    // (the libretro core) has nowhere to put it, and dereferencing the null
-    // window here would take down the guest thread mid-call. Report the dialog
-    // as dismissed instead; `headless` already handles this for the paths that
-    // check it, and this catches the ones that don't.
-    xe::ui::Window* display_window =
-        kernel_state()->emulator()->display_window();
-    if (!display_window) {
+    if (!CanShowDialogs()) {
+      result = close_callback(dialog);
       delete dialog;
       kernel_state()->xam_state()->is_xam_dialog_present_.store(false);
-      return X_ERROR_SUCCESS;
+      return result;
     }
-    xe::ui::WindowedAppContext& app_context = display_window->app_context();
+    xe::threading::Fence fence;
+    xe::ui::WindowedAppContext& app_context =
+        kernel_state()->emulator()->display_window()->app_context();
     if (app_context.CallInUIThreadSynchronous(
             [&dialog, &fence]() { dialog->Then(&fence); })) {
       GuestScheduler::WaitOnFence(fence);
@@ -138,6 +143,12 @@ X_RESULT xeXamDispatchDialogEx(
   };
   auto run = [dialog, close_callback](uint32_t& extended_error,
                                       uint32_t& length) -> X_RESULT {
+    if (!CanShowDialogs()) {
+      const X_RESULT result = close_callback(dialog, extended_error, length);
+      delete dialog;
+      kernel_state()->xam_state()->is_xam_dialog_present_.store(false);
+      return result;
+    }
     auto display_window = kernel_state()->emulator()->display_window();
     X_RESULT result;
     dialog->set_close_callback(
@@ -219,6 +230,10 @@ X_RESULT xeXamDispatchDialogAsync(T* dialog,
     thread.detach();
   });
 
+  // These dialogs delete themselves on closing, which runs the callback above.
+  if (!CanShowDialogs()) {
+    dialog->Destroy();
+  }
   return X_ERROR_SUCCESS;
 }
 
@@ -414,6 +429,13 @@ static dword_result_t XamShowMessageBoxUi(
   xe::ui::ImGuiDrawer* imgui_drawer = emulator->imgui_drawer();
   xe::hid::InputSystem* input_system = emulator->input_system();
 
+  // Nobody will read it, so the log is the only place it can say why a title
+  // stops.
+  if (!CanShowDialogs()) {
+    XELOGW("Message box closed unseen with its default answer: {}: {}", title,
+           text);
+  }
+
   if (flags & XMBox_PASSCODEMODE || flags & XMBox_VERIFYPASSCODEMODE) {
     auto close = [result_ptr,
                   active_button](ui::ProfilePasscodeUI* dialog) -> X_RESULT {
@@ -507,8 +529,12 @@ dword_result_t XNotifyQueueUI_entry(dword_t exnq, dword_t dwUserIndex,
   const Emulator* emulator = kernel_state()->emulator();
   xe::ui::ImGuiDrawer* imgui_drawer = emulator->imgui_drawer();
 
-  new xe::ui::XNotifyWindow(imgui_drawer, "", displayText, dwUserIndex,
-                            position_id);
+  // The drawer owns a notification, so there is nothing to show one with
+  // without it.
+  if (imgui_drawer) {
+    new xe::ui::XNotifyWindow(imgui_drawer, "", displayText, dwUserIndex,
+                              position_id);
+  }
 
   // XNotifyQueueUI -> XNotifyQueueUIEx -> XMsgProcessRequest ->
   // XMsgStartIORequestEx & XMsgInProcessCall

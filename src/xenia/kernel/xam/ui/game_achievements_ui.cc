@@ -54,7 +54,9 @@ bool GameAchievementsUI::LoadAchievementsData() {
     data.insert({entry.image_id, icon});
   }
 
-  achievements_icons_ = imgui_drawer()->LoadIcons(data);
+  if (imgui_drawer()) {
+    achievements_icons_ = imgui_drawer()->LoadIcons(data);
+  }
   return true;
 }
 
