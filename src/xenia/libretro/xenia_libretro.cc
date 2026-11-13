@@ -38,6 +38,7 @@
 #include "xenia/base/logging.h"
 #include "xenia/base/platform.h"
 #include "xenia/base/string.h"
+#include "xenia/base/utf8.h"
 #include "xenia/base/threading.h"
 #include "xenia/config.h"
 #include "xenia/emulator.h"
@@ -47,6 +48,7 @@
 #include "xenia/ui/presenter.h"
 #include "xenia/hid/input_driver.h"
 #include "xenia/hid/nop/nop_hid.h"
+#include "xenia/kernel/title_id_utils.h"
 #include "xenia/kernel/xam/profile_manager.h"
 #include "xenia/kernel/xam/xam_state.h"
 #include "xenia/libretro/libretro.h"
@@ -58,6 +60,8 @@
 #include "xenia/ui/vulkan/vulkan_instance.h"
 #include "xenia/ui/vulkan/vulkan_presenter.h"
 #include "xenia/ui/vulkan/vulkan_provider.h"
+#include "xenia/ui/system_files_installer_wx.h"
+#include "xenia/vfs/devices/xcontent_container_device.h"
 
 #if XE_PLATFORM_WIN32
 #include "xenia/base/main_win.h"
@@ -1027,6 +1031,67 @@ void Fail(const std::string& reason) {
 // Everything between a bare kernel and a running title. Shared by the initial
 // boot and by reset so the two sequences cannot drift apart: a reset lands on
 // a kernel as fresh as the one Setup produces, and needs the same steps.
+// Indie games run through the XNA title launcher, which only comes with the
+// console's system files - the USB system update. Standalone Xenia installs
+// them from its Tools menu; the core has no menu, so it installs them itself
+// the first time an indie game is opened, from a SystemUpdate*.zip left in its
+// system folder. Nothing else is installed, so other titles are unaffected
+// until then.
+void EnsureSystemFilesForIndieGame(const std::filesystem::path& path) {
+  const auto header =
+      xe::vfs::XContentContainerDevice::ReadContainerHeader(path);
+  if (!header || !header->content_header.is_magic_valid() ||
+      header->content_metadata.content_type.get() !=
+          xe::XContentType::kMarketplaceContent ||
+      header->content_metadata.execution_info.title_id.get() !=
+          xe::kernel::kXN_2002) {
+    return;
+  }
+  const std::filesystem::path system_path = g_emulator->system_files_path();
+  if (xe::ui::HasSystemFiles(system_path)) {
+    return;
+  }
+
+  std::filesystem::path zip;
+  std::error_code ec;
+  for (const auto& entry :
+       std::filesystem::directory_iterator(g_storage_root, ec)) {
+    const std::string name = xe::path_to_utf8(entry.path().filename());
+    if (xe::utf8::starts_with_case(name, "systemupdate") &&
+        xe::utf8::ends_with_case(name, ".zip")) {
+      zip = entry.path();
+      break;
+    }
+  }
+  if (zip.empty()) {
+    g_log_cb(RETRO_LOG_ERROR,
+             "[xenia] Indie games need the XNA launcher from the system "
+             "update. Put the USB system update zip (SystemUpdate*.zip) in "
+             "%s and open the game again\n",
+             xe::path_to_utf8(g_storage_root).c_str());
+    return;
+  }
+
+  g_log_cb(RETRO_LOG_INFO, "[xenia] Installing system files from %s\n",
+           xe::path_to_utf8(zip.filename()).c_str());
+  size_t next_report = 0;
+  const xe::ui::SystemFilesResult result = xe::ui::InstallSystemFiles(
+      zip, system_path, [&next_report](size_t done, size_t total) {
+        if (done >= next_report) {
+          g_log_cb(RETRO_LOG_INFO, "[xenia]   system files %zu/%zu\n", done,
+                   total);
+          next_report = done + std::max<size_t>(total / 4, 1);
+        }
+        return true;
+      });
+  if (result == xe::ui::SystemFilesResult::kSuccess) {
+    g_log_cb(RETRO_LOG_INFO, "[xenia] System files installed\n");
+  } else {
+    g_log_cb(RETRO_LOG_ERROR, "[xenia] Installing the system files failed (%d)\n",
+             static_cast<int>(result));
+  }
+}
+
 bool StartTitle(const std::filesystem::path& path) {
   // The kernel is new, so nothing is signed in - including after a reset,
   // where the profile only auto-logs-in at creation time.
@@ -1048,6 +1113,8 @@ bool StartTitle(const std::filesystem::path& path) {
           g_emulator->graphics_system()) {
     graphics_system->SetHostDrivenVblank(true);
   }
+
+  EnsureSystemFilesForIndieGame(path);
 
   g_log_cb(RETRO_LOG_INFO, "[xenia] Launching %s\n",
            xe::path_to_utf8(path).c_str());
