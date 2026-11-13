@@ -793,6 +793,17 @@ dword_result_t XamContentSetThumbnail_entry(
 }
 DECLARE_XAM_EXPORT1(XamContentSetThumbnail, kContent, kImplemented);
 
+// xam's three built-in images, such as the default content thumbnail. They
+// aren't shipped so a caller goes without, as for an image xam has no data for.
+dword_result_t XamGetDefaultImage_entry(dword_t image_id, lpdword_t image_ptr,
+                                        lpdword_t image_size_ptr) {
+  if (image_id >= 3) {
+    return X_E_INVALIDARG;
+  }
+  return 0x8000FFFF;  // E_UNEXPECTED
+}
+DECLARE_XAM_EXPORT1(XamGetDefaultImage, kContent, kStub);
+
 dword_result_t xeXamContentDelete(dword_t user_index, lpvoid_t content_data_ptr,
                                   dword_t content_data_size,
                                   pointer_t<XAM_OVERLAPPED> overlapped_ptr) {
@@ -1166,6 +1177,65 @@ dword_result_t XamContentGetMetaDataInternal_entry(
   return CompleteRequest(overlapped_ptr, result);
 }
 DECLARE_XAM_EXPORT1(XamContentGetMetaDataInternal, kContent, kImplemented);
+
+XLanguage xeXTLGetLanguageV2();
+
+// Copies the metadata's display name and description in the title's language,
+// or in the first language that has one.
+dword_result_t XamContentGetLocalizedString_entry(lpvoid_t metadata_ptr,
+                                                  lpvoid_t display_name_ptr,
+                                                  dword_t display_name_count,
+                                                  lpvoid_t description_ptr,
+                                                  dword_t description_count) {
+  using Metadata = vfs::XContentMetadata;
+  constexpr uint32_t kBase = Metadata::kNumLanguagesV1;
+  constexpr uint32_t kAll = Metadata::kNumLanguagesV2;
+  if (!metadata_ptr) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+  const auto& metadata = *metadata_ptr.as<const Metadata*>();
+  const bool has_extra = metadata.metadata_version >= 2;
+  const uint32_t slot = static_cast<uint32_t>(xeXTLGetLanguageV2()) - 1;
+
+  auto copy = [&](const xe::be<uint16_t>(*strings)[128],
+                  const xe::be<uint16_t>(*extra_strings)[128],
+                  xe::be<uint16_t>* out, uint32_t count) {
+    // The extra languages are stored last to first.
+    const xe::be<uint16_t>* str = slot < kBase ? strings[slot]
+                                  : has_extra && slot < kAll
+                                      ? extra_strings[kAll - 1 - slot]
+                                      : strings[0];
+    for (uint32_t i = 0; !*str && i < kBase; ++i) {
+      str = strings[i];
+    }
+    for (uint32_t i = 0; !*str && has_extra && i < kAll - kBase; ++i) {
+      str = extra_strings[i];
+    }
+    if (!count) {
+      return;
+    }
+    // Like wcsncpy, then terminated.
+    uint32_t i = 0;
+    for (; i < count && str[i]; ++i) {
+      out[i] = str[i];
+    }
+    for (; i < count; ++i) {
+      out[i] = 0;
+    }
+    out[count - 1] = 0;
+  };
+
+  if (display_name_ptr) {
+    copy(metadata.display_name_raw.uint, metadata.display_name_ex_raw.uint,
+         display_name_ptr.as<xe::be<uint16_t>*>(), display_name_count);
+  }
+  if (description_ptr) {
+    copy(metadata.description_raw.uint, metadata.description_ex_raw.uint,
+         description_ptr.as<xe::be<uint16_t>*>(), description_count);
+  }
+  return X_ERROR_SUCCESS;
+}
+DECLARE_XAM_EXPORT1(XamContentGetLocalizedString, kContent, kImplemented);
 
 #pragma pack(push, 4)
 struct X_CONTENT_ATTRIBUTES {
